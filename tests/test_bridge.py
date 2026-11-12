@@ -333,6 +333,12 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((body["kind"], body["sourceId"], key), ("image", "src1", "k1"))
         self.assertIn("multipart/form-data", self.daemon.uploads[0][0])
 
+    async def test_video_sent_with_original(self):
+        from bridge.wechat import Media
+        await self.b.wx.send_media("wxid_bob", "video", Media(b"mp4", "video/mp4", "clip.mp4"), "k2")
+        body, _ = self.daemon.sends[-1]
+        self.assertEqual((body["kind"], body["videoQuality"]), ("video", "original"))
+
     async def test_latest_cursor(self):
         self.assertEqual(await self.b.wx.latest_cursor(), "42")
 

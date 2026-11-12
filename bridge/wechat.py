@@ -233,7 +233,7 @@ class WeChatClient:
         body = {"threadId": thread_id, "kind": kind, "sourceId": source["id"], "standardSourceId": None,
                 "thumbnailSourceId": None, "playSeconds": None, "durationMs": None}
         if kind == "video":
-            body["videoQuality"] = "normal"
+            body["videoQuality"] = "original"  # 720p playback copy plus the untouched original
         job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
         return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
 
