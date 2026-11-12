@@ -15,6 +15,7 @@ import httpx
 from telethon import TelegramClient, errors, events, functions, types, utils
 
 from .config import Config
+from . import stickers
 from .login import LoginMixin
 from .store import Store
 from .wechat import (APP, APP_FILE, APP_QUOTE, IMAGE, LOCATION, SEND_OK, STICKER, SYSTEM, TEXT, VIDEO, VOICE,
@@ -625,8 +626,6 @@ class Bridge(LoginMixin):
         size = f.size if f else 0
         if size and size > self.max_media:
             return None, f"文件太大（{size // 1048576} MB），超过 max_media_mb 限制"
-        if msg.sticker and f.mime_type != "image/webp":
-            return None, "动态贴纸无法发到微信"
         data = await msg.download_media(file=bytes)
         if not data:
             return None, "无法下载这条 Telegram 媒体"
@@ -635,7 +634,14 @@ class Bridge(LoginMixin):
         if msg.photo:
             return "image", Media(data, "image/jpeg", "photo.jpg")
         if msg.sticker:
-            return "image", Media(data, "image/webp", "sticker.webp")
+            # WeChat stickers cannot be sent through agent-wechat; send a picture or a short video instead
+            converted = await stickers.convert(data, mime)
+            if isinstance(converted, str):
+                return None, converted
+            kind, out = converted
+            if kind == "video":
+                return "video", Media(out, "video/mp4", "sticker.mp4")
+            return "image", Media(out, "image/jpeg", "sticker.jpg")
         if msg.voice:
             return "voice", Media(data, "audio/ogg", "voice.ogg")
         if msg.video or msg.video_note or msg.gif:

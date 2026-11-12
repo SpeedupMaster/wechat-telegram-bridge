@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt imageio-ffmpeg  # ffmpeg for the sticker tests
       - run: python -m unittest discover -s tests -t . -v
         env:
           PYTHONWARNINGS: ignore::ResourceWarning

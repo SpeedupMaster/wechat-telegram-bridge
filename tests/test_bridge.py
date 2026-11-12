@@ -485,3 +485,105 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StickerTests(unittest.IsolatedAsyncioTestCase):
+    """Telegram stickers become a white-background JPEG or a short MP4 (WeChat stickers can't be sent)."""
+
+    def setUp(self):
+        from bridge import stickers
+        self.stickers = stickers
+        self.ffmpeg = stickers.find_ffmpeg()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    @staticmethod
+    def webp() -> bytes:
+        import io
+        from PIL import Image
+        im = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+        im.paste((255, 0, 0, 255), (100, 100, 400, 400))
+        out = io.BytesIO()
+        im.save(out, "WEBP")
+        return out.getvalue()
+
+    @staticmethod
+    def tgs() -> bytes:
+        import gzip
+        still = lambda v: {"a": 0, "k": v}
+        lottie = {"v": "5.5.2", "fr": 30, "ip": 0, "op": 30, "w": 512, "h": 512, "layers": [{
+            "ty": 4, "ip": 0, "op": 30, "st": 0,
+            "ks": {"o": still(100), "p": still([256, 256, 0]), "a": still([0, 0, 0]), "s": still([100, 100, 100]),
+                   "r": {"a": 1, "k": [{"t": 0, "s": [0], "e": [90], "i": {"x": [1], "y": [1]}, "o": {"x": [0], "y": [0]}},
+                                       {"t": 30, "s": [90]}]}},
+            "shapes": [{"ty": "rc", "p": still([0, 0]), "s": still([200, 200]), "r": still(0)},
+                       {"ty": "fl", "c": still([1, 0, 0, 1]), "o": still(100)}]}]}
+        return gzip.compress(json.dumps(lottie).encode())
+
+    def frame(self, mp4: bytes):
+        import subprocess
+        from PIL import Image
+        src, png = Path(self.tmp.name, "out.mp4"), Path(self.tmp.name, "frame.png")
+        src.write_bytes(mp4)
+        subprocess.run([self.ffmpeg, "-y", "-loglevel", "error", "-i", str(src), "-vf", r"select=eq(n\,5)",
+                        "-frames:v", "1", str(png)], check=True)
+        return Image.open(png).convert("RGB")
+
+    def assertColor(self, got, want):
+        self.assertTrue(all(abs(a - b) <= 12 for a, b in zip(got, want)), f"{got} != {want}")
+
+    async def test_static_sticker_flattened_on_white(self):
+        import io
+        from PIL import Image
+        kind, data = await self.stickers.convert(self.webp(), "image/webp")
+        im = Image.open(io.BytesIO(data))
+        self.assertEqual((kind, im.format), ("image", "JPEG"))
+        self.assertColor(im.getpixel((5, 5)), (255, 255, 255))
+        self.assertColor(im.getpixel((250, 250)), (255, 0, 0))
+
+    async def test_video_sticker_keeps_transparency(self):
+        if not self.ffmpeg:
+            self.skipTest("ffmpeg not installed")
+        import subprocess
+        webm = Path(self.tmp.name, "in.webm")
+        subprocess.run([self.ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                        "color=c=green:s=512x512:d=1,format=rgba,"
+                        "geq=r=0:g=200:b=0:a='if(between(X,100,300)*between(Y,100,300),255,0)'",
+                        "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", str(webm)], check=True)
+        kind, data = await self.stickers.convert(webm.read_bytes(), "video/webm")
+        self.assertEqual(kind, "video")
+        im = self.frame(data)
+        self.assertEqual(im.size, (384, 384))
+        self.assertColor(im.getpixel((5, 5)), (255, 255, 255))
+        self.assertColor(im.getpixel((150, 150)), (0, 200, 0))
+
+    async def test_animated_sticker_rendered_to_video(self):
+        if not self.ffmpeg:
+            self.skipTest("ffmpeg not installed")
+        kind, data = await self.stickers.convert(self.tgs(), "application/x-tgsticker")
+        self.assertEqual(kind, "video")
+        im = self.frame(data)
+        self.assertColor(im.getpixel((5, 5)), (255, 255, 255))
+        self.assertColor(im.getpixel((192, 192)), (255, 0, 0))
+
+    async def test_animated_sticker_falls_back_to_first_frame(self):
+        import io
+        from unittest import mock
+        from PIL import Image
+        with mock.patch.object(self.stickers, "find_ffmpeg", return_value=None):
+            kind, data = await self.stickers.convert(self.tgs(), "application/x-tgsticker")
+        self.assertEqual(kind, "image")
+        self.assertColor(Image.open(io.BytesIO(data)).getpixel((192, 192)), (255, 0, 0))
+
+    async def test_bridge_sends_sticker_as_jpeg(self):
+        b = Bridge.__new__(Bridge)
+        b.max_media = 50 * 1048576
+        data = self.webp()
+
+        async def download_media(file=None):
+            return data
+        msg = SimpleNamespace(file=SimpleNamespace(size=len(data), mime_type="image/webp", name=None, ext=".webp"),
+                              sticker=True, photo=None, download_media=download_media)
+        kind, media = await b._tg_media(msg)
+        self.assertEqual((kind, media.mime, media.filename), ("image", "image/jpeg", "sticker.jpg"))
+        self.assertTrue(media.data.startswith(b"\xff\xd8"))
