@@ -612,3 +612,17 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         kind, media = await b._tg_media(msg)
         self.assertEqual((kind, media.mime, media.filename), ("image", "image/jpeg", "sticker.jpg"))
         self.assertTrue(media.data.startswith(b"\xff\xd8"))
+
+    async def test_picture_sent_as_file_stays_a_file(self):
+        """agent-wechat shrinks images to ~64 KB; a Telegram document keeps its bytes as a WeChat file."""
+        b = Bridge.__new__(Bridge)
+        b.max_media = 50 * 1048576
+        data = b"\xff\xd8" + b"x" * 300_000
+
+        async def download_media(file=None):
+            return data
+        msg = SimpleNamespace(file=SimpleNamespace(size=len(data), mime_type="image/jpeg", name="IMG_7462.JPG", ext=".jpg"),
+                              sticker=None, photo=None, voice=None, video=None, video_note=None, gif=None,
+                              download_media=download_media)
+        kind, media = await b._tg_media(msg)
+        self.assertEqual((kind, media.filename, media.data), ("file", "IMG_7462.JPG", data))

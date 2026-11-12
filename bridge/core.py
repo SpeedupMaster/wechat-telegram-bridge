@@ -660,8 +660,8 @@ class Bridge(LoginMixin):
             return "voice", Media(data, "audio/ogg", "voice.ogg")
         if msg.video or msg.video_note or msg.gif:
             return "video", Media(data, "video/mp4", name if name.endswith(".mp4") else "video.mp4")
-        if mime.startswith("image/") and mime in ("image/jpeg", "image/png", "image/gif", "image/webp"):
-            return "image", Media(data, mime, name)
+        # Anything sent as a file in Telegram (including pictures) goes to WeChat as a file: agent-wechat
+        # squeezes every *image* it sends to at most 1280 px / ~64 KB, while files keep their exact bytes.
         return "file", Media(data, mime, name)
 
     async def _report(self, chat_id: int, reply_to: int, text: str) -> None:
