@@ -91,11 +91,16 @@ def _avatar_photo(data: bytes, size: int = 512) -> bytes:
     """WeChat hands out small avatars (~132 px) that Telegram rejects as a chat photo
     (PhotoCropSizeSmallError), so centre-crop to a square and scale up to size x size JPEG."""
     from PIL import Image
-    try:
-        im = Image.open(io.BytesIO(data))
-        im.load()
-    except Exception:
-        return data
+    if data.startswith(b"wxgf"):  # WeChat's own HEVC-based format, which Pillow can't read
+        if not (ffmpeg := stickers.find_ffmpeg()):
+            raise ValueError("avatar is in WeChat's wxgf format and ffmpeg is not installed")
+        im = stickers.wxgf_to_image(data, ffmpeg)
+    else:
+        try:
+            im = Image.open(io.BytesIO(data))
+            im.load()
+        except Exception as e:
+            raise ValueError(f"avatar is not a readable image (starts with {data[:8]!r})") from e
     w, h = im.size
     side = min(w, h)
     im = im.crop(((w - side) // 2, (h - side) // 2, (w - side) // 2 + side, (h - side) // 2 + side))

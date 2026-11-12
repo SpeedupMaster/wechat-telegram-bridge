@@ -21,6 +21,17 @@ from bridge.wechat import CursorExpired, WeChatClient
 ACC = "acc1"
 
 
+def _png(w=132, h=132, color=(10, 120, 200)) -> bytes:
+    import io
+    from PIL import Image
+    out = io.BytesIO()
+    Image.new("RGB", (w, h), color).save(out, "PNG")
+    return out.getvalue()
+
+
+AVATAR = _png()  # WeChat hands out ~132 px avatars
+
+
 class FakeDaemon:
     def __init__(self):
         self.messages: dict[str, dict] = {}
@@ -78,7 +89,7 @@ class FakeDaemon:
                 if self.avatar_lag:
                     self.avatar_lag -= 1
                     return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
-                return httpx.Response(200, content=b"JPEGDATA", headers={"content-type": "image/jpeg"})
+                return httpx.Response(200, content=AVATAR, headers={"content-type": "image/png"})
             return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
         if rest[0] == "groups" and rest[2] == "members":
             return httpx.Response(200, json={"state": "present", "member": {"displayName": "Alice in group"}})
@@ -244,7 +255,40 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         why = await self.b.sync_avatar(-501, "wxid_bob")
         self.assertEqual(why, "")
         self.assertEqual(self.daemon.avatar_refreshed, ["wxid_bob"])
-        self.assertEqual(self.b.user.photos, [(501, b"JPEGDATA")])  # not an image: passed through as-is
+        [(chat, uploaded)] = self.b.user.photos
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(uploaded))
+        self.assertEqual((chat, im.format, im.size), (501, "JPEG", (512, 512)))  # Telegram rejects 132 px
+
+    def test_wxgf_avatar_decoded(self):
+        """WeChat may store avatars in its own HEVC-based wxgf format."""
+        import io
+        import subprocess
+        from PIL import Image
+        from bridge import stickers
+        from bridge.core import _avatar_photo
+        ffmpeg = stickers.find_ffmpeg()
+        if not ffmpeg or b"libx265" not in subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                                          capture_output=True).stdout:
+            self.skipTest("needs ffmpeg with libx265 to build a wxgf sample")
+        with tempfile.TemporaryDirectory() as tmp:
+            src, hevc = Path(tmp, "a.png"), Path(tmp, "a.hevc")
+            src.write_bytes(_png(132, 132, (200, 30, 30)))
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(src), "-c:v", "libx265",
+                            "-x265-params", "log-level=none", "-pix_fmt", "yuv420p", "-f", "hevc", str(hevc)], check=True)
+            stream = hevc.read_bytes()
+        header = b"wxgf" + bytes([19]) + bytes([0, 2]) + (132).to_bytes(2, "big") * 2 + bytes(8)
+        wxgf = header + len(stream).to_bytes(4, "big") + stream
+        im = Image.open(io.BytesIO(_avatar_photo(wxgf)))
+        self.assertEqual(im.size, (512, 512))
+        r, g, b = im.getpixel((256, 256))
+        self.assertTrue(r > 150 and g < 80 and b < 80, (r, g, b))
+
+    def test_unreadable_avatar_is_an_error_not_uploaded(self):
+        from bridge.core import _avatar_photo
+        with self.assertRaises(ValueError):
+            _avatar_photo(b"JPEGDATA")
 
     async def test_small_avatar_scaled_up_for_telegram(self):
         import io
@@ -261,7 +305,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_avatar_read_retried_after_refresh(self):
         self.daemon.avatar_lag = 2
         data, why = await self.b.wx.fetch_avatar("wxid_bob", retry_delays=(0, 0, 0))
-        self.assertEqual((data, why), (b"JPEGDATA", ""))
+        self.assertEqual((data, why), (AVATAR, ""))
 
     async def test_avatar_failure_reason_reported(self):
         self.daemon.avatar_op = {"id": "avop", "state": "failed", "result": {"code": "avatar_not_advertised"}}

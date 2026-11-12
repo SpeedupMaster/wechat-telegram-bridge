@@ -61,6 +61,52 @@ def tgs_first_frame_jpeg(data: bytes) -> bytes:
     return out.getvalue()
 
 
+def _wxgf_partition(data: bytes) -> bytes:
+    """Largest HEVC partition of a WeChat "wxgf" (v2) image, as an Annex B stream.
+
+    Same discovery as agent-wechat's wechat-media/src/wxgf.rs (after sjzar/chatlog): a header whose
+    length is byte 4, then partitions that are a u32-BE length followed by NAL units starting with a
+    VPS/SPS/PPS."""
+    if len(data) < 15 or not data.startswith(b"wxgf") or data[5:7] != b"\x00\x02" or not 15 <= data[4] < len(data):
+        raise ValueError("not a wxgf v2 image")
+
+    def start_code(i: int) -> int:
+        return 4 if data[i:i + 4] == b"\0\0\0\x01" else 3 if data[i:i + 3] == b"\0\0\x01" else 0
+
+    pos, best = data[4] + 4, None
+    while pos < len(data):
+        code = start_code(pos)
+        if not code:
+            pos += 1
+            continue
+        length = int.from_bytes(data[pos - 4:pos], "big")
+        end = pos + length
+        nal = data[pos + code:pos + code + 2]
+        parameter_set = len(nal) == 2 and not nal[0] & 0x80 and nal[1] & 7 and 32 <= (nal[0] >> 1) & 0x3F <= 34
+        if length < code + 2 or end > len(data) or not parameter_set:
+            pos += 1
+            continue
+        if best is None or length > best[1] - best[0]:
+            best = (pos, end)
+        pos = end
+    if not best:
+        raise ValueError("wxgf image has no HEVC partition")
+    return data[best[0]:best[1]]
+
+
+def wxgf_to_image(data: bytes, ffmpeg: str) -> Image.Image:
+    """First frame of a WeChat wxgf image (used for avatars and stickers that come in this format)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = os.path.join(tmp, "in.hevc"), os.path.join(tmp, "out.png")
+        with open(src, "wb") as f:
+            f.write(_wxgf_partition(data))
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "hevc", "-i", src,
+                        "-frames:v", "1", out], check=True, capture_output=True, timeout=30)
+        im = Image.open(out)
+        im.load()
+        return im
+
+
 def _encode_cmd(ffmpeg: str, source: list[str], out: str, fps: float) -> list[str]:
     """Input 0 is a white background, input 1 the sticker (with alpha), centred and padded."""
     graph = (f"[1:v]scale={SIZE}:{SIZE}:force_original_aspect_ratio=decrease,"
