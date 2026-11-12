@@ -57,6 +57,7 @@ HELP = (
     "/wxlogin — 重新扫码登录微信（掉线或被踢下线时用）\n\n"
     "在桥接群里可用：\n"
     "/wx — 查看这个群对应的微信会话\n"
+    "/avatar — 重新获取微信头像作为群头像\n"
     "以 // 开头的消息只留在 Telegram，不会发到微信。"
 )
 
@@ -71,6 +72,14 @@ def _proxy(url: str):
 
 def _esc(s: str | None) -> str:
     return html.escape(s or "")
+
+
+def _fingerprint(m) -> tuple:
+    """What the bot's copy and your account's copy of one message have in common."""
+    media = getattr(m, "media", None)
+    if isinstance(media, types.MessageMediaWebPage):
+        media = None
+    return (getattr(m, "message", None) or "", type(media).__name__ if media else "")
 
 
 def _chunks(text: str, size: int = TG_TEXT_LIMIT) -> list[str]:
@@ -97,6 +106,10 @@ class Bridge(LoginMixin):
         self.names: dict[tuple[str, str], str] = {}
         self.started = time.time()
         self.forwarded = 0
+        # Pairing bot-side and user-side ids of the same bridged message (see store.msgmap):
+        # chat -> [(fingerprint, payload, time)] not matched yet.
+        self.unpaired_bot: dict[int, list] = defaultdict(list)   # payload: (wx_thread, wx_msg, wx_server)
+        self.unpaired_user: dict[int, list] = defaultdict(list)  # payload: user-side message id
 
     # ======================================================================
     # startup
@@ -132,6 +145,9 @@ class Bridge(LoginMixin):
         self.user.add_event_handler(self.on_tg_message, events.NewMessage(
             outgoing=True, func=lambda e: self.store.thread_for_chat(e.chat_id) is not None))
         self.user.add_event_handler(self.on_raw_update, events.Raw(types.UpdateNewMessage))
+        self.user.add_event_handler(self.on_user_sees_bot_message, events.NewMessage(
+            incoming=True, func=lambda e: e.sender_id == self.bot_me.id
+            and self.store.thread_for_chat(e.chat_id) is not None))
         await asyncio.gather(self.wechat_side(), self.user.run_until_disconnected())
 
     async def wechat_side(self) -> None:
@@ -318,16 +334,30 @@ class Bridge(LoginMixin):
         await self._init_chat(chat_id, tg_chat.id, thread)
         return chat_id
 
+    async def sync_avatar(self, chat_id: int, thread_id: str) -> bool:
+        """Set the Telegram group photo to the WeChat avatar. True when it was set."""
+        try:
+            data = await self.wx.fetch_avatar(thread_id)
+            if not data:
+                log.info("No WeChat avatar available for %s", thread_id)
+                return False
+            f = await self.user.upload_file(io.BytesIO(data), file_name="avatar.jpg")
+            peer = utils.resolve_id(chat_id)[0]
+            if chat_id < -1000000000000:  # upgraded to a supergroup
+                await self.user(functions.channels.EditPhotoRequest(
+                    channel=await self.user.get_input_entity(chat_id), photo=types.InputChatUploadedPhoto(file=f)))
+            else:
+                await self.user(functions.messages.EditChatPhotoRequest(
+                    chat_id=peer, photo=types.InputChatUploadedPhoto(file=f)))
+            return True
+        except Exception as e:
+            log.info("Could not set group avatar for %s: %s", thread_id, e)
+            return False
+
     async def _init_chat(self, chat_id: int, raw_chat_id: int, thread: dict) -> None:
         if self.cfg.bridge.sync_avatar:
-            try:
-                data = await self.wx.avatar(thread["id"])
-                if data:
-                    f = await self.user.upload_file(io.BytesIO(data), file_name="avatar.jpg")
-                    await self.user(functions.messages.EditChatPhotoRequest(
-                        chat_id=raw_chat_id, photo=types.InputChatUploadedPhoto(file=f)))
-            except Exception as e:
-                log.info("Could not set group avatar for %s: %s", thread["id"], e)
+            # Fetching an avatar from WeChat can take a while; don't hold up the first message.
+            asyncio.create_task(self.sync_avatar(chat_id, thread["id"]))
         kind = "群聊" if thread.get("kind") == "group" else "联系人"
         await self.bot.send_message(chat_id, f"已连接微信{kind}：<b>{_esc(thread.get('displayName'))}</b>\n"
                                              f"<code>{_esc(thread['id'])}</code>", parse_mode="html", silent=True)
@@ -413,8 +443,27 @@ class Bridge(LoginMixin):
         silent = outgoing and self.cfg.bridge.outgoing_silent
         sent = await self._send_tg(chat, thread, header, prefix, msg, media, reply_to, silent)
         for m in sent:
-            self.store.map_message(chat, m.id, msg["threadId"], msg["id"], msg.get("serverId"))
+            self.store.map_message(chat, "bot", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
+            self._pair(chat, _fingerprint(m), bot=(msg["threadId"], msg["id"], msg.get("serverId")))
         self.forwarded += 1
+
+    # --- pairing the two views of a bridged message ----------------------
+    async def on_user_sees_bot_message(self, event) -> None:
+        """Your account received a message the bot posted; it has a different id there."""
+        self._pair(event.chat_id, _fingerprint(event.message), user=event.message.id)
+
+    def _pair(self, chat: int, fp: tuple, bot: tuple | None = None, user: int | None = None) -> None:
+        now = time.monotonic()
+        mine, other = (self.unpaired_bot, self.unpaired_user) if bot else (self.unpaired_user, self.unpaired_bot)
+        for q in (mine[chat], other[chat]):
+            q[:] = [e for e in q if now - e[2] < 300][-50:]
+        for i, (ofp, payload, _) in enumerate(other[chat]):
+            if ofp == fp:
+                del other[chat][i]
+                user_id, wx = (payload, bot) if bot else (user, payload)
+                self.store.map_message(chat, "user", user_id, *wx)
+                return
+        mine[chat].append((fp, bot or user, now))
 
     async def _send_tg(self, chat, thread, header, prefix, msg, media, reply_to, silent) -> list:
         async def go(chat_id: int) -> list:
@@ -495,6 +544,11 @@ class Bridge(LoginMixin):
             await self.bot.send_message(chat_id, f"对应微信会话：<code>{_esc(thread_id)}</code>",
                                         parse_mode="html", reply_to=msg.id)
             return
+        if text.strip() in ("/avatar", f"/avatar@{self.bot_me.username}"):
+            ok = await self.sync_avatar(chat_id, thread_id)
+            await self.bot.send_message(chat_id, "已更新群头像" if ok else "没有拿到这个会话的微信头像",
+                                        reply_to=msg.id)
+            return
         if text.startswith("/") and not msg.media:
             return  # other commands are not forwarded
 
@@ -519,9 +573,21 @@ class Bridge(LoginMixin):
                         result = await self.wx.send_text(thread_id, text, key + "-caption")
                         self._record_send(chat_id, msg.id, thread_id, result)
             elif text:
-                result = await self.wx.send_text(thread_id, text, key, quote_ref)
-                if quote_ref and result.get("state") == "failed":  # quoting can be refused; fall back to plain
-                    result = await self.wx.send_text(thread_id, text, key + "-plain")
+                result = None
+                if quote_ref:
+                    try:
+                        result = await self.wx.send_text(thread_id, text, key, quote_ref)
+                    except WeChatError as e:
+                        if e.status >= 500:
+                            raise
+                        log.info("WeChat refused the quote (%s); sending without it", e.code)
+                    if result is not None and result.get("state") == "failed":
+                        log.info("Quote send failed (%s); sending without it", result.get("errorCode"))
+                        result = None
+                    if result is None:
+                        result = await self.wx.send_text(thread_id, text, key + "-plain")
+                else:
+                    result = await self.wx.send_text(thread_id, text, key)
                 self._record_send(chat_id, msg.id, thread_id, result)
             if result is not None:
                 state = result.get("state")
@@ -552,7 +618,7 @@ class Bridge(LoginMixin):
             self.store.add_sent(thread_id, server)
         # One Telegram message may become two WeChat sends (media + caption); quotes point at the first.
         if (server or local) and self.store.wx_for_tg(chat_id, tg_msg) is None:
-            self.store.map_message(chat_id, tg_msg, thread_id, local, server)
+            self.store.map_message(chat_id, "user", tg_msg, thread_id, local, server)
 
     async def _tg_media(self, msg) -> tuple[str | None, Media | str]:
         f = msg.file

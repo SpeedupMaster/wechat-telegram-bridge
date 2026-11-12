@@ -13,21 +13,26 @@ CREATE TABLE IF NOT EXISTS threads (
     title      TEXT,
     created_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS messages (
+-- Message ids in Telegram basic groups are per account: the same message has one id for the bot
+-- and another for your account. side = 'bot' (ids the bot uses, e.g. for reply_to) or
+-- 'user' (ids your account sees, e.g. the message you replied to).
+DROP TABLE IF EXISTS messages;
+CREATE TABLE IF NOT EXISTS msgmap (
     tg_chat   INTEGER NOT NULL,
+    side      TEXT NOT NULL,
     tg_msg    INTEGER NOT NULL,
     wx_thread TEXT NOT NULL,
     wx_msg    TEXT,
     wx_server TEXT,
-    PRIMARY KEY (tg_chat, tg_msg)
+    PRIMARY KEY (tg_chat, side, tg_msg)
 );
 CREATE TABLE IF NOT EXISTS sent (
     wx_thread TEXT NOT NULL,
     wx_server TEXT NOT NULL,
     PRIMARY KEY (wx_thread, wx_server)
 );
-CREATE INDEX IF NOT EXISTS messages_wx_msg ON messages (wx_msg);
-CREATE INDEX IF NOT EXISTS messages_wx_server ON messages (wx_thread, wx_server);
+CREATE INDEX IF NOT EXISTS msgmap_wx_msg ON msgmap (wx_msg);
+CREATE INDEX IF NOT EXISTS msgmap_wx_server ON msgmap (wx_thread, wx_server);
 """
 
 
@@ -65,34 +70,36 @@ class Store:
 
     def migrate_chat(self, old_chat: int, new_chat: int) -> None:
         self.db.execute("UPDATE threads SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
-        self.db.execute("UPDATE messages SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
+        self.db.execute("UPDATE msgmap SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
 
     def linked_chats(self) -> set[int]:
         return {r[0] for r in self.db.execute("SELECT tg_chat FROM threads")}
 
     # --- messages ---------------------------------------------------------
-    def map_message(self, tg_chat: int, tg_msg: int, wx_thread: str, wx_msg: str | None, wx_server: str | None) -> None:
+    def map_message(self, tg_chat: int, side: str, tg_msg: int, wx_thread: str, wx_msg: str | None,
+                    wx_server: str | None) -> None:
         self.db.execute(
-            "INSERT INTO messages(tg_chat,tg_msg,wx_thread,wx_msg,wx_server) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(tg_chat,tg_msg) DO UPDATE SET wx_msg=COALESCE(excluded.wx_msg,wx_msg), "
+            "INSERT INTO msgmap(tg_chat,side,tg_msg,wx_thread,wx_msg,wx_server) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(tg_chat,side,tg_msg) DO UPDATE SET wx_msg=COALESCE(excluded.wx_msg,wx_msg), "
             "wx_server=COALESCE(excluded.wx_server,wx_server)",
-            (tg_chat, tg_msg, wx_thread, wx_msg, wx_server))
+            (tg_chat, side, tg_msg, wx_thread, wx_msg, wx_server))
 
-    def wx_for_tg(self, tg_chat: int, tg_msg: int) -> tuple[str | None, str | None] | None:
-        row = self.db.execute("SELECT wx_msg, wx_server FROM messages WHERE tg_chat=? AND tg_msg=?",
-                              (tg_chat, tg_msg)).fetchone()
+    def wx_for_tg(self, tg_chat: int, tg_msg: int, side: str = "user") -> tuple[str | None, str | None] | None:
+        row = self.db.execute("SELECT wx_msg, wx_server FROM msgmap WHERE tg_chat=? AND side=? AND tg_msg=?",
+                              (tg_chat, side, tg_msg)).fetchone()
         return (row[0], row[1]) if row else None
 
-    def tg_for_wx(self, wx_thread: str, wx_msg: str | None, wx_server: str | None) -> tuple[int, int] | None:
+    def tg_for_wx(self, wx_thread: str, wx_msg: str | None, wx_server: str | None,
+                  side: str = "bot") -> tuple[int, int] | None:
         if wx_msg:
-            row = self.db.execute("SELECT tg_chat, tg_msg FROM messages WHERE wx_msg=? ORDER BY tg_msg LIMIT 1",
-                                  (wx_msg,)).fetchone()
+            row = self.db.execute("SELECT tg_chat, tg_msg FROM msgmap WHERE wx_msg=? AND side=? ORDER BY tg_msg LIMIT 1",
+                                  (wx_msg, side)).fetchone()
             if row:
                 return row[0], row[1]
         if wx_server:
             row = self.db.execute(
-                "SELECT tg_chat, tg_msg FROM messages WHERE wx_thread=? AND wx_server=? ORDER BY tg_msg LIMIT 1",
-                (wx_thread, wx_server)).fetchone()
+                "SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND wx_server=? AND side=? ORDER BY tg_msg LIMIT 1",
+                (wx_thread, wx_server, side)).fetchone()
             if row:
                 return row[0], row[1]
         return None
@@ -105,9 +112,9 @@ class Store:
         if not self.db.execute("SELECT 1 FROM sent WHERE wx_thread=? AND wx_server=?",
                                (wx_thread, wx_server)).fetchone():
             return False
-        self.db.execute("UPDATE messages SET wx_msg=? WHERE wx_thread=? AND wx_server=? AND wx_msg IS NULL",
+        self.db.execute("UPDATE msgmap SET wx_msg=? WHERE wx_thread=? AND wx_server=? AND wx_msg IS NULL",
                         (wx_msg, wx_thread, wx_server))
         return True
 
     def seen_wx_msg(self, wx_msg: str) -> bool:
-        return self.db.execute("SELECT 1 FROM messages WHERE wx_msg=? LIMIT 1", (wx_msg,)).fetchone() is not None
+        return self.db.execute("SELECT 1 FROM msgmap WHERE wx_msg=? LIMIT 1", (wx_msg,)).fetchone() is not None

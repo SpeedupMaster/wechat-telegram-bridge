@@ -151,6 +151,25 @@ class WeChatClient:
             return None
         return r.content if r.headers.get("content-type", "").startswith("image/") else None
 
+    async def fetch_avatar(self, username: str, wait: float = 60.0) -> bytes | None:
+        """Cached avatar, or ask WeChat for it first (the daemon only caches avatars it has seen)."""
+        if data := await self.avatar(username):
+            return data
+        try:
+            op = await self._req("POST", self._a(f"avatars/{_id(username)}/refresh"), json={})
+        except WeChatError as e:
+            log.info("Avatar refresh for %s refused: %s", username, e.code)
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        while op.get("state") not in ("succeeded", "failed", "expired", "rejected", "cancelled") \
+                and loop.time() < deadline:
+            await asyncio.sleep(1.5)
+            op = await self.operation(op["id"])
+        if op.get("state") != "succeeded":
+            log.info("Avatar refresh for %s ended as %s: %s", username, op.get("state"), op.get("result"))
+        return await self.avatar(username)
+
     async def mark_read(self, thread_id: str) -> None:
         t = await self.thread(thread_id)
         if t.get("unreadCount"):

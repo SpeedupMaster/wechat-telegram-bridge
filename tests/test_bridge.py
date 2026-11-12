@@ -29,6 +29,7 @@ class FakeDaemon:
         self.uploads: list[tuple[str, bytes]] = []
         self.sse_body = ""
         self.marked_read: list[str] = []
+        self.avatar_refreshed: list[str] = []
 
     def add_thread(self, tid, name, kind="direct"):
         self.threads[tid] = {"id": tid, "accountId": ACC, "peerId": tid, "kind": kind, "displayName": name,
@@ -62,7 +63,14 @@ class FakeDaemon:
         if rest[0] == "threads" and rest[2] == "read-state":
             self.marked_read.append(rest[1])
             return httpx.Response(200, json={})
+        if rest[0] == "avatars" and len(rest) == 3 and m == "POST":  # .../refresh
+            self.avatar_refreshed.append(rest[1])
+            return httpx.Response(202, json={"id": "avop", "state": "running"})
+        if rest[:2] == ["operations", "avop"]:
+            return httpx.Response(200, json={"id": "avop", "state": "succeeded"})
         if rest[0] == "avatars":
+            if rest[1] in self.avatar_refreshed:
+                return httpx.Response(200, content=b"JPEGDATA", headers={"content-type": "image/jpeg"})
             return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
         if rest[0] == "groups" and rest[2] == "members":
             return httpx.Response(200, json={"state": "present", "member": {"displayName": "Alice in group"}})
@@ -104,6 +112,9 @@ class Sent:
         Sent._next += 1
         self.id = Sent._next
         self.chat, self.text, self.file, self.kwargs = chat, text, file, kwargs or {}
+        # what Telethon exposes on the sent message (used to pair the bot's and your account's copies)
+        self.message = text if text is not None else (self.kwargs.get("caption") or "")
+        self.media = None if file is None else types.MessageMediaDocument()
 
 
 class FakeBot:
@@ -124,6 +135,7 @@ class FakeBot:
 class FakeUser:
     def __init__(self):
         self.created: list[str] = []
+        self.photos: list = []
 
     async def __call__(self, request):
         if isinstance(request, functions.messages.CreateChatRequest):
@@ -132,6 +144,9 @@ class FakeUser:
                               participants_count=2, date=None, version=1)
             return types.messages.InvitedUsers(
                 updates=types.Updates(updates=[], users=[], chats=[chat], date=None, seq=0), missing_invitees=[])
+        if isinstance(request, functions.messages.EditChatPhotoRequest):
+            self.photos.append((request.chat_id, request.photo.file[1]))
+            return None
         raise AssertionError(f"unexpected request {request}")
 
 
@@ -212,6 +227,17 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.b.user.created, ["文件传输助手"])
         self.assertIn("test", self.b.bot.sent[-1].text)
 
+    async def test_avatar_fetched_from_wechat_when_not_cached(self):
+        self.b.user.photos = []
+
+        async def upload_file(f, file_name=None):
+            return ("uploaded", f.read())
+        self.b.user.upload_file = upload_file
+        ok = await self.b.sync_avatar(-501, "wxid_bob")
+        self.assertTrue(ok)
+        self.assertEqual(self.daemon.avatar_refreshed, ["wxid_bob"])
+        self.assertEqual(self.b.user.photos, [(501, b"JPEGDATA")])
+
     async def test_image_is_downloaded_and_sent_as_file(self):
         self.daemon.add_thread("wxid_bob", "Bob")
         self.daemon.add_message("img1", "wxid_bob", None, type_=3)
@@ -226,19 +252,24 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.event("m1", "wxid_bob")
         chat = self.b.store.chat_for_thread("wxid_bob")
         bridged = self.b.bot.sent[-1].id
+        # In basic groups your account sees the bot's message under its own, different id.
+        seen = SimpleNamespace(chat_id=chat, message=SimpleNamespace(id=5001, message="question", media=None))
+        await self.b.on_user_sees_bot_message(seen)
 
-        await self.b.on_tg_message(tg_event(chat, 9001, "answer", reply_to=bridged))
+        await self.b.on_tg_message(tg_event(chat, 9000, "no quote", reply_to=bridged))
+        self.assertNotIn("quote", self.daemon.sends[-1][0], "the bot's id must not be read as yours")
+        await self.b.on_tg_message(tg_event(chat, 9001, "answer", reply_to=5001))
         body, key = self.daemon.sends[-1]
         self.assertEqual(key, f"tg-{chat}-9001")
         self.assertEqual(body["text"], "answer")
         self.assertEqual(body["quote"], {"messageId": "m1", "serverId": "777"})
-        self.assertEqual(self.daemon.marked_read, ["wxid_bob"])
+        self.assertEqual(self.daemon.marked_read, ["wxid_bob", "wxid_bob"])
 
         n_sent = len(self.b.bot.sent)
-        self.daemon.add_message("echo", "wxid_bob", "answer", direction="outgoing", server="901")
+        self.daemon.add_message("echo", "wxid_bob", "answer", direction="outgoing", server="902")
         await self.event("echo", "wxid_bob", direction="outgoing")
         self.assertEqual(len(self.b.bot.sent), n_sent, "echo of our own send must not be forwarded")
-        self.assertEqual(self.b.store.wx_for_tg(chat, 9001), ("echo", "901"))
+        self.assertEqual(self.b.store.wx_for_tg(chat, 9001), ("echo", "902"))
 
     async def test_phone_outgoing_is_forwarded_silently(self):
         self.daemon.add_thread("wxid_bob", "Bob")
