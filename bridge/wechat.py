@@ -151,24 +151,31 @@ class WeChatClient:
             return None
         return r.content if r.headers.get("content-type", "").startswith("image/") else None
 
-    async def fetch_avatar(self, username: str, wait: float = 60.0) -> bytes | None:
-        """Cached avatar, or ask WeChat for it first (the daemon only caches avatars it has seen)."""
+    async def fetch_avatar(self, username: str, wait: float = 60.0,
+                           retry_delays: tuple[float, ...] = (1, 2, 4)) -> tuple[bytes | None, str]:
+        """(avatar, "") — or (None, why not). The daemon only caches avatars it has seen, so ask WeChat first."""
         if data := await self.avatar(username):
-            return data
+            return data, ""
         try:
             op = await self._req("POST", self._a(f"avatars/{_id(username)}/refresh"), json={})
         except WeChatError as e:
-            log.info("Avatar refresh for %s refused: %s", username, e.code)
-            return None
+            return None, f"refresh refused: {e.code}"
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait
-        while op.get("state") not in ("succeeded", "failed", "expired", "rejected", "cancelled") \
+        while op.get("state") not in ("succeeded", "failed", "expired", "rejected", "cancelled", "needs_review") \
                 and loop.time() < deadline:
             await asyncio.sleep(1.5)
             op = await self.operation(op["id"])
-        if op.get("state") != "succeeded":
-            log.info("Avatar refresh for %s ended as %s: %s", username, op.get("state"), op.get("result"))
-        return await self.avatar(username)
+        state = op.get("state")
+        if state != "succeeded":
+            result = op.get("result") or {}
+            code = result.get("code") if isinstance(result, dict) else None
+            return None, f"refresh {state or 'unknown'}: {code or result or 'no details'}"
+        for delay in (0, *retry_delays):  # the daemon's profile reader can lag a moment behind the write
+            await asyncio.sleep(delay)
+            if data := await self.avatar(username):
+                return data, ""
+        return None, "refresh succeeded but the avatar is still not readable"
 
     async def mark_read(self, thread_id: str) -> None:
         t = await self.thread(thread_id)

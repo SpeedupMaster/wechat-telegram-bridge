@@ -30,6 +30,8 @@ class FakeDaemon:
         self.sse_body = ""
         self.marked_read: list[str] = []
         self.avatar_refreshed: list[str] = []
+        self.avatar_op = {"id": "avop", "state": "succeeded"}
+        self.avatar_lag = 0  # reads after a successful refresh that still miss (profile reader lag)
         self.media: dict[str, list[dict]] = {}  # message id -> media assets (default: one available PNG)
 
     def add_thread(self, tid, name, kind="direct"):
@@ -70,9 +72,12 @@ class FakeDaemon:
             self.avatar_refreshed.append(rest[1])
             return httpx.Response(202, json={"id": "avop", "state": "running"})
         if rest[:2] == ["operations", "avop"]:
-            return httpx.Response(200, json={"id": "avop", "state": "succeeded"})
+            return httpx.Response(200, json=self.avatar_op)
         if rest[0] == "avatars":
-            if rest[1] in self.avatar_refreshed:
+            if rest[1] in self.avatar_refreshed and self.avatar_op["state"] == "succeeded":
+                if self.avatar_lag:
+                    self.avatar_lag -= 1
+                    return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
                 return httpx.Response(200, content=b"JPEGDATA", headers={"content-type": "image/jpeg"})
             return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
         if rest[0] == "groups" and rest[2] == "members":
@@ -236,10 +241,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         async def upload_file(f, file_name=None):
             return ("uploaded", f.read())
         self.b.user.upload_file = upload_file
-        ok = await self.b.sync_avatar(-501, "wxid_bob")
-        self.assertTrue(ok)
+        why = await self.b.sync_avatar(-501, "wxid_bob")
+        self.assertEqual(why, "")
         self.assertEqual(self.daemon.avatar_refreshed, ["wxid_bob"])
         self.assertEqual(self.b.user.photos, [(501, b"JPEGDATA")])
+
+    async def test_avatar_read_retried_after_refresh(self):
+        self.daemon.avatar_lag = 2
+        data, why = await self.b.wx.fetch_avatar("wxid_bob", retry_delays=(0, 0, 0))
+        self.assertEqual((data, why), (b"JPEGDATA", ""))
+
+    async def test_avatar_failure_reason_reported(self):
+        self.daemon.avatar_op = {"id": "avop", "state": "failed", "result": {"code": "avatar_not_advertised"}}
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m1", "wxid_bob", "hi")
+        self.b.cfg.bridge.sync_avatar = False
+        await self.event("m1", "wxid_bob")
+        chat = self.b.store.chat_for_thread("wxid_bob")
+        await self.b.on_tg_message(tg_event(chat, 7000, "/avatar"))
+        self.assertEqual(self.b.bot.sent[-1].text, "没有拿到这个会话的微信头像（refresh failed: avatar_not_advertised）")
 
     async def test_image_is_downloaded_and_sent_as_file(self):
         self.daemon.add_thread("wxid_bob", "Bob")

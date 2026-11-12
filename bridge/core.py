@@ -347,13 +347,13 @@ class Bridge(LoginMixin):
         await self._init_chat(chat_id, tg_chat.id, thread)
         return chat_id
 
-    async def sync_avatar(self, chat_id: int, thread_id: str) -> bool:
-        """Set the Telegram group photo to the WeChat avatar. True when it was set."""
+    async def sync_avatar(self, chat_id: int, thread_id: str) -> str:
+        """Set the Telegram group photo to the WeChat avatar. "" when it was set, otherwise why not."""
         try:
-            data = await self.wx.fetch_avatar(thread_id)
+            data, why = await self.wx.fetch_avatar(thread_id)
             if not data:
-                log.info("No WeChat avatar available for %s", thread_id)
-                return False
+                log.info("No WeChat avatar for %s: %s", thread_id, why)
+                return why
             f = await self.user.upload_file(io.BytesIO(data), file_name="avatar.jpg")
             peer = utils.resolve_id(chat_id)[0]
             if chat_id < -1000000000000:  # upgraded to a supergroup
@@ -362,10 +362,10 @@ class Bridge(LoginMixin):
             else:
                 await self.user(functions.messages.EditChatPhotoRequest(
                     chat_id=peer, photo=types.InputChatUploadedPhoto(file=f)))
-            return True
+            return ""
         except Exception as e:
             log.info("Could not set group avatar for %s: %s", thread_id, e)
-            return False
+            return f"{type(e).__name__}: {e}"
 
     async def _init_chat(self, chat_id: int, raw_chat_id: int, thread: dict) -> None:
         if self.cfg.bridge.sync_avatar:
@@ -560,8 +560,8 @@ class Bridge(LoginMixin):
                                         parse_mode="html", reply_to=msg.id)
             return
         if text.strip() in ("/avatar", f"/avatar@{self.bot_me.username}"):
-            ok = await self.sync_avatar(chat_id, thread_id)
-            await self.bot.send_message(chat_id, "已更新群头像" if ok else "没有拿到这个会话的微信头像",
+            why = await self.sync_avatar(chat_id, thread_id)
+            await self.bot.send_message(chat_id, f"没有拿到这个会话的微信头像（{why}）" if why else "已更新群头像",
                                         reply_to=msg.id)
             return
         if text.startswith("/") and not msg.media:
