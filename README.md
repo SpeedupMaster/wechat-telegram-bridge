@@ -26,7 +26,7 @@
 
 ## 部署（Docker Compose，一台 Linux VPS）
 
-agent-wechat 和本程序跑在同一台 VPS 上。agent-wechat 的 API 只监听 `127.0.0.1:6174`，不对公网开放任何端口。需要 Docker 和 Docker Compose 插件 v2.23.1 或更新（`docker compose version` 查看），x86_64 或 ARM64 Linux。
+agent-wechat 和本程序跑在同一台 VPS 上。agent-wechat 的 API 只监听 `127.0.0.1:6174`，不对公网开放任何端口。需要 Docker 和 Docker Compose 插件（`docker compose version` 能输出版本号），x86_64 或 ARM64 Linux。
 
 ### 你需要自己准备的 3 样东西
 
@@ -87,7 +87,7 @@ sh setup.sh
 | 微信掉线或被踢下线 | 机器人会通知你，私聊机器人发 `/wxlogin` 重新扫码 |
 | 换一个 Telegram 账号 | `docker compose down`，删除 `bridge-data` 卷，再 `docker compose up -d`，重新配对 |
 | 高级设置 | `cp config.example.toml config/config.toml`，编辑后 `docker compose restart telegram-bridge` |
-| 备份 | 备份 `.env` 以及 `wechat-data`、`wechat-token`、`bridge-data` 三个卷 |
+| 备份 | 备份 `.env` 以及 `wechat-data`、`wechat-token`、`bridge-data` 三个卷（`wechat-config` 每次启动自动重写，不用备份） |
 
 注意：
 
@@ -144,7 +144,7 @@ bridge/
   store.py      SQLite：事件游标、微信会话 ↔ Telegram 群、消息 ID 对照
 tests/          离线测试（模拟 agent-wechat 和 Telegram）
 Dockerfile      桥接程序镜像（带 ffmpeg）
-compose.yaml    token 初始化 + agent-wechat（含守护进程配置）+ 桥接程序
+compose.yaml    初始化（token 和守护进程配置）+ agent-wechat + 桥接程序；只需要这一个文件就能部署
 setup.sh        一键安装：写 .env、启动、显示配对码
 .github/workflows/image.yml   GitHub Actions：跑测试，构建并推送镜像到 ghcr.io
 .env.example    Telegram 的 3 个必填项

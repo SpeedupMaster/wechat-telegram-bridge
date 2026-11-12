@@ -11,13 +11,18 @@
 # No ports are published.
 
 services:
-  # One-shot: creates the agent-wechat API token on first start (kept in the wechat-token volume).
-  # The daemon refuses token files that other users can read, so each side gets its own copy.
+  # One-shot, runs before the others on every start:
+  #  - creates the agent-wechat API token the first time (kept in the wechat-token volume).
+  #    The daemon refuses token files that other users can read, so each side gets its own copy.
+  #  - writes the agent-wechat server config (same as upstream deploy/native/server.toml:
+  #    API on loopback only) into the wechat-config volume. agent-wechat runs with a read-only
+  #    filesystem, so this is mounted as a volume rather than a Compose config or a host file.
   token-init:
     image: busybox:1.37
     network_mode: none
     volumes:
       - wechat-token:/token
+      - wechat-config:/config
     command:
       - sh
       - -ec
@@ -32,6 +37,14 @@ services:
         chown 10002:10002 /token/bridge-token
         chmod 600 /token/daemon-token /token/bridge-token
         chmod 755 /token
+        {
+          echo 'schemaVersion = 1'
+          echo 'listen = "127.0.0.1:6174"'
+          echo 'dataDir = "/var/lib/agent-wechat"'
+          echo 'tokenFile = "/token/daemon-token"'
+        } > /config/config.toml
+        chmod 644 /config/config.toml
+        chmod 755 /config
     restart: "no"
 
   agent-wechat:
@@ -51,9 +64,7 @@ services:
       - wechat-data:/var/lib/agent-wechat
       - wechat-scratch:/var/cache/agent-wechat
       - wechat-token:/token:ro
-    configs:
-      - source: agent-wechat-server
-        target: /etc/agent-wechat/server/config.toml
+      - wechat-config:/etc/agent-wechat/server:ro
     depends_on:
       token-init:
         condition: service_completed_successfully
@@ -86,19 +97,9 @@ services:
         condition: service_started
     restart: unless-stopped
 
-configs:
-  # agent-wechat daemon config, same as upstream deploy/native/server.toml:
-  # the API listens on loopback only; the token file comes from token-init.
-  # (Inline content needs Docker Compose v2.23.1 or newer.)
-  agent-wechat-server:
-    content: |
-      schemaVersion = 1
-      listen = "127.0.0.1:6174"
-      dataDir = "/var/lib/agent-wechat"
-      tokenFile = "/token/daemon-token"
-
 volumes:
   wechat-data:
+  wechat-config:
   wechat-scratch:
   wechat-token:
   bridge-data:
