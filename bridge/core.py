@@ -108,7 +108,9 @@ class Bridge(LoginMixin):
         await self.user.connect()
         self.bot.add_event_handler(self.on_bot_private, events.NewMessage(incoming=True, func=lambda e: e.is_private))
         self.bot.add_event_handler(self.on_bot_callback, events.CallbackQuery())
-        await asyncio.gather(self.main(), self.user.run_until_disconnected(), self.bot.run_until_disconnected())
+        # The user client's update loop may only start once that account is logged in
+        # (before that Telegram answers AUTH_KEY_UNREGISTERED), so main() starts it after login.
+        await asyncio.gather(self.main(), self.bot.run_until_disconnected())
 
     async def main(self) -> None:
         if await self.user.is_user_authorized():
@@ -129,7 +131,9 @@ class Bridge(LoginMixin):
         self.user.add_event_handler(self.on_tg_message, events.NewMessage(
             outgoing=True, func=lambda e: self.store.thread_for_chat(e.chat_id) is not None))
         self.user.add_event_handler(self.on_raw_update, events.Raw(types.UpdateNewMessage))
+        await asyncio.gather(self.wechat_side(), self.user.run_until_disconnected())
 
+    async def wechat_side(self) -> None:
         await self.ensure_wechat()
         log.info("WeChat is logged in; bridging messages")
         await asyncio.gather(self.event_loop(), self.wechat_monitor())

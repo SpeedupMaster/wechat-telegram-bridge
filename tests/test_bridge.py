@@ -380,6 +380,41 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("手机微信上点" in t for t in texts))
         self.assertIn("微信已登录", texts[-1])
 
+    async def test_startup_without_telegram_login_waits_for_pairing(self):
+        from telethon import errors
+
+        class Client:
+            def __init__(self, authorized):
+                self.authorized = authorized
+                self.handlers = []
+
+            async def start(self, **kw):
+                pass
+
+            async def connect(self):
+                pass
+
+            async def get_me(self):
+                return SimpleNamespace(username="mybot", id=1)
+
+            async def is_user_authorized(self):
+                return self.authorized
+
+            def add_event_handler(self, *a):
+                self.handlers.append(a)
+
+            async def run_until_disconnected(self):
+                if not self.authorized:  # what Telegram does for a session that is not logged in
+                    raise errors.AuthKeyUnregisteredError(request=None)
+                await asyncio.Event().wait()
+
+        self.b.bot, self.b.user = Client(True), Client(False)
+        task = asyncio.create_task(self.b.run())
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done(), task.done() and task.exception())
+        self.assertIsNotNone(self.b.pairing_code)
+        task.cancel()
+
     async def test_pairing_code_gate(self):
         replies = []
 

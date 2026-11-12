@@ -51,7 +51,9 @@ services:
       - wechat-data:/var/lib/agent-wechat
       - wechat-scratch:/var/cache/agent-wechat
       - wechat-token:/token:ro
-      - ./deploy/agent-wechat.toml:/etc/agent-wechat/server/config.toml:ro
+    configs:
+      - source: agent-wechat-server
+        target: /etc/agent-wechat/server/config.toml
     depends_on:
       token-init:
         condition: service_completed_successfully
@@ -83,6 +85,17 @@ services:
       agent-wechat:
         condition: service_started
     restart: unless-stopped
+
+configs:
+  # agent-wechat daemon config, same as upstream deploy/native/server.toml:
+  # the API listens on loopback only; the token file comes from token-init.
+  # (Inline content needs Docker Compose v2.23.1 or newer.)
+  agent-wechat-server:
+    content: |
+      schemaVersion = 1
+      listen = "127.0.0.1:6174"
+      dataDir = "/var/lib/agent-wechat"
+      tokenFile = "/token/daemon-token"
 
 volumes:
   wechat-data:
