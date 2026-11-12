@@ -75,6 +75,18 @@ def _esc(s: str | None) -> str:
     return html.escape(s or "")
 
 
+# agent-wechat reason codes for attachments it could not fetch
+MEDIA_REASONS = {
+    "unsupported_sticker_source": "这个表情没有可下载的地址（比如自定义/加密表情），agent-wechat 拿不到",
+    "sticker_source_not_allowed": "表情地址不在 agent-wechat 允许的服务器上",
+    "sticker_source_dns_not_public": "表情服务器解析失败",
+    "sticker_dns_failed": "表情服务器解析失败",
+    "media_expired": "已过期",
+    "unsupported_media": "不支持",
+    "unsupported_media_transport": "不支持",
+}
+
+
 def _fingerprint(m) -> tuple:
     """What the bot's copy and your account's copy of one message have in common."""
     media = getattr(m, "media", None)
@@ -437,6 +449,8 @@ class Bridge(LoginMixin):
                 media = await self.wx.download_media(msg, self.max_media)
             except WeChatError as e:
                 media = e.code
+            if isinstance(media, str):
+                log.info("Could not download the attachment of WeChat message %s (type %s): %s", msg["id"], t, media)
             if isinstance(media, Media) and t == VOICE and media.mime == "audio/wav":
                 if ogg := await wav_to_ogg(media.data):
                     media = Media(ogg, "audio/ogg", "voice.ogg")
@@ -492,7 +506,7 @@ class Bridge(LoginMixin):
                 return out
             if isinstance(media, str):
                 label = {IMAGE: "图片", VIDEO: "视频", VOICE: "语音", STICKER: "表情"}.get(t, "文件")
-                text = header + prefix + (f"[{label}，无法获取：{_esc(media)}]" if t != STICKER else "[表情]")
+                text = header + prefix + f"[{label}，无法获取：{_esc(MEDIA_REASONS.get(media, media))}]"
             else:
                 text = header + prefix + self._body(msg)
             for i, part in enumerate(_chunks(text)):

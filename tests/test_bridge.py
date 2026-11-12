@@ -30,6 +30,7 @@ class FakeDaemon:
         self.sse_body = ""
         self.marked_read: list[str] = []
         self.avatar_refreshed: list[str] = []
+        self.media: dict[str, list[dict]] = {}  # message id -> media assets (default: one available PNG)
 
     def add_thread(self, tid, name, kind="direct"):
         self.threads[tid] = {"id": tid, "accountId": ACC, "peerId": tid, "kind": kind, "displayName": name,
@@ -50,6 +51,8 @@ class FakeDaemon:
         m = request.method
         if rest[0] == "messages" and len(rest) == 2:
             return httpx.Response(200, json=self.messages[rest[1]])
+        if rest[0] == "messages" and rest[2] == "media" and rest[1] in self.media:
+            return httpx.Response(200, json={"items": self.media[rest[1]]})
         if rest[0] == "messages" and rest[2] == "media":
             return httpx.Response(200, json={"items": [{"id": "asset-" + rest[1], "state": "available",
                                                         "variant": "original", "actualVariant": "original",
@@ -245,6 +248,28 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         s = self.b.bot.sent[-1]
         self.assertEqual(s.file.read(), b"\x89PNG")
         self.assertEqual(s.file.name, "pic.png")
+
+    async def test_sticker_is_forwarded_as_its_image(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("st1", "wxid_bob", None, type_=47)
+        self.daemon.media["st1"] = [{"id": "asset-st1", "kind": "sticker", "state": "available", "variant": "original",
+                                     "actualVariant": "original", "contentType": "image/gif", "byteLength": 4}]
+        await self.event("st1", "wxid_bob")
+        s = self.b.bot.sent[-1]
+        self.assertEqual(s.file.name, "st1.gif")
+        self.assertFalse(s.kwargs["force_document"])
+
+    async def test_sticker_that_cannot_be_downloaded_says_why(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("st2", "wxid_bob", None, type_=47)
+        self.daemon.media["st2"] = [{"id": "asset-st2", "kind": "sticker", "state": "unsupported",
+                                     "variant": "original", "reason": "unsupported_sticker_source"}]
+        with self.assertLogs("bridge", "INFO") as logs:
+            await self.event("st2", "wxid_bob")
+        text = self.b.bot.sent[-1].text
+        self.assertTrue(text.startswith("[表情，无法获取："), text)
+        self.assertIn("自定义", text)
+        self.assertTrue(any("unsupported_sticker_source" in line for line in logs.output))
 
     async def test_telegram_reply_goes_to_wechat_and_echo_is_dropped(self):
         self.daemon.add_thread("wxid_bob", "Bob")

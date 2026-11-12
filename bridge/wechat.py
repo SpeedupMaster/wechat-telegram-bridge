@@ -260,7 +260,8 @@ class WeChatClient:
         if not asset:
             states = {a.get("state") for a in items}
             if states & {"expired", "unsupported", "recalled"} and not states & {"pending"}:
-                return "已过期" if "expired" in states else "不支持"
+                reasons = [a["reason"] for a in items if a.get("reason")]
+                return reasons[0] if reasons else "已过期" if "expired" in states else "不支持"
             big = [a for a in items if (a.get("advertisedByteLength") or 0) > max_bytes]
             if big and len(big) == len(items):
                 return "文件太大"
