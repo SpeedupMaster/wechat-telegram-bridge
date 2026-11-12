@@ -244,7 +244,19 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         why = await self.b.sync_avatar(-501, "wxid_bob")
         self.assertEqual(why, "")
         self.assertEqual(self.daemon.avatar_refreshed, ["wxid_bob"])
-        self.assertEqual(self.b.user.photos, [(501, b"JPEGDATA")])
+        self.assertEqual(self.b.user.photos, [(501, b"JPEGDATA")])  # not an image: passed through as-is
+
+    async def test_small_avatar_scaled_up_for_telegram(self):
+        import io
+        from PIL import Image
+        from bridge.core import _avatar_photo
+        src = io.BytesIO()
+        Image.new("RGB", (132, 120), (10, 120, 200)).save(src, "PNG")
+        im = Image.open(io.BytesIO(_avatar_photo(src.getvalue())))
+        self.assertEqual((im.format, im.size), ("JPEG", (512, 512)))
+        big = io.BytesIO()
+        Image.new("RGB", (800, 600)).save(big, "PNG")
+        self.assertEqual(Image.open(io.BytesIO(_avatar_photo(big.getvalue()))).size, (600, 600))
 
     async def test_avatar_read_retried_after_refresh(self):
         self.daemon.avatar_lag = 2

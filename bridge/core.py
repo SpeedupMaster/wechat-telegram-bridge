@@ -87,6 +87,25 @@ MEDIA_REASONS = {
 }
 
 
+def _avatar_photo(data: bytes, size: int = 512) -> bytes:
+    """WeChat hands out small avatars (~132 px) that Telegram rejects as a chat photo
+    (PhotoCropSizeSmallError), so centre-crop to a square and scale up to size x size JPEG."""
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.load()
+    except Exception:
+        return data
+    w, h = im.size
+    side = min(w, h)
+    im = im.crop(((w - side) // 2, (h - side) // 2, (w - side) // 2 + side, (h - side) // 2 + side))
+    if side < size:
+        im = im.resize((size, size), Image.LANCZOS)
+    out = io.BytesIO()
+    stickers.on_white(im).save(out, "JPEG", quality=92)
+    return out.getvalue()
+
+
 def _fingerprint(m) -> tuple:
     """What the bot's copy and your account's copy of one message have in common."""
     media = getattr(m, "media", None)
@@ -354,6 +373,7 @@ class Bridge(LoginMixin):
             if not data:
                 log.info("No WeChat avatar for %s: %s", thread_id, why)
                 return why
+            data = await asyncio.to_thread(_avatar_photo, data)
             f = await self.user.upload_file(io.BytesIO(data), file_name="avatar.jpg")
             peer = utils.resolve_id(chat_id)[0]
             if chat_id < -1000000000000:  # upgraded to a supergroup
