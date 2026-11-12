@@ -197,6 +197,21 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.event("h1", "wxid_old", origin="sync")
         self.assertEqual(self.b.user.created, [])
 
+    async def test_caught_up_filehelper_message_forwarded_but_not_history(self):
+        import time
+        from datetime import datetime, timezone
+        self.b.since = time.time()
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self.daemon.add_thread("filehelper", "文件传输助手", kind="system")
+        self.daemon.add_message("old", "filehelper", "old note", direction="outgoing", server="1",
+                                createdAt="2020-01-01T00:00:00Z")
+        self.daemon.add_message("new", "filehelper", "test", direction="outgoing", server="2", createdAt=now)
+        await self.event("old", "filehelper", origin="catchup", direction="outgoing")
+        self.assertEqual(self.b.user.created, [])
+        await self.event("new", "filehelper", origin="catchup", direction="outgoing")
+        self.assertEqual(self.b.user.created, ["文件传输助手"])
+        self.assertIn("test", self.b.bot.sent[-1].text)
+
     async def test_image_is_downloaded_and_sent_as_file(self):
         self.daemon.add_thread("wxid_bob", "Bob")
         self.daemon.add_message("img1", "wxid_bob", None, type_=3)

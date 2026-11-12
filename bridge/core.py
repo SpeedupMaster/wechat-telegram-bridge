@@ -8,6 +8,7 @@ import logging
 import shutil
 import time
 from collections import defaultdict
+from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -161,6 +162,11 @@ class Bridge(LoginMixin):
             cursor = await self.wx.latest_cursor()
             self.store.set("cursor", cursor)
             log.info("First start: skipping old history, listening from event cursor %s", cursor)
+        if self.store.get("since") is None:
+            # Messages created before this moment are history and never forwarded, even when the
+            # daemon syncs them in later ("catchup"), e.g. right after the first WeChat login.
+            self.store.set("since", str(time.time()))
+        self.since = float(self.store.get("since"))
         backoff = 1.0
         while True:
             try:
@@ -190,10 +196,16 @@ class Bridge(LoginMixin):
     async def handle_event(self, event: dict) -> None:
         kind, data = event.get("kind"), event.get("data") or {}
         try:
-            # Only "live" messages are forwarded; outgoing ones of any origin are still checked so
-            # that our own Telegram sends get linked to their saved WeChat message (for quoting).
-            if kind == "message.committed" and (data.get("origin") == "live" or data.get("direction") == "outgoing"):
-                await self.on_wx_message(data["messageId"], data.get("origin") == "live")
+            # origin: "live" (pushed now), "catchup" (synced in after login/reconnect), "local_send"
+            # (sent through the daemon API, i.e. by us), "profile_import" (old data). Outgoing ones of
+            # any origin are still checked so our Telegram sends get linked to their WeChat message.
+            if kind == "message.committed":
+                origin = data.get("origin")
+                if origin in ("live", "catchup") or data.get("direction") == "outgoing":
+                    await self.on_wx_message(data["messageId"], origin)
+                else:
+                    log.info("Skipped WeChat message %s in %s: origin %s", data.get("messageId"),
+                             data.get("threadId"), origin)
             elif kind == "message.recalled":
                 await self.on_wx_recall(data)
         except Exception:
@@ -211,7 +223,19 @@ class Bridge(LoginMixin):
             return False
         return True
 
-    async def on_wx_message(self, message_id: str, live: bool) -> None:
+    def _is_new(self, msg: dict, origin: str | None) -> bool:
+        """Forward live messages, and caught-up ones created after the bridge started listening."""
+        if origin == "live":
+            return True
+        if origin != "catchup":
+            return False
+        try:
+            created = datetime.fromisoformat(msg["createdAt"]).timestamp()
+        except (KeyError, TypeError, ValueError):
+            return False
+        return created >= getattr(self, "since", 0) - 60  # small allowance for clock differences
+
+    async def on_wx_message(self, message_id: str, origin: str | None) -> None:
         if self.store.seen_wx_msg(message_id):
             return
         msg = await self.wx.message(message_id)
@@ -220,25 +244,36 @@ class Bridge(LoginMixin):
         if outgoing:
             # Our own sends from Telegram come back as outgoing messages: drop the echo.
             if self.pending_sends.get(thread_id):
-                asyncio.create_task(self._deferred_outgoing(msg, live))
+                asyncio.create_task(self._deferred_outgoing(msg, origin))
                 return
             if msg.get("serverId") and self.store.claim_echo(thread_id, msg["serverId"], msg["id"]):
                 return
-            if not self.cfg.bridge.forward_outgoing:
-                return
-        if not live:
-            return
-        if msg.get("recall"):
-            return
-        thread = await self.wx.thread(thread_id)
-        if not self._allowed(thread):
+        await self._maybe_forward(msg, origin)
+
+    async def _maybe_forward(self, msg: dict, origin: str | None) -> None:
+        thread_id = msg["threadId"]
+        skip = None
+        if msg.get("direction") == "outgoing" and not self.cfg.bridge.forward_outgoing:
+            skip = "outgoing (forward_outgoing = false)"
+        elif not self._is_new(msg, origin):
+            skip = f"history (origin {origin}, created {msg.get('createdAt')})"
+        elif msg.get("recall"):
+            skip = "recalled"
+        thread = None
+        if skip is None:
+            thread = await self.wx.thread(thread_id)
+            if not self._allowed(thread):
+                skip = f"filtered (kind {thread.get('kind')}, {(thread.get('classification') or {}).get('category')})"
+        if skip is not None:
+            log.info("Skipped WeChat message %s in %s: %s", msg["id"], thread_id, skip)
             return
         chat = await self.ensure_chat(thread)
         if chat is None:
             return
         await self.forward_to_tg(chat, thread, msg)
+        log.info("Forwarded WeChat message %s from %s to Telegram %s", msg["id"], thread_id, chat)
 
-    async def _deferred_outgoing(self, msg: dict, live: bool) -> None:
+    async def _deferred_outgoing(self, msg: dict, origin: str | None) -> None:
         """Wait until in-flight Telegram sends for this chat settle, then decide whether msg is an echo."""
         tid = msg["threadId"]
         for _ in range(600):
@@ -247,11 +282,8 @@ class Bridge(LoginMixin):
             await asyncio.sleep(0.5)
         if msg.get("serverId") and self.store.claim_echo(tid, msg["serverId"], msg["id"]):
             return
-        if not live or not self.cfg.bridge.forward_outgoing or self.store.seen_wx_msg(msg["id"]):
-            return
-        thread = await self.wx.thread(tid)
-        if self._allowed(thread) and (chat := await self.ensure_chat(thread)) is not None:
-            await self.forward_to_tg(chat, thread, msg)
+        if not self.store.seen_wx_msg(msg["id"]):
+            await self._maybe_forward(msg, origin)
 
     # --- group creation ---------------------------------------------------
     def _title(self, thread: dict) -> str:

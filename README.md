@@ -160,5 +160,5 @@ config/         可选的 config.toml 放这里（Docker）
 - **配对码输错太多次**：连续错 10 次后机器人不再响应配对，`docker compose restart telegram-bridge` 换一个新码。
 - **启动时报 “this token sees accounts”**：守护进程里有多个微信账号，用 `WECHAT_ACCOUNT` 或 `[wechat] account` 指定一个。
 - **连不上 Telegram**：检查 `TG_PROXY`。
-- **群里收不到消息**：私聊机器人发 `/status` 看微信是否在线，不在线就发 `/wxlogin`。
+- **群里收不到消息**：私聊机器人发 `/status` 看微信是否在线，不在线就发 `/wxlogin`。再看 `docker compose logs telegram-bridge` 里每条微信消息对应的 `Forwarded` 或 `Skipped ...: 原因` 日志。程序只转发开始监听之后产生的消息。
 - **想看详细日志**：在 compose.yaml 里给 telegram-bridge 加 `command: ["-v"]`，或本地运行 `python -m bridge -v`。
