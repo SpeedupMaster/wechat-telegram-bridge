@@ -1,0 +1,7 @@
+# agent-wechat daemon config (mounted into its container).
+# Same as upstream deploy/native/server.toml: the API listens on loopback only.
+# The token file is created by the token-init service in compose.yaml.
+schemaVersion = 1
+listen = "127.0.0.1:6174"
+dataDir = "/var/lib/agent-wechat"
+tokenFile = "/token/daemon-token"

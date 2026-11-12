@@ -1,0 +1,91 @@
+# WeChat <-> Telegram on one Linux VPS.
+#
+#   cp .env.example .env    # fill in TG_API_ID, TG_API_HASH, TG_BOT_TOKEN
+#   docker compose up -d
+#   docker compose logs telegram-bridge     # shows the pairing code; send "/login CODE" to your bot
+#
+# (or just run ./setup.sh, which does all of the above)
+#
+# Both long-running containers use host networking: the agent-wechat API stays on
+# 127.0.0.1:6174 (never exposed to the internet) and the bridge reaches it there.
+# No ports are published.
+
+services:
+  # One-shot: creates the agent-wechat API token on first start (kept in the wechat-token volume).
+  # The daemon refuses token files that other users can read, so each side gets its own copy.
+  token-init:
+    image: busybox:1.37
+    network_mode: none
+    volumes:
+      - wechat-token:/token
+    command:
+      - sh
+      - -ec
+      - |
+        umask 077
+        if [ ! -s /token/daemon-token ]; then
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /token/daemon-token
+          echo "created a new agent-wechat API token"
+        fi
+        cp /token/daemon-token /token/bridge-token
+        chown 10001:10001 /token/daemon-token
+        chown 10002:10002 /token/bridge-token
+        chmod 600 /token/daemon-token /token/bridge-token
+        chmod 755 /token
+    restart: "no"
+
+  agent-wechat:
+    image: ghcr.io/thisnick/agent-wechat-native:${AGENT_WECHAT_VERSION:-v2.3.2}
+    network_mode: host
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    environment:
+      # lets `docker compose exec agent-wechat wx ...` talk to this daemon without extra flags
+      AGENT_WECHAT_URL: http://127.0.0.1:6174
+      AGENT_WECHAT_TOKEN_FILE: /token/daemon-token
+    volumes:
+      - wechat-data:/var/lib/agent-wechat
+      - wechat-scratch:/var/cache/agent-wechat
+      - wechat-token:/token:ro
+      - ./deploy/agent-wechat.toml:/etc/agent-wechat/server/config.toml:ro
+    depends_on:
+      token-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  telegram-bridge:
+    # Built by GitHub Actions (.github/workflows/image.yml). The image is private, so run
+    # `docker login ghcr.io` once on the VPS (see README). Without that, `docker compose up -d --build`
+    # builds it locally from this directory instead.
+    image: ${BRIDGE_IMAGE:-ghcr.io/speedupmaster/wechat-telegram-bridge:latest}
+    build: .
+    network_mode: host
+    environment:
+      TG_API_ID: ${TG_API_ID:?set TG_API_ID in .env}
+      TG_API_HASH: ${TG_API_HASH:?set TG_API_HASH in .env}
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:?set TG_BOT_TOKEN in .env}
+      TG_PROXY: ${TG_PROXY:-}
+      WECHAT_URL: http://127.0.0.1:6174
+      WECHAT_TOKEN_FILE: /token/bridge-token
+    volumes:
+      - bridge-data:/app/data
+      - wechat-token:/token:ro
+      # optional: put a config.toml with advanced settings here (see config.example.toml)
+      - ./config:/app/config:ro
+    depends_on:
+      token-init:
+        condition: service_completed_successfully
+      agent-wechat:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  wechat-data:
+  wechat-scratch:
+  wechat-token:
+  bridge-data:

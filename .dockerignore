@@ -1,0 +1,4 @@
+*
+!requirements.txt
+!bridge/
+bridge/__pycache__/

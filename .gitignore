@@ -1,0 +1,8 @@
+config.toml
+data/
+*.session
+*.session-journal
+__pycache__/
+.venv/
+.env
+config/config.toml

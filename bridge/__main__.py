@@ -1,0 +1,47 @@
+"""Run with:  python -m bridge [path/to/config.toml]"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import sys
+
+from .config import load_config
+from .core import Bridge
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="python -m bridge", description="WeChat <-> Telegram bridge")
+    parser.add_argument("config", nargs="?", default="config.toml",
+                        help="optional config.toml with advanced settings (environment variables override it)")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    try:
+        cfg = load_config(args.config)
+    except (OSError, ValueError) as e:
+        sys.exit(str(e))
+
+    async def run() -> None:
+        bridge = Bridge(cfg)
+        try:
+            await bridge.run()
+        finally:
+            await bridge.close()
+            for client in (bridge.user, bridge.bot):
+                if client.is_connected():
+                    await client.disconnect()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

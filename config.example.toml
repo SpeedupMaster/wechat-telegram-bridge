@@ -1,0 +1,48 @@
+# 可选的高级设置。所有项都有默认值，不需要这个文件也能运行。
+#   Docker：复制到 config/config.toml，然后 docker compose restart telegram-bridge
+#   本地运行：复制到项目根目录的 config.toml
+# 环境变量（.env）会覆盖这里的同名设置：TG_API_ID、TG_API_HASH、TG_BOT_TOKEN、TG_PROXY、
+# WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR
+
+[wechat]
+# agent-wechat 守护进程（wx serve）的地址。用本项目的 compose.yaml 部署时不用填
+# base_url = "http://127.0.0.1:6174"
+# 守护进程的 API token（或 token_file = token 文件路径）。Docker 部署时自动生成，不用填
+# token = ""
+# 留空 = 自动使用唯一的账号（没有账号时自动创建）；守护进程里有多个账号时填账号 ID 或别名
+# account = ""
+# 在守护进程里登记的消费者名，用于记录读到哪条事件
+# consumer = "telegram-bridge"
+
+[telegram]
+# 一般写在 .env 里（TG_API_ID / TG_API_HASH / TG_BOT_TOKEN）
+# api_id = 0
+# api_hash = ""
+# bot_token = ""
+# 海外 VPS 留空。国内网络需要代理才能连 Telegram，例如 "socks5://127.0.0.1:7890" 或 "http://127.0.0.1:7890"
+# proxy = ""
+
+[bridge]
+# 数据目录（数据库、Telegram 登录会话），相对于本文件。Docker 里固定为 /app/data
+# data_dir = "data"
+# Telegram 群名模板，{name} = 微信备注名/昵称/群名
+title_direct = "{name}"
+title_group = "👥 {name}"
+# 是否桥接微信群聊
+bridge_groups = true
+# 是否桥接公众号/服务号消息
+bridge_official_accounts = false
+# 在手机微信上发出的消息，是否也同步到 Telegram 群（显示为“我（手机端）”）
+forward_outgoing = true
+# 上面这类同步消息静音发送，不触发通知
+outgoing_silent = true
+# 建群时把微信头像设为群头像
+sync_avatar = true
+# 在 Telegram 回复后，把对应微信会话标记为已读
+mark_read_on_reply = true
+# 两次自动建群之间至少间隔多少秒，降低触发 Telegram 频率限制的风险
+create_interval_seconds = 20
+# 单个媒体文件的大小上限（MB），两个方向都适用
+max_media_mb = 200
+# 不桥接的微信会话 ID，例如 ["filehelper", "weixin"]
+skip_threads = ["weixin"]
