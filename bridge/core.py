@@ -54,15 +54,51 @@ HELP = (
     "私聊我可用的命令：\n"
     "/find 关键词 — 搜索微信联系人和群\n"
     "/open 微信ID — 为这个联系人/群建立 Telegram 群（主动发起聊天）\n"
+    "/chats [关键词] — 查看已连接的会话列表（别名 /list）\n"
+    "/link 微信ID TG群ID — 手动把现有 Telegram 群绑定到微信会话\n"
     "/status — 查看桥的运行状态\n"
-    "/wxlogin — 重新扫码登录微信（掉线或被踢下线时用）\n\n"
+    "/wxlogin — 重新扫码登录微信（掉线或被踢下线时用）\n"
+    "/help — 显示这份帮助\n\n"
     "在桥接群里可用：\n"
     "/wx — 查看这个群对应的微信会话\n"
+    "/members [关键词] — 查看微信群成员（可点按复制 @名字，别名 /at）\n"
     "/avatar — 重新获取微信头像作为群头像\n"
-    "/members [关键词] — 查看微信群成员（可点按复制 @名字）\n"
+    "/rename — 同步最新微信备注/群名到当前群标题（别名 /title）\n"
+    "/unlink — 解除当前群与微信会话的绑定\n"
+    "/help — 查看群内命令帮助\n\n"
     "在微信群对应的群里发 @成员名 或 @所有人 会触发微信里的 @ 提醒。\n"
     "以 // 开头的消息只留在 Telegram，不会发到微信。"
 )
+
+GROUP_HELP = (
+    "<b>桥接群可用命令</b>\n"
+    "/wx — 查看这个群对应的微信会话\n"
+    "/members [关键词] — 查看微信群成员（可点按复制 @名字，别名 /at）\n"
+    "/avatar — 重新获取微信头像作为群头像\n"
+    "/rename — 同步最新微信备注/群名到当前群标题（别名 /title）\n"
+    "/unlink — 解除当前群与微信会话的绑定\n"
+    "/help — 显示群内命令帮助\n\n"
+    "提示：发 @成员名 或 @所有人 可触发微信 @ 提醒；以 // 开头的内容只留在 Telegram。"
+)
+
+PRIVATE_BOT_COMMANDS = [
+    ("find", "搜索微信联系人和群"),
+    ("open", "为微信会话建立 Telegram 群"),
+    ("chats", "查看已连接的会话列表"),
+    ("link", "手动绑定微信ID与TG群ID"),
+    ("status", "查看桥的运行状态"),
+    ("wxlogin", "重新扫码登录微信"),
+    ("help", "查看使用帮助"),
+]
+
+GROUP_BOT_COMMANDS = [
+    ("wx", "查看对应的微信会话"),
+    ("members", "查看微信群成员（用于 @ 提醒）"),
+    ("avatar", "重新同步微信头像到群头像"),
+    ("rename", "同步最新微信名称到群标题"),
+    ("unlink", "解除当前群与微信的绑定"),
+    ("help", "查看群内命令帮助"),
+]
 
 
 def _proxy(url: str):
@@ -270,11 +306,26 @@ class Bridge(LoginMixin):
     # ======================================================================
     # startup
     # ======================================================================
+    async def sync_bot_commands(self) -> None:
+        """Register private and group `/` menus with Telegram."""
+        scopes = [
+            (types.BotCommandScopeDefault(), PRIVATE_BOT_COMMANDS),
+            (types.BotCommandScopeUsers(), PRIVATE_BOT_COMMANDS),
+            (types.BotCommandScopeChats(), GROUP_BOT_COMMANDS),
+        ]
+        for scope, items in scopes:
+            cmds = [types.BotCommand(command=cmd, description=desc) for cmd, desc in items]
+            try:
+                await self.bot(functions.bots.SetBotCommandsRequest(scope=scope, lang_code="", commands=cmds))
+            except Exception as e:
+                log.warning("Could not set bot commands for %s: %s", type(scope).__name__, e)
+
     async def run(self) -> None:
         await self.bot.start(bot_token=self.cfg.telegram.bot_token)
         self.bot_me = await self.bot.get_me()
         if not self.bot_me.username:
             raise SystemExit("The bot has no username; check TG_BOT_TOKEN")
+        await self.sync_bot_commands()
         await self.user.connect()
         self.bot.add_event_handler(self.on_bot_private, events.NewMessage(incoming=True, func=lambda e: e.is_private))
         self.bot.add_event_handler(self.on_bot_callback, events.CallbackQuery())
@@ -513,6 +564,33 @@ class Bridge(LoginMixin):
             log.info("Could not set group avatar for %s: %s", thread_id, e)
             return f"{type(e).__name__}: {e}"
 
+    async def sync_title(self, chat_id: int, thread_id: str) -> tuple[str | None, str]:
+        """Update Telegram group title from WeChat display name. Returns (new_title, error_or_status)."""
+        try:
+            try:
+                thread = await self.wx.thread(thread_id)
+            except WeChatError:
+                if thread_id.endswith("@chatroom"):
+                    raise
+                contact = await self.wx.contact(thread_id)
+                thread = {"id": thread_id, "kind": "direct", "displayName": contact.get("displayName") or thread_id}
+            title = self._title(thread)
+            try:
+                if chat_id < -1000000000000:
+                    await self.user(functions.channels.EditTitleRequest(
+                        channel=await self.user.get_input_entity(chat_id), title=title))
+                else:
+                    await self.user(functions.messages.EditChatTitleRequest(
+                        chat_id=utils.resolve_id(chat_id)[0], title=title))
+            except errors.ChatNotModifiedError:
+                self.store.update_title(thread_id, title)
+                return title, "unchanged"
+            self.store.update_title(thread_id, title)
+            return title, ""
+        except Exception as e:
+            log.info("Could not sync group title for %s: %s", thread_id, e)
+            return None, f"{type(e).__name__}: {e}"
+
     async def _init_chat(self, chat_id: int, raw_chat_id: int, thread: dict) -> None:
         if self.cfg.bridge.sync_avatar:
             # Fetching an avatar from WeChat can take a while; don't hold up the first message.
@@ -712,13 +790,41 @@ class Bridge(LoginMixin):
         if not at_bot or at_bot.lower() == self.bot_me.username.lower():
             cmd_name = cmd_name.lower()
             if cmd_name == "/wx":
-                await self.bot.send_message(chat_id, f"对应微信会话：<code>{_esc(thread_id)}</code>",
+                title = next((t for w, _, t, _ in self.store.list_threads() if w == thread_id), "")
+                if self.wx_ready:
+                    try:
+                        thread = await self.wx.thread(thread_id)
+                        title = thread.get("displayName") or title
+                    except Exception:
+                        pass
+                head = f"对应微信会话：<b>{_esc(title)}</b>\n" if title else "对应微信会话："
+                await self.bot.send_message(chat_id, f"{head}<code>{_esc(thread_id)}</code>",
                                             parse_mode="html", reply_to=msg.id)
                 return
             if cmd_name == "/avatar":
                 why = await self.sync_avatar(chat_id, thread_id)
                 await self.bot.send_message(chat_id, f"没有拿到这个会话的微信头像（{why}）" if why else "已更新群头像",
                                             reply_to=msg.id)
+                return
+            if cmd_name in ("/rename", "/title"):
+                title, status = await self.sync_title(chat_id, thread_id)
+                if status == "unchanged":
+                    reply = f"群标题已是最新：{_esc(title)}"
+                elif status:
+                    reply = f"无法同步群标题（{_esc(status)}）"
+                else:
+                    reply = f"已更新群标题：{_esc(title)}"
+                await self.bot.send_message(chat_id, reply, parse_mode="html", reply_to=msg.id)
+                return
+            if cmd_name == "/unlink":
+                self.store.unlink(thread_id)
+                await self.bot.send_message(
+                    chat_id,
+                    f"已解除当前群与微信会话 <code>{_esc(thread_id)}</code> 的绑定。",
+                    parse_mode="html", reply_to=msg.id)
+                return
+            if cmd_name == "/help":
+                await self.bot.send_message(chat_id, GROUP_HELP, parse_mode="html", reply_to=msg.id)
                 return
             if cmd_name in ("/members", "/at"):
                 await self._send_members(chat_id, msg.id, thread_id, arg.strip())
@@ -911,6 +1017,42 @@ class Bridge(LoginMixin):
                 await event.reply(f"运行 {up // 3600}h{up % 3600 // 60}m，已转发 {self.forwarded} 条，"
                                   f"已连接 {len(self.store.linked_chats())} 个会话。\n"
                                   f"微信：{state}，账号 <code>{_esc(self.wx.account or '-')}</code>", parse_mode="html")
+            elif cmd in ("/chats", "/list"):
+                rows = self.store.list_threads()
+                kw = arg.lower()
+                if kw:
+                    rows = [r for r in rows if kw in r[0].lower() or kw in r[2].lower() or kw in str(r[1])]
+                if not rows:
+                    return await event.reply("没有找到匹配的已连接会话" if kw else "还没有任何已连接的会话")
+                lines = [
+                    f"• {_esc(title or wx_id)} — <code>{_esc(wx_id)}</code> ↔ <code>{tg_chat}</code>"
+                    for wx_id, tg_chat, title, _ in rows[:40]
+                ]
+                suffix = f"\n\n共 {len(rows)} 个会话（仅显示前 40 个）" if len(rows) > 40 else f"\n\n共 {len(rows)} 个会话"
+                await event.reply("\n".join(lines) + suffix, parse_mode="html")
+            elif cmd == "/link":
+                parts = arg.split()
+                if len(parts) != 2:
+                    return await event.reply("用法：/link 微信ID TG群ID")
+                wx_id, tg_raw = parts
+                try:
+                    tg_chat = int(tg_raw)
+                except ValueError:
+                    return await event.reply("TG群ID 必须是数字（例如 -1001234567890 或 -512345678）")
+                title = wx_id
+                if self.wx_ready:
+                    try:
+                        title = (await self.wx.thread(wx_id)).get("displayName") or wx_id
+                    except WeChatError:
+                        if not wx_id.endswith("@chatroom"):
+                            try:
+                                title = (await self.wx.contact(wx_id)).get("displayName") or wx_id
+                            except WeChatError:
+                                pass
+                self.store.link(wx_id, tg_chat, title)
+                await event.reply(
+                    f"已绑定：<b>{_esc(title)}</b> (<code>{_esc(wx_id)}</code> ↔ <code>{tg_chat}</code>)",
+                    parse_mode="html")
             elif cmd == "/wxlogin":
                 await self.request_wechat_login()
             elif cmd in ("/find", "/open") and not self.wx_ready:

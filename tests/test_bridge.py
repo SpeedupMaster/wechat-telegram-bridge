@@ -148,6 +148,13 @@ class Sent:
 class FakeBot:
     def __init__(self):
         self.sent: list[Sent] = []
+        self.commands: list = []
+
+    async def __call__(self, request):
+        if isinstance(request, functions.bots.SetBotCommandsRequest):
+            self.commands.append((type(request.scope), [(c.command, c.description) for c in request.commands]))
+            return True
+        raise AssertionError(f"unexpected bot request {request}")
 
     async def send_message(self, chat, text, **kw):
         s = Sent(chat, text=text, kwargs=kw)
@@ -164,6 +171,7 @@ class FakeUser:
     def __init__(self):
         self.created: list[str] = []
         self.photos: list = []
+        self.titles: list = []
 
     async def __call__(self, request):
         if isinstance(request, functions.messages.CreateChatRequest):
@@ -174,6 +182,9 @@ class FakeUser:
                 updates=types.Updates(updates=[], users=[], chats=[chat], date=None, seq=0), missing_invitees=[])
         if isinstance(request, functions.messages.EditChatPhotoRequest):
             self.photos.append((request.chat_id, request.photo.file[1]))
+            return None
+        if isinstance(request, functions.messages.EditChatTitleRequest):
+            self.titles.append((request.chat_id, request.title))
             return None
         raise AssertionError(f"unexpected request {request}")
 
@@ -543,6 +554,58 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("只有在微信群聊里", self.b.bot.sent[-1].text)
         await self.b.on_tg_message(tg_event(dm_chat, 21, "@Jessie hi"))
         self.assertNotIn("mentions", self.daemon.sends[-1][0])
+
+    async def test_bot_commands_menu_and_management_commands(self):
+        await self.b.sync_bot_commands()
+        scopes = {s: cmds for s, cmds in self.b.bot.commands}
+        self.assertIn(types.BotCommandScopeDefault, scopes)
+        self.assertIn(types.BotCommandScopeUsers, scopes)
+        self.assertIn(types.BotCommandScopeChats, scopes)
+        self.assertIn("chats", [c for c, _ in scopes[types.BotCommandScopeUsers]])
+        self.assertIn("rename", [c for c, _ in scopes[types.BotCommandScopeChats]])
+
+        replies = []
+
+        async def private_cmd(text):
+            ev = SimpleNamespace(raw_text=text)
+            async def reply(msg, **kw):
+                replies.append(msg)
+            ev.reply = reply
+            await self.b.on_bot_command(ev)
+
+        await private_cmd("/chats")
+        self.assertIn("还没有任何已连接的会话", replies[-1])
+
+        self.daemon.add_thread("wxid_alice", "Alice Remark")
+        self.daemon.add_message("m1", "wxid_alice", "hi")
+        await self.event("m1", "wxid_alice")
+        chat = self.b.store.chat_for_thread("wxid_alice")
+
+        await private_cmd("/chats alice")
+        self.assertIn("Alice Remark", replies[-1])
+        self.assertIn("wxid_alice", replies[-1])
+
+        await self.b.on_tg_message(tg_event(chat, 10, "/wx"))
+        self.assertIn("Alice Remark", self.b.bot.sent[-1].text)
+        self.assertIn("wxid_alice", self.b.bot.sent[-1].text)
+
+        self.daemon.threads["wxid_alice"]["displayName"] = "Alice New"
+        await self.b.on_tg_message(tg_event(chat, 11, "/rename"))
+        self.assertEqual(self.b.user.titles[-1][1], "Alice New")
+        self.assertIn("已更新群标题：Alice New", self.b.bot.sent[-1].text)
+        self.assertEqual(self.b.store.list_threads()[0][2], "Alice New")
+
+        await self.b.on_tg_message(tg_event(chat, 12, "/help"))
+        self.assertIn("/rename", self.b.bot.sent[-1].text)
+        self.assertIn("/unlink", self.b.bot.sent[-1].text)
+
+        await self.b.on_tg_message(tg_event(chat, 13, "/unlink"))
+        self.assertIsNone(self.b.store.thread_for_chat(chat))
+        self.assertIn("已解除当前群与微信会话", self.b.bot.sent[-1].text)
+
+        await private_cmd(f"/link wxid_alice {chat}")
+        self.assertEqual(self.b.store.thread_for_chat(chat), "wxid_alice")
+        self.assertIn("已绑定", replies[-1])
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):

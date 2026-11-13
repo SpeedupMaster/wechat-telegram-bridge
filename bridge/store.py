@@ -75,6 +75,14 @@ class Store:
     def linked_chats(self) -> set[int]:
         return {r[0] for r in self.db.execute("SELECT tg_chat FROM threads")}
 
+    def list_threads(self) -> list[tuple[str, int, str, int]]:
+        return list(self.db.execute(
+            "SELECT wx_thread, tg_chat, COALESCE(title, ''), created_at FROM threads ORDER BY created_at DESC"
+        ))
+
+    def update_title(self, wx_thread: str, title: str) -> None:
+        self.db.execute("UPDATE threads SET title=? WHERE wx_thread=?", (title, wx_thread))
+
     # --- messages ---------------------------------------------------------
     def map_message(self, tg_chat: int, side: str, tg_msg: int, wx_thread: str, wx_msg: str | None,
                     wx_server: str | None) -> None:
