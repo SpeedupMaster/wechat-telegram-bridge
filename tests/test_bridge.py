@@ -607,6 +607,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.b.store.thread_for_chat(chat), "wxid_alice")
         self.assertIn("已绑定", replies[-1])
 
+    async def test_wechat_topics_and_emojis_rendered(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_message("m1", "wxid_alice", "", type=49, appMessageType=51, link={
+            "title": "当前版本不支持展示该内容",
+            "description": "#静电#内容过于真实[捂脸][捂脸]",
+            "sourceName": "老抽搞笑动画",
+            "url": "https://support.weixin.qq.com/security/readtemplate?t=w_upgrade",
+        })
+        await self.event("m1", "wxid_alice")
+        sent = self.b.bot.sent[-1].text
+        self.assertIn("🎬 <b>视频号 · 老抽搞笑动画</b>", sent)
+        self.assertIn("#静电 内容过于真实🤦🤦", sent)
+        self.assertNotIn("#静电#", sent)
+
+        self.daemon.add_message("m2", "wxid_alice", "看看#日常##搞笑#还挺好[破涕为笑] https://a.b/#x#1 <tag>")
+        await self.event("m2", "wxid_alice")
+        sent2 = self.b.bot.sent[-1].text
+        self.assertIn("看看 #日常 #搞笑 还挺好😂 https://a.b/#x#1 &lt;tag&gt;", sent2)
+
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_parsing_and_cursor_expiry(self):

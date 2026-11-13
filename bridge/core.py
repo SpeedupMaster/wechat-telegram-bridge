@@ -5,6 +5,7 @@ import asyncio
 import html
 import io
 import logging
+import re
 import shutil
 import time
 from collections import defaultdict
@@ -113,6 +114,46 @@ def _esc(s: str | None) -> str:
     return html.escape(s or "")
 
 
+WX_EMOJIS = {
+    "微笑": "🙂", "撇嘴": "😒", "色": "😍", "发呆": "😳", "得意": "😎", "流泪": "😭", "害羞": "😊",
+    "闭嘴": "🤐", "睡": "😴", "大哭": "😭", "尴尬": "😅", "发怒": "😡", "调皮": "😜", "呲牙": "😁",
+    "惊讶": "😮", "难过": "😔", "囧": "😳", "抓狂": "😫", "吐": "🤮", "偷笑": "🤭", "愉快": "😊",
+    "白眼": "🙄", "傲慢": "😤", "困": "😪", "惊恐": "😱", "憨笑": "😄", "悠闲": "😌", "咒骂": "🤬",
+    "疑问": "❓", "嘘": "🤫", "晕": "😵", "衰": "😞", "骷髅": "💀", "敲打": "🔨", "再见": "👋",
+    "擦汗": "😅", "抠鼻": "🤥", "鼓掌": "👏", "坏笑": "😏", "右哼哼": "😤", "鄙视": "😒", "委屈": "😢",
+    "快哭了": "😢", "阴险": "😈", "亲亲": "😘", "可怜": "🥺", "菜刀": "🔪", "西瓜": "🍉", "啤酒": "🍺",
+    "咖啡": "☕", "猪头": "🐷", "玫瑰": "🌹", "凋谢": "🥀", "嘴唇": "💋", "爱心": "❤️", "心碎": "💔",
+    "蛋糕": "🎂", "炸弹": "💣", "便便": "💩", "月亮": "🌙", "太阳": "☀️", "拥抱": "🤗", "强": "👍",
+    "弱": "👎", "握手": "🤝", "胜利": "✌️", "抱拳": "🙏", "勾引": "🤙", "拳头": "✊", "OK": "👌",
+    "笑脸": "😄", "生病": "😷", "脸红": "😳", "恐惧": "😨", "失望": "😞", "无语": "😑", "嘿哈": "🤣",
+    "捂脸": "🤦", "奸笑": "😏", "机智": "🧐", "皱眉": "😟", "耶": "✌️", "吃瓜": "🍉", "加油": "💪",
+    "汗": "😓", "天啊": "😱", "旺柴": "🐶", "好的": "👌", "打脸": "🤦", "哇": "🤩", "翻白眼": "🙄",
+    "破涕为笑": "😂", "笑哭": "😂", "叹气": "😮‍💨", "苦涩": "🥲", "裂开": "💔", "合十": "🙏", "赞": "👍",
+    "庆祝": "🎉", "礼物": "🎁", "红包": "🧧", "烟花": "🎆", "爆竹": "🧨",
+}
+_WX_EMOJI_RE = re.compile(r"\[(" + "|".join(re.escape(k) for k in WX_EMOJIS) + r")\]")
+_WX_TOPIC_RE = re.compile(r"(?<![A-Za-z0-9_/:.?&=])#([^\s#<>/?&=]{1,30})#")
+_TOPIC_BOUNDARY = set(" \t\r\n,，。！？、；：.!?;:)）]】\"'”’")
+
+
+def _fmt_wx_text(s: str | None) -> str:
+    """Convert WeChat #topic# tags and [emoji] codes into Telegram-friendly HTML-escaped text."""
+    text = s or ""
+    if not text:
+        return ""
+    if "[" in text:
+        text = _WX_EMOJI_RE.sub(lambda m: WX_EMOJIS[m.group(1)], text)
+    if "#" in text:
+        def _topic_sub(m: re.Match) -> str:
+            lead = " " if m.start() > 0 and ("\u4e00" <= text[m.start() - 1] <= "\u9fff") else ""
+            nxt = text[m.end()] if m.end() < len(text) else ""
+            tail = " " if nxt and nxt not in _TOPIC_BOUNDARY else ""
+            return f"{lead}#{m.group(1)}{tail}"
+
+        text = _WX_TOPIC_RE.sub(_topic_sub, text)
+    return _esc(text)
+
+
 _CHANNELS_PLACEHOLDER_TITLE = "当前版本不支持展示该内容"
 _CHANNELS_PLACEHOLDER_URL = "support.weixin.qq.com/security/readtemplate"
 
@@ -133,10 +174,10 @@ def _channels_body(link: dict | None, body: str = "") -> str:
             title = ""
         if _CHANNELS_PLACEHOLDER_URL in url:
             url = ""
-        return "\n".join(p for p in (header, _esc(title), _esc(desc), _esc(url)) if p)
+        return "\n".join(p for p in (header, _fmt_wx_text(title), _fmt_wx_text(desc), _esc(url)) if p)
     lines = [ln for ln in (body or "").splitlines()
              if ln.strip() and not _is_channels_placeholder(ln.strip()) and _CHANNELS_PLACEHOLDER_URL not in ln]
-    return "\n".join(["🎬 <b>视频号</b>", *(_esc(ln) for ln in lines)])
+    return "\n".join(["🎬 <b>视频号</b>", *(_fmt_wx_text(ln) for ln in lines)])
 
 
 # agent-wechat reason codes for attachments it could not fetch
@@ -623,7 +664,7 @@ class Bridge(LoginMixin):
     def _body(self, msg: dict) -> str:
         t, body = msg.get("type"), msg.get("body") or ""
         if t == TEXT:
-            return _esc(body)
+            return _fmt_wx_text(body)
         if t == SYSTEM:
             return f"<i>{_esc(body)}</i>"
         if t == LOCATION:
@@ -632,16 +673,16 @@ class Bridge(LoginMixin):
         if t == APP and msg.get("appMessageType") == APP_CHANNELS:
             return _channels_body(msg.get("link"), body)
         if t == APP and (link := msg.get("link")):
-            parts = [f"🔗 <b>{_esc(link.get('title'))}</b>" if link.get("title") else "🔗",
-                     _esc(link.get("description")), _esc(link.get("url"))]
+            parts = [f"🔗 <b>{_fmt_wx_text(link.get('title'))}</b>" if link.get("title") else "🔗",
+                     _fmt_wx_text(link.get("description")), _esc(link.get("url"))]
             if link.get("sourceName"):
                 parts.append(f"<i>来自 {_esc(link['sourceName'])}</i>")
             return "\n".join(p for p in parts if p)
         if t == APP and msg.get("appMessageType") == 19:
-            return "📜 聊天记录\n" + _esc(body)
+            return "📜 聊天记录\n" + _fmt_wx_text(body)
         if t == STICKER:
             return "[表情]"
-        return _esc(body) or _unsupported_label(t, msg.get("appMessageType"))
+        return _fmt_wx_text(body) or _unsupported_label(t, msg.get("appMessageType"))
 
     def _quote_prefix(self, msg: dict) -> str:
         q = msg.get("quote") or {}
@@ -652,7 +693,7 @@ class Bridge(LoginMixin):
         text = q.get("embeddedText") or ("[图片]" if q.get("embeddedImage") else "[表情]" if q.get("embeddedSticker")
                                          else el_title or "…")
         who = q.get("senderName") or ""
-        return f"<blockquote>{_esc(who + '：' if who else '')}{_esc(text[:200])}</blockquote>"
+        return f"<blockquote>{_esc(who + '：' if who else '')}{_fmt_wx_text(text[:200])}</blockquote>"
 
     # --- sending to Telegram ----------------------------------------------
     async def forward_to_tg(self, chat: int, thread: dict, msg: dict) -> None:
