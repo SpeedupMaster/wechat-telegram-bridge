@@ -18,8 +18,8 @@ from .config import Config
 from . import stickers
 from .login import LoginMixin
 from .store import Store
-from .wechat import (APP, APP_FILE, APP_QUOTE, IMAGE, LOCATION, SEND_OK, STICKER, SYSTEM, TEXT, VIDEO, VOICE,
-                     CursorExpired, Media, WeChatClient, WeChatError)
+from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, IMAGE, LOCATION, SEND_OK, STICKER, SYSTEM, TEXT, VIDEO,
+                     VOICE, CursorExpired, Media, WeChatClient, WeChatError)
 
 log = logging.getLogger("bridge")
 
@@ -73,6 +73,32 @@ def _proxy(url: str):
 
 def _esc(s: str | None) -> str:
     return html.escape(s or "")
+
+
+_CHANNELS_PLACEHOLDER_TITLE = "当前版本不支持展示该内容"
+_CHANNELS_PLACEHOLDER_URL = "support.weixin.qq.com/security/readtemplate"
+
+
+def _is_channels_placeholder(text: str) -> bool:
+    return text.startswith(_CHANNELS_PLACEHOLDER_TITLE) or text.startswith(f"[Link] {_CHANNELS_PLACEHOLDER_TITLE}")
+
+
+def _channels_body(link: dict | None, body: str = "") -> str:
+    """Render WeChat Channels (type 49/51) without WeChat's legacy upgrade placeholder."""
+    if link:
+        source = (link.get("sourceName") or "").strip()
+        header = f"🎬 <b>视频号 · {_esc(source)}</b>" if source else "🎬 <b>视频号</b>"
+        title = (link.get("title") or "").strip()
+        desc = (link.get("description") or "").strip()
+        url = (link.get("url") or "").strip()
+        if _is_channels_placeholder(title) or title == desc:
+            title = ""
+        if _CHANNELS_PLACEHOLDER_URL in url:
+            url = ""
+        return "\n".join(p for p in (header, _esc(title), _esc(desc), _esc(url)) if p)
+    lines = [ln for ln in (body or "").splitlines()
+             if ln.strip() and not _is_channels_placeholder(ln.strip()) and _CHANNELS_PLACEHOLDER_URL not in ln]
+    return "\n".join(["🎬 <b>视频号</b>", *(_esc(ln) for ln in lines)])
 
 
 # agent-wechat reason codes for attachments it could not fetch
@@ -430,6 +456,8 @@ class Bridge(LoginMixin):
         if t == LOCATION:
             loc = msg.get("location") or {}
             return "📍 " + _esc(" ".join(x for x in (loc.get("name"), loc.get("address")) if x) or body)
+        if t == APP and msg.get("appMessageType") == APP_CHANNELS:
+            return _channels_body(msg.get("link"), body)
         if t == APP and (link := msg.get("link")):
             parts = [f"🔗 <b>{_esc(link.get('title'))}</b>" if link.get("title") else "🔗",
                      _esc(link.get("description")), _esc(link.get("url"))]
@@ -444,8 +472,12 @@ class Bridge(LoginMixin):
 
     def _quote_prefix(self, msg: dict) -> str:
         q = msg.get("quote") or {}
+        el = q.get("embeddedLink") or {}
+        el_title = el.get("title") or ""
+        if _is_channels_placeholder(el_title):
+            el_title = el.get("description") or (f"视频号 · {el['sourceName']}" if el.get("sourceName") else "视频号")
         text = q.get("embeddedText") or ("[图片]" if q.get("embeddedImage") else "[表情]" if q.get("embeddedSticker")
-                                         else (q.get("embeddedLink") or {}).get("title") or "…")
+                                         else el_title or "…")
         who = q.get("senderName") or ""
         return f"<blockquote>{_esc(who + '：' if who else '')}{_esc(text[:200])}</blockquote>"
 

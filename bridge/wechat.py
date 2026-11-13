@@ -14,7 +14,7 @@ log = logging.getLogger("wechat")
 
 # WeChat numeric message types (NativeMessage.type)
 TEXT, IMAGE, VOICE, VIDEO, STICKER, LOCATION, APP, SYSTEM = 1, 3, 34, 43, 47, 48, 49, 10000
-APP_FILE, APP_QUOTE = 6, 57
+APP_FILE, APP_CHANNELS, APP_QUOTE = 6, 51, 57
 
 SEND_DONE = {"accepted", "completed", "succeeded", "failed", "needs_review", "cancelled"}
 SEND_OK = {"accepted", "completed", "succeeded"}

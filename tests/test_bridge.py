@@ -418,6 +418,51 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_latest_cursor(self):
         self.assertEqual(await self.b.wx.latest_cursor(), "42")
 
+    async def test_channels_card_strips_upgrade_placeholder(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message(
+            "ch1", "wxid_bob",
+            "[Link] 当前版本不支持展示该内容，请升级至最新版本。\n视频文案 <tag>\nhttps://support.weixin.qq.com/security/readtemplate?t=w_security_center_website/upgrade",
+            type_=49, appMessageType=51,
+            link={
+                "title": "当前版本不支持展示该内容，请升级至最新版本。",
+                "description": "视频文案 <tag>",
+                "sourceName": "老抽搞笑动画",
+                "url": "https://support.weixin.qq.com/security/readtemplate?t=w_security_center_website/upgrade",
+            },
+        )
+        self.daemon.add_message(
+            "ch2", "wxid_bob",
+            "[Link] 当前版本不支持展示该内容，请升级至最新版本。\n仅正文\nhttps://support.weixin.qq.com/security/readtemplate?t=w_security_center_website/upgrade",
+            type_=49, appMessageType=51, link=None,
+        )
+        self.daemon.add_message(
+            "lk1", "wxid_bob", "", type_=49, appMessageType=5,
+            link={"title": "文章标题", "description": "摘要", "url": "https://example.com", "sourceName": "公众号"},
+        )
+        self.daemon.add_message(
+            "q1", "wxid_bob", "好看", type_=49, appMessageType=57,
+            quote={
+                "senderName": "Bob",
+                "embeddedLink": {
+                    "title": "当前版本不支持展示该内容，请升级至最新版本。",
+                    "description": "引用的视频文案",
+                    "sourceName": "仙桃电视台",
+                },
+            },
+        )
+        await self.event("ch1", "wxid_bob")
+        await self.event("ch2", "wxid_bob")
+        await self.event("lk1", "wxid_bob")
+        await self.event("q1", "wxid_bob")
+
+        ch1_text, ch2_text, lk1_text, q1_text = [s.text for s in self.b.bot.sent[-4:]]
+        self.assertEqual(ch1_text, "🎬 <b>视频号 · 老抽搞笑动画</b>\n视频文案 &lt;tag&gt;")
+        self.assertEqual(ch2_text, "🎬 <b>视频号</b>\n仅正文")
+        self.assertIn("🔗 <b>文章标题</b>", lk1_text)
+        self.assertIn("https://example.com", lk1_text)
+        self.assertEqual(q1_text, "<blockquote>Bob：引用的视频文案</blockquote>好看")
+
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_parsing_and_cursor_expiry(self):
