@@ -44,6 +44,7 @@ class FakeDaemon:
         self.avatar_op = {"id": "avop", "state": "succeeded"}
         self.avatar_lag = 0  # reads after a successful refresh that still miss (profile reader lag)
         self.media: dict[str, list[dict]] = {}  # message id -> media assets (default: one available PNG)
+        self.group_members: dict[str, list[dict]] = {}
 
     def add_thread(self, tid, name, kind="direct"):
         self.threads[tid] = {"id": tid, "accountId": ACC, "peerId": tid, "kind": kind, "displayName": name,
@@ -91,6 +92,14 @@ class FakeDaemon:
                     return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
                 return httpx.Response(200, content=AVATAR, headers={"content-type": "image/png"})
             return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
+        if rest[0] == "groups" and rest[2] == "members" and len(rest) == 3:
+            members = self.group_members.get(rest[1], [])
+            cur = request.url.params.get("cursor")
+            if cur is None and len(members) > 2:
+                return httpx.Response(200, json={"items": members[:2], "nextCursor": "p2"})
+            if cur == "p2":
+                return httpx.Response(200, json={"items": members[2:], "nextCursor": None})
+            return httpx.Response(200, json={"items": members, "nextCursor": None})
         if rest[0] == "groups" and rest[2] == "members":
             return httpx.Response(200, json={"state": "present", "member": {"displayName": "Alice in group"}})
         if rest[0] == "contacts":
@@ -490,6 +499,50 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             "[暂不支持的微信消息：语音/视频通话 (50)]",
             "[暂不支持的微信消息类型 49/999]",
         ])
+
+    async def test_group_mentions_and_members_command(self):
+        self.daemon.add_thread("123@chatroom", "Team", kind="group")
+        self.daemon.group_members["123@chatroom"] = [
+            {"id": "lucifer231", "displayName": "永明-Sophia", "mentionName": "永明-Sophia", "roomDisplayName": None},
+            {"id": "wxid_jessie", "displayName": "Jessie", "mentionName": "Jessie", "roomDisplayName": None},
+            {"id": "wxid_uk", "displayName": "JP Office", "mentionName": "JP EU&UK Manchester Office",
+             "roomDisplayName": "JP EU&UK Manchester Office"},
+        ]
+        self.daemon.add_message("g1", "123@chatroom", "hi", sender="wxid_jessie")
+        await self.event("g1", "123@chatroom")
+        chat = self.b.store.chat_for_thread("123@chatroom")
+
+        await self.b.on_tg_message(tg_event(chat, 10, "/members"))
+        self.assertIn("<code>@永明-Sophia</code>", self.b.bot.sent[-1].text)
+        self.assertIn("<code>@JP EU&amp;UK Manchester Office</code>", self.b.bot.sent[-1].text)
+        self.assertEqual(self.daemon.sends, [])
+
+        await self.b.on_tg_message(tg_event(chat, 11, "/members@mybot jessie"))
+        self.assertIn("<code>@Jessie</code>", self.b.bot.sent[-1].text)
+        self.assertNotIn("永明-Sophia", self.b.bot.sent[-1].text)
+
+        await self.b.on_tg_message(tg_event(
+            chat, 12, "@jessie你好 @JP EU&UK Manchester Office 看下 @永明-Sophia 邮箱 test@Jessie.com"))
+        body, _ = self.daemon.sends[-1]
+        self.assertEqual(body["kind"], "text")
+        self.assertEqual(body["mentions"], {"all": False, "userIds": ["wxid_jessie", "wxid_uk", "lucifer231"]})
+
+        await self.b.on_tg_message(tg_event(chat, 13, "@所有人 开会了"))
+        body, _ = self.daemon.sends[-1]
+        self.assertEqual(body["mentions"], {"all": True, "userIds": []})
+
+        await self.b.on_tg_message(tg_event(chat, 14, "mail me at foo@all.com"))
+        body, _ = self.daemon.sends[-1]
+        self.assertNotIn("mentions", body)
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m1", "wxid_bob", "hi")
+        await self.event("m1", "wxid_bob")
+        dm_chat = self.b.store.chat_for_thread("wxid_bob")
+        await self.b.on_tg_message(tg_event(dm_chat, 20, "/members"))
+        self.assertIn("只有在微信群聊里", self.b.bot.sent[-1].text)
+        await self.b.on_tg_message(tg_event(dm_chat, 21, "@Jessie hi"))
+        self.assertNotIn("mentions", self.daemon.sends[-1][0])
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):

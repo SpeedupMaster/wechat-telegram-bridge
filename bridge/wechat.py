@@ -144,6 +144,28 @@ class WeChatClient:
         data = await self._req("GET", self._a(f"groups/{_id(room)}/members/{_id(username)}"))
         return data.get("member")
 
+    async def group_members(self, room: str) -> list[dict]:
+        items: list[dict] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": 500}
+            if cursor:
+                params["cursor"] = cursor
+            data = await self._req("GET", self._a(f"groups/{_id(room)}/members"), params=params)
+            added = 0
+            for m in data.get("items", []):
+                uid = m.get("id")
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    items.append(m)
+                    added += 1
+            nxt = data.get("nextCursor")
+            if not nxt or nxt == cursor or added == 0:
+                break
+            cursor = str(nxt)
+        return items
+
     async def avatar(self, username: str) -> bytes | None:
         try:
             r = await self._req("GET", self._a(f"avatars/{_id(username)}"), raw=True)
@@ -227,10 +249,15 @@ class WeChatClient:
                     ev_id = line[3:].strip()
 
     # --- sending ------------------------------------------------------------
-    async def send_text(self, thread_id: str, text: str, key: str, quote_ref: dict | None = None) -> dict:
+    async def send_text(self, thread_id: str, text: str, key: str, quote_ref: dict | None = None,
+                        mentions: dict | None = None) -> dict:
         body: dict = {"threadId": thread_id, "text": text}
+        if quote_ref or mentions:
+            body = {"kind": "text", **body}
         if quote_ref:
-            body = {"kind": "text", **body, "quote": quote_ref}
+            body["quote"] = quote_ref
+        if mentions:
+            body["mentions"] = mentions
         intent = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
         return await self._wait(intent, lambda i: f"sends/{_id(i['id'])}", SEND_DONE, 120)
 

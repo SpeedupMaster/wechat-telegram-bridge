@@ -59,6 +59,8 @@ HELP = (
     "在桥接群里可用：\n"
     "/wx — 查看这个群对应的微信会话\n"
     "/avatar — 重新获取微信头像作为群头像\n"
+    "/members [关键词] — 查看微信群成员（可点按复制 @名字）\n"
+    "在微信群对应的群里发 @成员名 或 @所有人 会触发微信里的 @ 提醒。\n"
     "以 // 开头的消息只留在 Telegram，不会发到微信。"
 )
 
@@ -182,6 +184,62 @@ def _fingerprint(m) -> tuple:
 
 def _chunks(text: str, size: int = TG_TEXT_LIMIT) -> list[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
+
+
+def _member_label(m: dict) -> str:
+    return (m.get("mentionName") or m.get("roomDisplayName") or m.get("displayName") or m.get("id") or "").strip()
+
+
+def _is_mention_boundary(name: str, after: str) -> bool:
+    if not after:
+        return True
+    ch = after[0]
+    if ch.isspace() or not ch.isalnum():
+        return True
+    return name[-1].isascii() and not ch.isascii()
+
+
+def _match_mentions(text: str, members: list[dict]) -> dict | None:
+    """Resolve @all/@所有人 and @memberName occurrences in `text` to an agent-wechat mentions payload."""
+    candidates: list[tuple[str, str]] = []
+    for m in members:
+        uid = m.get("id")
+        if not uid:
+            continue
+        for key in ("mentionName", "roomDisplayName", "displayName"):
+            name = (m.get(key) or "").strip()
+            if name:
+                candidates.append((name, uid))
+    candidates.sort(key=lambda item: len(item[0]), reverse=True)
+
+    mention_all = False
+    user_ids: list[str] = []
+    i = 0
+    while (pos := text.find("@", i)) != -1:
+        if pos > 0 and text[pos - 1].isalnum():
+            i = pos + 1
+            continue
+        rest = text[pos + 1:]
+        if rest.startswith("所有人") and _is_mention_boundary("所有人", rest[3:]):
+            mention_all = True
+            i = pos + 4
+            continue
+        if rest[:3].lower() == "all" and _is_mention_boundary("all", rest[3:]):
+            mention_all = True
+            i = pos + 4
+            continue
+        matched_len = 0
+        for name, uid in candidates:
+            if len(name) < matched_len:
+                break
+            if rest[:len(name)].lower() == name.lower() and _is_mention_boundary(name, rest[len(name):]):
+                matched_len = len(name)
+                if uid not in user_ids:
+                    user_ids.append(uid)
+        i = pos + 1 + (matched_len or 0)
+    if not mention_all and not user_ids:
+        return None
+    return {"all": mention_all, "userIds": user_ids}
 
 
 class Bridge(LoginMixin):
@@ -649,15 +707,22 @@ class Bridge(LoginMixin):
         text = msg.message or ""
         if text.startswith("//"):
             return
-        if text.strip() in ("/wx", f"/wx@{self.bot_me.username}"):
-            await self.bot.send_message(chat_id, f"对应微信会话：<code>{_esc(thread_id)}</code>",
-                                        parse_mode="html", reply_to=msg.id)
-            return
-        if text.strip() in ("/avatar", f"/avatar@{self.bot_me.username}"):
-            why = await self.sync_avatar(chat_id, thread_id)
-            await self.bot.send_message(chat_id, f"没有拿到这个会话的微信头像（{why}）" if why else "已更新群头像",
-                                        reply_to=msg.id)
-            return
+        cmd, _, arg = text.strip().partition(" ")
+        cmd_name, _, at_bot = cmd.partition("@")
+        if not at_bot or at_bot.lower() == self.bot_me.username.lower():
+            cmd_name = cmd_name.lower()
+            if cmd_name == "/wx":
+                await self.bot.send_message(chat_id, f"对应微信会话：<code>{_esc(thread_id)}</code>",
+                                            parse_mode="html", reply_to=msg.id)
+                return
+            if cmd_name == "/avatar":
+                why = await self.sync_avatar(chat_id, thread_id)
+                await self.bot.send_message(chat_id, f"没有拿到这个会话的微信头像（{why}）" if why else "已更新群头像",
+                                            reply_to=msg.id)
+                return
+            if cmd_name in ("/members", "/at"):
+                await self._send_members(chat_id, msg.id, thread_id, arg.strip())
+                return
         if text.startswith("/") and not msg.media:
             return  # other commands are not forwarded
 
@@ -666,6 +731,8 @@ class Bridge(LoginMixin):
             hit = self.store.wx_for_tg(chat_id, msg.reply_to.reply_to_msg_id)
             if hit and hit[0] and hit[1]:
                 quote_ref = {"messageId": hit[0], "serverId": hit[1]}
+
+        mentions = await self._resolve_mentions(thread_id, text) if text else None
 
         key = f"tg-{chat_id}-{msg.id}"
         self.pending_sends[thread_id] += 1
@@ -679,13 +746,13 @@ class Bridge(LoginMixin):
                     result = await self.wx.send_media(thread_id, kind, media, key)
                     self._record_send(chat_id, msg.id, thread_id, result, media=True)
                     if text:  # caption goes as a separate text message
-                        result = await self.wx.send_text(thread_id, text, key + "-caption")
+                        result = await self.wx.send_text(thread_id, text, key + "-caption", mentions=mentions)
                         self._record_send(chat_id, msg.id, thread_id, result)
             elif text:
                 result = None
                 if quote_ref:
                     try:
-                        result = await self.wx.send_text(thread_id, text, key, quote_ref)
+                        result = await self.wx.send_text(thread_id, text, key, quote_ref, mentions)
                     except WeChatError as e:
                         if e.status >= 500:
                             raise
@@ -694,9 +761,9 @@ class Bridge(LoginMixin):
                         log.info("Quote send failed (%s); sending without it", result.get("errorCode"))
                         result = None
                     if result is None:
-                        result = await self.wx.send_text(thread_id, text, key + "-plain")
+                        result = await self.wx.send_text(thread_id, text, key + "-plain", mentions=mentions)
                 else:
-                    result = await self.wx.send_text(thread_id, text, key)
+                    result = await self.wx.send_text(thread_id, text, key, mentions=mentions)
                 self._record_send(chat_id, msg.id, thread_id, result)
             if result is not None:
                 state = result.get("state")
@@ -716,6 +783,60 @@ class Bridge(LoginMixin):
             await self._report(chat_id, msg.id, f"发送到微信失败：{type(e).__name__}: {e}")
         finally:
             self.pending_sends[thread_id] -= 1
+
+    async def _resolve_mentions(self, thread_id: str, text: str) -> dict | None:
+        if not thread_id.endswith("@chatroom") or "@" not in text:
+            return None
+        if (m := _match_mentions(text, [])) and not any(
+            (pos := i) >= 0 and (pos == 0 or not text[pos - 1].isalnum())
+            and not (text[pos + 1:].startswith("所有人") and _is_mention_boundary("所有人", text[pos + 4:]))
+            and not (text[pos + 1:pos + 4].lower() == "all" and _is_mention_boundary("all", text[pos + 4:]))
+            for i, ch in enumerate(text) if ch == "@"
+        ):
+            return m
+        try:
+            members = await self.wx.group_members(thread_id)
+        except WeChatError as e:
+            log.info("Could not load group members for %s (%s); sending without mentions", thread_id, e.code)
+            return _match_mentions(text, [])
+        return _match_mentions(text, members)
+
+    async def _send_members(self, chat_id: int, reply_to: int, thread_id: str, query: str) -> None:
+        if not thread_id.endswith("@chatroom"):
+            await self.bot.send_message(chat_id, "只有在微信群聊里才能查看群成员", reply_to=reply_to)
+            return
+        try:
+            members = await self.wx.group_members(thread_id)
+        except WeChatError as e:
+            await self.bot.send_message(chat_id, f"获取群成员失败：{e.code}", reply_to=reply_to)
+            return
+        if query:
+            q = query.lower()
+            members = [m for m in members if any(
+                q in str(m.get(k) or "").lower()
+                for k in ("mentionName", "roomDisplayName", "displayName", "id")
+            )]
+        if not members:
+            await self.bot.send_message(chat_id, "没有匹配的群成员" if query else "没有拿到群成员", reply_to=reply_to)
+            return
+        lines = []
+        for m in members:
+            label = _member_label(m)
+            disp = (m.get("displayName") or "").strip()
+            extra = f" （{_esc(disp)}）" if disp and disp != label else ""
+            lines.append(f"• <code>@{_esc(label)}</code>{extra}")
+        header = f"<b>群成员</b>（{len(members)} 人，点按可复制）：\n也可直接发送 <code>@所有人</code>\n\n"
+        pages: list[str] = []
+        cur = header
+        for line in lines:
+            if len(cur) + len(line) + 1 > TG_TEXT_LIMIT:
+                pages.append(cur.rstrip())
+                cur = ""
+            cur += line + "\n"
+        if cur:
+            pages.append(cur.rstrip())
+        for i, part in enumerate(pages):
+            await self.bot.send_message(chat_id, part, parse_mode="html", reply_to=reply_to if i == 0 else None)
 
     def _record_send(self, chat_id: int, tg_msg: int, thread_id: str, result: dict, media: bool = False) -> None:
         server = result.get("serverMessageId") if media else result.get("serverId")
