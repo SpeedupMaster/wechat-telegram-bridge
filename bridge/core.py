@@ -18,8 +18,8 @@ from .config import Config
 from . import stickers
 from .login import LoginMixin
 from .store import Store
-from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, IMAGE, LOCATION, SEND_OK, STICKER, SYSTEM, TEXT, VIDEO,
-                     VOICE, CursorExpired, Media, WeChatClient, WeChatError)
+from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE, LOCATION, SEND_OK, STICKER,
+                     SYSTEM, TEXT, VIDEO, VOICE, CursorExpired, Media, WeChatClient, WeChatError)
 
 log = logging.getLogger("bridge")
 
@@ -338,6 +338,8 @@ class Bridge(LoginMixin):
             skip = f"history (origin {origin}, created {msg.get('createdAt')})"
         elif msg.get("recall"):
             skip = "recalled"
+        elif msg.get("type") == APP and msg.get("appMessageType") == APP_UPLOAD_NOTICE:
+            skip = "file upload notice"
         thread = None
         if skip is None:
             thread = await self.wx.thread(thread_id)

@@ -463,6 +463,19 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://example.com", lk1_text)
         self.assertEqual(q1_text, "<blockquote>Bob：引用的视频文案</blockquote>好看")
 
+    async def test_file_upload_notice_is_skipped(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("up1", "wxid_bob", "[File upload notice]\ninvoice.pdf", type_=49, appMessageType=74)
+        self.daemon.add_message("f1", "wxid_bob", "invoice.pdf", type_=49, appMessageType=6)
+        self.daemon.media["f1"] = [{"id": "asset-f1", "kind": "file", "state": "available", "variant": "original",
+                                    "actualVariant": "original", "contentType": "application/pdf", "byteLength": 4,
+                                    "filename": "invoice.pdf"}]
+        await self.event("up1", "wxid_bob")
+        self.assertEqual(self.b.user.created, [])
+        self.assertEqual(self.b.bot.sent, [])
+        await self.event("f1", "wxid_bob")
+        self.assertEqual(self.b.bot.sent[-1].file.name, "invoice.pdf")
+
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_parsing_and_cursor_expiry(self):
