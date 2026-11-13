@@ -12,17 +12,21 @@
 
 services:
   # One-shot, runs before the others on every start:
-  #  - creates the agent-wechat API token the first time (kept in the wechat-token volume).
+  #  - creates the agent-wechat API token the first time (kept in ./data/wechat-token).
   #    The daemon refuses token files that other users can read, so each side gets its own copy.
   #  - writes the agent-wechat server config (same as upstream deploy/native/server.toml:
-  #    API on loopback only) into the wechat-config volume. agent-wechat runs with a read-only
-  #    filesystem, so this is mounted as a volume rather than a Compose config or a host file.
+  #    API on loopback only) into ./data/wechat-config. agent-wechat runs with a read-only
+  #    filesystem, so this is mounted as a bind directory rather than a Compose config or a host file.
+  #  - ensures host bind-mount directories are owned by the right container UIDs (10001 / 10002).
   token-init:
     image: busybox:1.37
     network_mode: none
     volumes:
-      - wechat-token:/token
-      - wechat-config:/config
+      - ./data/wechat-token:/token
+      - ./data/wechat-config:/config
+      - ./data/wechat-data:/wechat-data
+      - ./data/wechat-scratch:/wechat-scratch
+      - ./data/bridge-data:/bridge-data
     command:
       - sh
       - -ec
@@ -37,6 +41,8 @@ services:
         chown 10002:10002 /token/bridge-token
         chmod 600 /token/daemon-token /token/bridge-token
         chmod 755 /token
+        chown -R 10001:10001 /wechat-data /wechat-scratch
+        chown -R 10002:10002 /bridge-data
         {
           echo 'schemaVersion = 1'
           echo 'listen = "127.0.0.1:6174"'
@@ -61,10 +67,10 @@ services:
       AGENT_WECHAT_URL: http://127.0.0.1:6174
       AGENT_WECHAT_TOKEN_FILE: /token/daemon-token
     volumes:
-      - wechat-data:/var/lib/agent-wechat
-      - wechat-scratch:/var/cache/agent-wechat
-      - wechat-token:/token:ro
-      - wechat-config:/etc/agent-wechat/server:ro
+      - ./data/wechat-data:/var/lib/agent-wechat
+      - ./data/wechat-scratch:/var/cache/agent-wechat
+      - ./data/wechat-token:/token:ro
+      - ./data/wechat-config:/etc/agent-wechat/server:ro
     depends_on:
       token-init:
         condition: service_completed_successfully
@@ -86,8 +92,8 @@ services:
       WECHAT_URL: http://127.0.0.1:6174
       WECHAT_TOKEN_FILE: /token/bridge-token
     volumes:
-      - bridge-data:/app/data
-      - wechat-token:/token:ro
+      - ./data/bridge-data:/app/data
+      - ./data/wechat-token:/token:ro
       # optional: put a config.toml with advanced settings here (see config.example.toml)
       - ./config:/app/config:ro
     depends_on:
@@ -96,10 +102,3 @@ services:
       agent-wechat:
         condition: service_started
     restart: unless-stopped
-
-volumes:
-  wechat-data:
-  wechat-config:
-  wechat-scratch:
-  wechat-token:
-  bridge-data:

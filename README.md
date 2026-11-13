@@ -71,7 +71,7 @@ sh setup.sh
    - 开了两步验证的，按提示再发密码。密码和验证码消息机器人读完会立即删掉。
 3. **登录微信**：Telegram 登录后，机器人会自动发来微信登录二维码，用手机微信「扫一扫」，然后在手机上确认。二维码过期会自动换新的。
 
-看到「✅ 微信已登录」就完成了。之后微信来消息就会自动建群。登录状态保存在 Docker 卷里，重启、升级都不用再登。
+看到「✅ 微信已登录」就完成了。之后微信来消息就会自动建群。登录状态保存在 `compose.yaml` 同级的 `data/` 目录里，重启、升级都不用再登。
 
 > 如果在手机上确认登录后一直没反应：有些微信登录确认需要手机直连服务器的 TCP 8050-8100 端口。可以在 VPS 防火墙/安全组里临时放行这些端口，登录成功后再关掉。机器人等太久也会提示这一点。
 
@@ -81,20 +81,20 @@ sh setup.sh
 |---|---|
 | 看日志 | `docker compose logs -f telegram-bridge` / `docker compose logs -f agent-wechat` |
 | 重启 | `docker compose restart` |
-| 停止 | `docker compose down`（数据保存在卷里，不会丢；不要加 `-v`） |
+| 停止 | `docker compose down`（数据保存在 `./data/` 目录里，不会丢） |
 | 更新本程序 | 代码推送到 GitHub 后等 Actions 构建完，在 VPS 上 `docker compose pull telegram-bridge && docker compose up -d` |
 | 固定某个版本 | 在 `.env` 里写 `BRIDGE_IMAGE=ghcr.io/speedupmaster/wechat-telegram-bridge:sha-xxxxxxx`（或打 `v1.0.0` 标签后用 `:1.0.0`） |
 | 在 VPS 上自己构建 | `docker compose up -d --build`（需要完整源码） |
 | 更新 agent-wechat | 在 `.env` 里写 `AGENT_WECHAT_VERSION=v2.x.x`，然后 `docker compose pull agent-wechat && docker compose up -d` |
 | 微信掉线或被踢下线 | 机器人会通知你，私聊机器人发 `/wxlogin` 重新扫码 |
-| 换一个 Telegram 账号 | `docker compose down`，删除 `bridge-data` 卷，再 `docker compose up -d`，重新配对 |
+| 换一个 Telegram 账号 | `docker compose down`，删除 `data/bridge-data`，再 `docker compose up -d`，重新配对 |
 | 高级设置 | `cp config.example.toml config/config.toml`，编辑后 `docker compose restart telegram-bridge` |
-| 备份 | 备份 `.env` 以及 `wechat-data`、`wechat-token`、`bridge-data` 三个卷（`wechat-config` 每次启动自动重写，不用备份） |
+| 备份 | 备份 `.env`、`config/` 以及 `data/wechat-data`、`data/wechat-token`、`data/bridge-data`（`data/wechat-config` 每次启动自动重写，`data/wechat-scratch` 为缓存，均不用备份） |
 
 注意：
 
-- 卷名前面会带上项目目录名，例如 `wechat-telegram-bridge_bridge-data`，可以用 `docker volume ls` 查看。
-- `bridge-data` 卷里的 `user.session` 就是你的 Telegram 登录凭证；`wechat-token` 卷里的 token 能完全控制微信守护进程；`.env` 里的 bot token 能控制机器人。都要妥善保管。
+- 所有持久化数据都在项目目录下的 `data/` 子目录里，方便直接打包备份（已加入 `.gitignore`，不会提交到 Git）。
+- `data/bridge-data` 里的 `user.session` 就是你的 Telegram 登录凭证；`data/wechat-token` 里的 token 能完全控制微信守护进程；`.env` 里的 bot token 能控制机器人。都要妥善保管。
 - 程序重启时如果 Telegram 还没登录，会生成一个新的配对码，旧的作废。
 
 ## 本地运行（不用 Docker）

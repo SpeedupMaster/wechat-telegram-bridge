@@ -39,7 +39,7 @@ if [ ! -f .env ]; then
   echo "已写入 .env"
 fi
 
-mkdir -p config
+mkdir -p config data/wechat-data data/wechat-config data/wechat-scratch data/wechat-token data/bridge-data
 if docker compose pull; then
   docker compose up -d
 else
