@@ -45,6 +45,9 @@ class FakeDaemon:
         self.avatar_lag = 0  # reads after a successful refresh that still miss (profile reader lag)
         self.media: dict[str, list[dict]] = {}  # message id -> media assets (default: one available PNG)
         self.group_members: dict[str, list[dict]] = {}
+        self.recalls: list[tuple[str, dict, str]] = []
+        self.recall_error: tuple[int, str] | None = None
+        self.recall_op = {"id": "rcop", "state": "succeeded"}
 
     def add_thread(self, tid, name, kind="direct"):
         self.threads[tid] = {"id": tid, "accountId": ACC, "peerId": tid, "kind": kind, "displayName": name,
@@ -65,6 +68,15 @@ class FakeDaemon:
         m = request.method
         if rest[0] == "messages" and len(rest) == 2:
             return httpx.Response(200, json=self.messages[rest[1]])
+        if rest[0] == "messages" and len(rest) == 3 and rest[2] == "recall" and m == "POST":
+            if self.recall_error:
+                st, code = self.recall_error
+                return httpx.Response(st, json={"error": {"code": code}})
+            body = json.loads(request.content)
+            self.recalls.append((rest[1], body, request.headers["idempotency-key"]))
+            return httpx.Response(202, json={"id": "rcop", "state": "queued"})
+        if rest[:2] == ["operations", "rcop"]:
+            return httpx.Response(200, json=self.recall_op)
         if rest[0] == "messages" and rest[2] == "media" and rest[1] in self.media:
             return httpx.Response(200, json={"items": self.media[rest[1]]})
         if rest[0] == "messages" and rest[2] == "media":
@@ -77,6 +89,9 @@ class FakeDaemon:
         if rest[0] == "threads" and len(rest) == 2:
             t = self.threads.get(rest[1])
             return httpx.Response(200, json=t) if t else httpx.Response(404, json={"error": {"code": "not_found"}})
+        if rest[0] == "threads" and len(rest) == 3 and rest[2] == "messages":
+            items = [m for m in self.messages.values() if m.get("threadId") == rest[1]]
+            return httpx.Response(200, json={"items": items})
         if rest[0] == "threads" and rest[2] == "read-state":
             self.marked_read.append(rest[1])
             return httpx.Response(200, json={})
@@ -625,6 +640,53 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.event("m2", "wxid_alice")
         sent2 = self.b.bot.sent[-1].text
         self.assertIn("看看 #日常 #搞笑 还挺好😂 https://a.b/#x#1 &lt;tag&gt;", sent2)
+
+    async def test_telegram_recall_via_command_and_delete(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_message("m0", "wxid_alice", "incoming", server="100")
+        await self.event("m0", "wxid_alice")
+        chat = self.b.store.chat_for_thread("wxid_alice")
+
+        # User sends a message from Telegram (serverId="901", no localMessageId yet)
+        await self.b.on_tg_message(tg_event(chat, 10, "oops typo"))
+        self.daemon.add_message("wx_local_10", "wxid_alice", "oops typo", direction="outgoing", server="901")
+
+        # Replying /recall without reply_to shows usage
+        await self.b.on_tg_message(tg_event(chat, 11, "/recall"))
+        self.assertIn("请回复你要撤回的那条消息", self.b.bot.sent[-1].text)
+
+        # /recall resolves wx_local_10 by serverId="901" and calls recall API
+        await self.b.on_tg_message(tg_event(chat, 12, "/recall", reply_to=10))
+        self.assertEqual(self.daemon.recalls[-1][0], "wx_local_10")
+        self.assertEqual(self.daemon.recalls[-1][1], {"serverId": "901"})
+        self.assertIn("↩️ 已从微信撤回", self.b.bot.sent[-1].text)
+
+        # WeChat echoing message.recalled for our own Telegram-triggered recall does not duplicate notice
+        sent_before = len(self.b.bot.sent)
+        await self.b.handle_event({"cursor": "2", "kind": "message.recalled",
+                                   "data": {"threadId": "wxid_alice", "messageId": "wx_local_10", "serverId": "901"}})
+        self.assertEqual(len(self.b.bot.sent), sent_before)
+
+        # Deleting a Telegram-sent message (even with chat_id=None as in basic groups) recalls on WeChat
+        await self.b.on_tg_message(tg_event(chat, 20, "delete me"))
+        self.daemon.add_message("wx_local_20", "wxid_alice", "delete me", direction="outgoing", server="902")
+        await self.event("wx_local_20", "wxid_alice")
+        await self.b.on_tg_delete(SimpleNamespace(chat_id=None, deleted_ids=[20]))
+        self.assertEqual(self.daemon.recalls[-1][0], "wx_local_20")
+        self.assertEqual(self.daemon.recalls[-1][1], {"serverId": "902"})
+        self.assertIn("↩️ 已从微信撤回", self.b.bot.sent[-1].text)
+
+        # Deleting an incoming message (not in `sent`) must NOT call WeChat recall
+        recalls_before = len(self.daemon.recalls)
+        bot_msg_id = self.b.bot.sent[0].id
+        self.b.store.map_message(chat, "user", 99, "wxid_alice", "m0", "100")
+        await self.b.on_tg_delete(SimpleNamespace(chat_id=chat, deleted_ids=[99, bot_msg_id]))
+        self.assertEqual(len(self.daemon.recalls), recalls_before)
+
+        # Recall failure reports error cleanly
+        self.daemon.recall_error = (409, "recall_window_expired")
+        await self.b.on_tg_message(tg_event(chat, 21, "/recall", reply_to=20))
+        self.assertIn("recall_window_expired", self.b.bot.sent[-1].text)
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):

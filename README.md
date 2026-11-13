@@ -1,168 +1,208 @@
 # wechat-telegram-bridge
 
-在 Telegram 里收发微信消息：**每个微信会话自动对应一个 Telegram 群**。
+在 Telegram 中收发微信消息的双向桥接工具：**每个微信私聊/群聊自动对应一个 Telegram 群**。
 
-- 微信收到新消息时，程序用你的 Telegram 账号自动建一个群（群名 = 微信备注名，群头像 = 微信头像），并把机器人拉进群。之后这个会话的消息都由机器人发到这个群里，所以你会收到正常的通知。
-- 你在群里发的消息会发到对应的微信会话。
-- 微信端依赖 [agent-wechat](https://github.com/thisnick/agent-wechat) 的守护进程（`wx serve`）和它的 HTTP API。
+- 微信收到新消息时，程序通过你的 Telegram 账号自动建群（群名 = 微信备注/群名，群头像 = 微信头像），并把你的 Bot 拉进群；后续消息由 Bot 发送到对应群中，保留正常的 Telegram 通知体验。
+- 你在 Telegram 桥接群里发送的消息会实时转发到对应的微信会话。
+- 微信侧依赖 [agent-wechat](https://github.com/thisnick/agent-wechat) 的本地守护进程（`wx serve`）及其 HTTP/SSE API。
 
+```text
+微信服务器 ⇄ agent-wechat (wx serve) ⇄ telegram-bridge ⇄ Telegram（你的账号 + 机器人）
 ```
-微信服务器 ⇄ agent-wechat (wx serve) ⇄ 本程序 ⇄ Telegram（你的账号 + 机器人）
-```
 
-## 支持的内容
+---
+
+## 功能特性
+
+### 双向消息支持
 
 | 微信 → Telegram | Telegram → 微信 |
 |---|---|
-| 文字、图片、视频、文件、表情 | 文字、图片、视频、文件（Telegram 里“作为文件发送”的图片会作为微信文件发送，保持原图） |
-| 语音（装了 ffmpeg 会转成 Telegram 语音条，否则以音频文件发送） | 语音条（作为微信语音发送） |
-| 链接卡片、位置（附地图点）、聊天记录、系统提示 | 贴纸：静态贴纸转成白底图片，动态/视频贴纸转成短视频（微信无法通过 agent-wechat 发表情） |
-| 群聊消息显示发送人 | 回复某条消息 → 微信引用回复 |
-| 引用回复（能对上的话变成 Telegram 回复） | 媒体的说明文字会作为一条单独的文字发送 |
-| 撤回提示 | 以 `//` 开头的消息不发到微信 |
-| 你在手机上发出的消息（静音同步，可以关） | |
+| 文字消息（自动将 `#话题#` 转为 Telegram 可高亮 `#话题`，常用 `[捂脸]` 等微信表情转为 Emoji） | 文字消息 |
+| 图片、视频、文件、表情（支持 wxid/wxgf 头像解码） | 图片、视频、文件（在 Telegram 选择「**作为文件发送**」可绕过压缩，保持微信原图字节） |
+| 语音（容器自带 `ffmpeg` 时自动转为 Telegram 语音条） | 语音条（发送为微信语音） |
+| 链接卡片、**视频号卡片**（自动清理低版本升级占位提示）、位置（含地图坐标）、聊天记录、系统提示 | 贴纸：静态贴纸转为白底 JPEG，动态/视频贴纸转码为短视频 |
+| 微信群聊显示发送者名称 | **群内 `@` 提醒**：发送 `@成员名` 或 `@所有人` / `@all` 触发微信真实 `@` 提醒 |
+| 引用回复对照还原为 Telegram 回复 | 回复某条消息 → 微信引用回复 |
+| 撤回提示、手机端已发消息静音同步（可关闭） | **双向撤回**：在 Telegram 删除已发消息，或回复该消息发送 `/recall`，即可撤回微信消息（2 分钟内有效）；以 `//` 开头的内容只留在 Telegram |
 
-上游限制：agent-wechat 发到微信的**图片**一律压到最长边 1280 像素、约 64 KB 以内，所以普通方式发的照片在微信里清晰度一般；要原图请在 Telegram 里选“作为文件发送”。视频会同时发送 720p 播放版和未经修改的原始视频，微信里可以看原画。
+### 文件大小与上游限制
 
-不支持：以微信表情的形式发送贴纸（上游 agent-wechat 不支持发表情，图片会被转成 JPEG，所以透明背景变白、GIF 不动）、在 Telegram 删消息撤回微信消息、语音/视频通话。
+- **不受 HTTP Bot API 20 MB / 50 MB 限制**：本桥接使用 Telethon 直连 Telegram **MTProto 协议**，Telegram 协议层单文件最高支持 2 GB。
+- **默认媒体上限 `200 MB`**：由 `config.toml` 中的 `max_media_mb = 200` 控制（双向均检查）。由于收发媒体需先读入内存再转发，如需调大请确保服务器内存充足，同时微信侧本身也有文件大小上限。
+- **图片清晰度**：上游 `agent-wechat` 会把普通「图片消息」压缩至最长边 1280 px / 约 64 KB；若要发高清原图，请在 Telegram 中以**文件**形式发送。视频会发送 720p 播放版及原始文件。
+- **暂不支持**：以微信原生动态表情包形式发送贴纸、微信语音/视频通话。
 
-## 部署（Docker Compose，一台 Linux VPS）
+---
 
-agent-wechat 和本程序跑在同一台 VPS 上。agent-wechat 的 API 只监听 `127.0.0.1:6174`，不对公网开放任何端口。需要 Docker 和 Docker Compose 插件（`docker compose version` 能输出版本号），x86_64 或 ARM64 Linux。
+## 机器人命令
 
-### 你需要自己准备的 3 样东西
+Bot 启动时会自动向 Telegram 注册斜杠 `/` 菜单（私聊和群聊菜单分开展示，无需手动去 `@BotFather` 配置）。
 
-1. **`api_id` 和 `api_hash`**：登录 https://my.telegram.org → *API development tools* 申请。
-2. **`bot_token`**：找 [@BotFather](https://t.me/BotFather) 发 `/newbot` 创建机器人。
+### 私聊机器人命令
 
-其余的（agent-wechat 的 token、微信账号、配置文件）都会自动生成。
+| 命令 | 说明 |
+|---|---|
+| `/find 关键词` | 搜索微信联系人和微信群 |
+| `/open 微信ID` | 为指定微信联系人或群聊新建对应的 Telegram 群（主动发起聊天） |
+| `/chats [关键词]` | 查看当前已绑定的所有会话（别名 `/list`） |
+| `/link 微信ID TG群ID` | 手动将已有的 Telegram 群绑定到指定微信会话 |
+| `/status` | 查看运行时长、转发统计、已连接会话数与微信在线状态 |
+| `/wxlogin` | 重新获取微信登录二维码（掉线或被踢下线时使用） |
+| `/help` | 查看使用帮助 |
 
-### 安装
+### 桥接群内命令
 
-桥接程序的镜像由 GitHub Actions 自动构建（`.github/workflows/image.yml`，推送到 main 分支就会更新），发布在 `ghcr.io/speedupmaster/wechat-telegram-bridge`，支持 x86_64 和 ARM64。仓库是私有的，镜像也是私有的，所以 VPS 要先登录一次 ghcr.io：
+| 命令 | 说明 |
+|---|---|
+| `/wx` | 查看当前群对应的微信名称与会话 ID |
+| `/members [关键词]` | 列出微信群成员（点击代码块即可复制 `@名字`，别名 `/at`） |
+| `/recall` | 回复某条自己发的消息并发送此命令，撤回微信消息 |
+| `/avatar` | 重新拉取微信头像并更新 Telegram 群头像 |
+| `/rename` | 同步最新微信备注/群名到 Telegram 群标题（别名 `/title`） |
+| `/unlink` | 解除当前 Telegram 群与微信会话的绑定 |
+| `/help` | 查看群内可用命令帮助 |
 
-1. 在 GitHub → Settings → Developer settings → Personal access tokens → *Tokens (classic)* 新建一个 token，只勾 `read:packages`。
-2. 在 VPS 上执行（把 `TOKEN` 换成刚才的 token）：
+---
+
+## 部署指南（Docker Compose，Linux VPS）
+
+`agent-wechat` 与 `telegram-bridge` 运行在同一台 Linux VPS 上（支持 x86_64 / ARM64），`agent-wechat` 仅监听 `127.0.0.1:6174`，不对外暴露端口。
+
+### 1. 准备工作
+
+开始前请准备以下 3 项凭证（其余 token、守护进程配置、数据库目录都会自动生成）：
+
+1. **`TG_API_ID` 与 `TG_API_HASH`**：登录 <https://my.telegram.org> → *API development tools* 创建应用获取。
+2. **`TG_BOT_TOKEN`**：在 Telegram 找 [@BotFather](https://t.me/BotFather) 发送 `/newbot` 创建机器人获取。
+
+### 2. 安装与启动
+
+GitHub Actions 会在推送到 `main` 分支后自动构建并发布多架构镜像到 `ghcr.io/speedupmaster/wechat-telegram-bridge`。
+
+如果仓库/镜像为私有，先在 VPS 登录一次 GHCR（Token 只需勾选 `read:packages`）：
 
 ```bash
-echo TOKEN | docker login ghcr.io -u SpeedupMaster --password-stdin
+echo <GITHUB_PAT> | docker login ghcr.io -u SpeedupMaster --password-stdin
 ```
 
-然后把项目拿到 VPS 上：`git clone https://github.com/SpeedupMaster/wechat-telegram-bridge.git`（私有仓库，git 会要密码，填一个有 `repo` 权限的 token），或者用 `scp -r` 上传（`.venv`、`data` 不用传）。在目录里执行：
+拉取代码并运行一键脚本：
 
 ```bash
+git clone https://github.com/SpeedupMaster/wechat-telegram-bridge.git
+cd wechat-telegram-bridge
 sh setup.sh
 ```
 
-它会问你上面 3 个值（保存在 `.env`），然后拉取镜像并启动所有容器（拉不到桥接镜像时会改为在本机构建），最后显示一行：
+脚本会引导填写 `.env` 中的必需变量、创建 `./data/` 持久化目录、拉取/构建镜像并启动容器，随后打印配对码：
 
-```
+```text
     /login 3f9a1c07
 ```
 
-不想用脚本也可以手动做：`cp .env.example .env`，填好 3 个值，`docker compose up -d`，再用 `docker compose logs telegram-bridge` 找 `PAIRING CODE`。
+> 也可以手动部署：`cp .env.example .env` 并填写配置 → `docker compose up -d` → `docker compose logs telegram-bridge | grep "PAIRING CODE"` 查看配对码。
 
-### 在机器人里完成登录
+### 3. 在机器人内完成登录
 
-1. **配对**：在 Telegram 里打开你的机器人，发送上面那行 `/login 配对码`。配对码只出现在服务器日志里，所以别人就算找到你的机器人也没法操作。
-2. **登录 Telegram**：程序需要登录你自己的 Telegram 账号来自动建群。机器人会让你选：
-   - **扫码登录**：机器人发来一张二维码，用手机 Telegram 的「设置 → 设备 → 关联桌面设备」扫。二维码要显示在另一台设备上（比如在电脑版/网页版 Telegram 里打开和机器人的对话）。
-   - **验证码登录**：发手机号，再把收到的验证码**用空格隔开**发给机器人（例如 `1 2 3 4 5`）。原样发送的话，Telegram 会认为验证码泄露并作废这次登录。
-   - 开了两步验证的，按提示再发密码。密码和验证码消息机器人读完会立即删掉。
-3. **登录微信**：Telegram 登录后，机器人会自动发来微信登录二维码，用手机微信「扫一扫」，然后在手机上确认。二维码过期会自动换新的。
+1. **配对**：在 Telegram 私聊你的机器人，发送 `/login 配对码`（仅持有服务器日志的人可配对）。
+2. **登录 Telegram 账号**：按机器人引导二选一（用于自动建群与收发账号状态）：
+   - **扫码登录**：用手机 Telegram「设置 → 设备 → 关联桌面设备」扫描机器人发来的二维码（需在电脑端/网页版等另一块屏幕上展示）。
+   - **验证码登录**：发送手机号，收到验证码后**用空格隔开**发送（如 `1 2 3 4 5`），避免被 Telegram 判定验证码泄露而作废；如开启两步验证再按提示输入密码。敏感消息会被机器人自动删除。
+3. **登录微信**：Telegram 登录后机器人会自动发送微信登录二维码，用手机微信扫码确认即可。看到「✅ 微信已登录」即部署完成。
 
-看到「✅ 微信已登录」就完成了。之后微信来消息就会自动建群。登录状态保存在 `compose.yaml` 同级的 `data/` 目录里，重启、升级都不用再登。
+> **扫码确认卡住提示**：部分微信设备确认登录需要手机直连服务器 TCP `8050-8100` 端口；若扫码确认后久未响应，可临时在 VPS 安全组/防火墙放行该端口段，登录成功后再关闭。
 
-> 如果在手机上确认登录后一直没反应：有些微信登录确认需要手机直连服务器的 TCP 8050-8100 端口。可以在 VPS 防火墙/安全组里临时放行这些端口，登录成功后再关掉。机器人等太久也会提示这一点。
+---
 
-### 日常维护
+## 日常维护与更新
+
+### 只更新 `telegram-bridge`（保持微信不断线）
+
+由于 [compose.yaml](compose.yaml) 中 `telegram-bridge` 对 `agent-wechat` 有 `depends_on` 依赖，更新桥接镜像时请务必加上 `--no-deps`，这样不会重启 `agent-wechat`：
+
+- **拉取 GitHub Actions 构建好的最新镜像**：
+  ```bash
+  docker compose pull telegram-bridge
+  docker compose up -d --no-deps telegram-bridge
+  ```
+- **或直接在服务器拉代码本地重新构建**：
+  ```bash
+  git pull
+  docker compose up -d --no-deps --build telegram-bridge
+  ```
+
+### 其他常用操作
 
 | 操作 | 命令 |
 |---|---|
-| 看日志 | `docker compose logs -f telegram-bridge` / `docker compose logs -f agent-wechat` |
-| 重启 | `docker compose restart` |
-| 停止 | `docker compose down`（数据保存在 `./data/` 目录里，不会丢） |
-| 更新本程序 | 代码推送到 GitHub 后等 Actions 构建完，在 VPS 上 `docker compose pull telegram-bridge && docker compose up -d` |
-| 固定某个版本 | 在 `.env` 里写 `BRIDGE_IMAGE=ghcr.io/speedupmaster/wechat-telegram-bridge:sha-xxxxxxx`（或打 `v1.0.0` 标签后用 `:1.0.0`） |
-| 在 VPS 上自己构建 | `docker compose up -d --build`（需要完整源码） |
-| 更新 agent-wechat | 在 `.env` 里写 `AGENT_WECHAT_VERSION=v2.x.x`，然后 `docker compose pull agent-wechat && docker compose up -d` |
-| 微信掉线或被踢下线 | 机器人会通知你，私聊机器人发 `/wxlogin` 重新扫码 |
-| 换一个 Telegram 账号 | `docker compose down`，删除 `data/bridge-data`，再 `docker compose up -d`，重新配对 |
-| 高级设置 | `cp config.example.toml config/config.toml`，编辑后 `docker compose restart telegram-bridge` |
-| 备份 | 备份 `.env`、`config/` 以及 `data/wechat-data`、`data/wechat-token`、`data/bridge-data`（`data/wechat-config` 每次启动自动重写，`data/wechat-scratch` 为缓存，均不用备份） |
+| 查看桥接日志 | `docker compose logs -f --tail 100 telegram-bridge` |
+| 查看微信守护进程日志 | `docker compose logs -f agent-wechat` |
+| 清理旧镜像 | `docker image prune -f` |
+| 停止服务 | `docker compose down`（数据保存在 `./data/` 中不会丢失） |
+| 指定桥接镜像版本 | 在 `.env` 中设置 `BRIDGE_IMAGE=ghcr.io/speedupmaster/wechat-telegram-bridge:sha-xxxxxxx` |
+| 更新 `agent-wechat` | 在 `.env` 中修改 `AGENT_WECHAT_VERSION=v2.x.x`，再 `docker compose pull agent-wechat && docker compose up -d` |
+| 高级配置 | `cp config.example.toml config/config.toml`，按需修改后执行 `docker compose restart telegram-bridge` |
+| 更换 Telegram 账号 | `docker compose down`，删除 `data/bridge-data/`，重新 `docker compose up -d` 并配对 |
 
-注意：
+### 数据目录与备份
 
-- 所有持久化数据都在项目目录下的 `data/` 子目录里，方便直接打包备份（已加入 `.gitignore`，不会提交到 Git）。
-- `data/bridge-data` 里的 `user.session` 就是你的 Telegram 登录凭证；`data/wechat-token` 里的 token 能完全控制微信守护进程；`.env` 里的 bot token 能控制机器人。都要妥善保管。
-- 程序重启时如果 Telegram 还没登录，会生成一个新的配对码，旧的作废。
+所有持久化状态均以 bind mount 保存在项目下的 `./data/` 目录中（已加入 `.gitignore`）：
+
+- **建议定期备份**：`.env`、`config/`、`data/bridge-data`（含 Telegram `user.session` 与绑定数据库 `bridge.db`）、`data/wechat-data`（微信登录态）、`data/wechat-token`。
+- **无需备份**：`data/wechat-config`（每次启动由 `token-init` 自动重写）、`data/wechat-scratch`（临时缓存）。
+
+---
 
 ## 本地运行（不用 Docker）
 
-需要 Python 3.11 或更新版本，以及已经在运行的 agent-wechat 守护进程（安装见[官方文档](https://thisnick.github.io/agent-wechat/setup/install/)，`wx serve` 即可，微信不用提前登录）。
+要求 Python 3.11+、运行中的 `agent-wechat`（`wx serve`），推荐安装 [ffmpeg](https://ffmpeg.org/) 以支持语音条与动态贴纸转码。
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate            # Linux/macOS: source .venv/bin/activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-用环境变量（或 `config.toml`，见 `config.example.toml`）提供 `TG_API_ID`、`TG_API_HASH`、`TG_BOT_TOKEN`，以及守护进程的 token：`WECHAT_TOKEN`，或者 `WECHAT_TOKEN_FILE`（token 文件路径）。然后：
+通过环境变量（或 `config.toml`）提供 `TG_API_ID`、`TG_API_HASH`、`TG_BOT_TOKEN`、`WECHAT_TOKEN`（或 `WECHAT_TOKEN_FILE`），国内网络可加 `TG_PROXY=socks5://127.0.0.1:7890`，然后启动：
 
 ```bash
 python -m bridge
 ```
 
-终端会打印配对码，之后的登录步骤和上面一样，全部在机器人里完成。国内网络需要设置 `TG_PROXY`，例如 `socks5://127.0.0.1:7890`。建议装上 [ffmpeg](https://ffmpeg.org/)，这样微信语音会显示成 Telegram 语音条。
+运行全部单元测试：
 
-第一次启动只从“现在”开始转发，不会把以前的聊天记录灌进 Telegram。
-
-## 使用
-
-- 等微信来消息就会自动建群。想主动找某人聊：私聊你的机器人，发 `/find 张三` 搜索，再发 `/open wxid_xxx` 建群。
-- 私聊机器人发 `/status` 查看运行状态（包括微信是否在线），`/help` 查看帮助，`/wxlogin` 重新登录微信。
-- 微信掉线、被踢下线或恢复在线时，机器人会私聊通知你。
-- 在桥接群里发 `/wx` 查看它对应的微信会话 ID，发 `/avatar` 重新获取微信头像作为群头像（建群时会自动设置，拿不到时可以手动再试）。
-- 在 Telegram 里回复群里的某条消息，发到微信就是引用回复。
-- 不想要某个群了：直接在 Telegram 删群。之后这个人再发消息时会建一个新群。
-- 群多了以后，可以在 Telegram 里建一个“微信”聊天文件夹，把这些群放进去。
-
-## 注意事项
-
-- **封号风险**：agent-wechat 用的是非官方协议客户端，登录时算作“一台新设备”。微信可能对第三方客户端做风控，建议先用小号试，不要用来群发或营销。
-- **Telegram 频率限制**：短时间建太多群会被要求等待（`FLOOD_WAIT`），程序会自动等。`create_interval_seconds` 控制两次建群的最小间隔。普通（非超级）群不占用 500 个超级群/频道的上限。
-- **建的是 Telegram 普通群**。如果你手动把群升级成超级群，程序会自动跟着新 ID 走。
-- `needs_review` 表示微信那边的发送结果不确定。程序会在群里提示，请在手机上确认，不要重复发送。
-- 程序和 agent-wechat 最好跑在同一台机器上。agent-wechat 只监听 localhost，跨机器访问需要 HTTPS 或隧道。
-
-## 文件说明
-
+```bash
+python -m unittest discover -s tests -v
 ```
+
+---
+
+## 项目结构
+
+```text
 bridge/
-  __main__.py   入口：python -m bridge [config.toml]
-  config.py     读取环境变量和可选的 config.toml
-  login.py      在机器人里登录：配对码、Telegram 扫码/验证码登录、微信二维码登录、掉线提醒
-  wechat.py     agent-wechat HTTP API 客户端（账号、登录、SSE 事件流、发送、上传、下载媒体）
-  core.py       桥接逻辑：建群、双向转发、引用、撤回、机器人命令
-  store.py      SQLite：事件游标、微信会话 ↔ Telegram 群、消息 ID 对照
-tests/          离线测试（模拟 agent-wechat 和 Telegram）
-Dockerfile      桥接程序镜像（带 ffmpeg）
-compose.yaml    初始化（token 和守护进程配置）+ agent-wechat + 桥接程序；只需要这一个文件就能部署
-setup.sh        一键安装：写 .env、启动、显示配对码
-.github/workflows/image.yml   GitHub Actions：跑测试，构建并推送镜像到 ghcr.io
-.env.example    Telegram 的 3 个必填项
-config/         可选的 config.toml 放这里（Docker）
+  __main__.py   程序入口（python -m bridge [config.toml]）
+  config.py     环境变量与可选 config.toml 配置加载
+  login.py      Bot 内引导登录（配对码、Telegram 扫码/验证码登录、微信扫码、掉线告警）
+  wechat.py     agent-wechat HTTP / SSE 客户端与群成员/媒体接口封装
+  core.py       双向桥接主逻辑、视频号/话题/表情渲染、@提及解析、机器人命令与菜单注册
+  stickers.py   Telegram 贴纸转微信图片/短视频（基于 Pillow / ffmpeg）
+  store.py      SQLite 持久化（事件游标、会话映射、消息映射）
+tests/          基于模拟客户端的离线单元测试
+Dockerfile      桥接服务镜像构建文件（内置 ffmpeg）
+compose.yaml    token-init + agent-wechat + telegram-bridge 编排文件
+setup.sh        VPS 一键初始化脚本
+config.example.toml  高级配置模板
 ```
 
-运行测试：`python -m unittest discover -s tests -t . -v`
+---
 
-## 常见问题
+## 注意事项与常见问题
 
-- **机器人不理我**：Telegram 登录前，机器人只响应 `/login 配对码`；登录后只听你登录的那个 Telegram 账号的命令。
-- **配对码找不到**：`docker compose logs telegram-bridge | grep "PAIRING CODE"`。容器重启会换新的配对码，用最新的。
-- **配对码输错太多次**：连续错 10 次后机器人不再响应配对，`docker compose restart telegram-bridge` 换一个新码。
-- **启动时报 “this token sees accounts”**：守护进程里有多个微信账号，用 `WECHAT_ACCOUNT` 或 `[wechat] account` 指定一个。
-- **连不上 Telegram**：检查 `TG_PROXY`。
-- **群里收不到消息**：私聊机器人发 `/status` 看微信是否在线，不在线就发 `/wxlogin`。再看 `docker compose logs telegram-bridge` 里每条微信消息对应的 `Forwarded` 或 `Skipped ...: 原因` 日志。程序只转发开始监听之后产生的消息。
-- **微信表情显示成 `[表情，无法获取：…]`**：agent-wechat 只能下载带公开 CDN 地址的表情（普通表情、表情商店里的表情），拿不到地址的（部分自定义/加密表情）就只能显示这行字，冒号后面是原因，日志里也有一行 `Could not download the attachment of WeChat message`。微信自有的 wxgf 格式动图只能拿到第一帧。
-- **想看详细日志**：在 compose.yaml 里给 telegram-bridge 加 `command: ["-v"]`，或本地运行 `python -m bridge -v`。
+- **微信风控提示**：`agent-wechat` 属于非官方协议客户端，登录时会显示为新设备，请勿用于高频群发或营销，建议先用测试账号验证。
+- **Telegram 建群限流**：短时间批量新建群组会触发 `FLOOD_WAIT`，程序会自动等待；可通过 `config.toml` 中的 `create_interval_seconds`（默认 `20` 秒）控制间隔。默认创建的是普通群（不占用 500 个超级群上限），若你手动升级为超级群，桥接会自动迁移群 ID。
+- **为什么只转发新消息**：首次启动会记录当前事件游标，不会把历史微信消息灌入 Telegram。
+- **找不到配对码 / 配对失效**：执行 `docker compose logs telegram-bridge | grep "PAIRING CODE"`；容器重启会生成新配对码，连续输错 10 次将锁定，重启容器即可刷新。
+- **提示 `needs_review`**：表示微信侧发送状态未确认，请在手机微信上核对是否发出，避免重复发送。
+- **微信表情显示 `[表情，无法获取：…]`**：加密/部分自定义表情没有可下载 CDN 地址，属于 `agent-wechat` 协议限制；可以在日志中看到具体原因。
+- **开启详细调试日志**：在 `compose.yaml` 的 `telegram-bridge` 下加 `command: ["-v"]`，或本地运行 `python -m bridge -v`。

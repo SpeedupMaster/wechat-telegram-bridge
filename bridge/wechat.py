@@ -129,6 +129,10 @@ class WeChatClient:
     async def message(self, message_id: str) -> dict:
         return await self._req("GET", self._a(f"messages/{_id(message_id)}"))
 
+    async def thread_messages(self, thread_id: str, limit: int = 20) -> list[dict]:
+        data = await self._req("GET", self._a(f"threads/{_id(thread_id)}/messages"), params={"limit": limit})
+        return data.get("items", [])
+
     async def contact(self, username: str) -> dict:
         return await self._req("GET", self._a(f"contacts/{_id(username)}"))
 
@@ -270,6 +274,14 @@ class WeChatClient:
             body["videoQuality"] = "original"  # 720p playback copy plus the untouched original
         job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
         return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
+
+    async def recall_message(self, message_id: str, server_id: str, key: str) -> dict:
+        op = await self._req("POST", self._a(f"messages/{_id(message_id)}/recall"),
+                             json={"serverId": str(server_id)}, headers={"Idempotency-Key": key})
+        done = {"succeeded", "completed", "failed", "expired", "rejected", "cancelled", "needs_review"}
+        if isinstance(op, dict) and op.get("id") and op.get("state") not in done:
+            op = await self._wait(op, lambda o: f"operations/{_id(o['id'])}", done, 30)
+        return op if isinstance(op, dict) else {}
 
     async def _wait(self, item: dict, path, done: set[str], timeout: float) -> dict:
         loop = asyncio.get_running_loop()

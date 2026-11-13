@@ -63,11 +63,13 @@ HELP = (
     "在桥接群里可用：\n"
     "/wx — 查看这个群对应的微信会话\n"
     "/members [关键词] — 查看微信群成员（可点按复制 @名字，别名 /at）\n"
+    "/recall — 回复某条消息发送以撤回微信消息\n"
     "/avatar — 重新获取微信头像作为群头像\n"
     "/rename — 同步最新微信备注/群名到当前群标题（别名 /title）\n"
     "/unlink — 解除当前群与微信会话的绑定\n"
-    "/help — 查看群内命令帮助\n\n"
+    "/help — 显示群内命令帮助\n\n"
     "在微信群对应的群里发 @成员名 或 @所有人 会触发微信里的 @ 提醒。\n"
+    "在群里删除你从 Telegram 发出的消息也会尝试自动撤回微信消息（2 分钟内有效）。\n"
     "以 // 开头的消息只留在 Telegram，不会发到微信。"
 )
 
@@ -75,11 +77,12 @@ GROUP_HELP = (
     "<b>桥接群可用命令</b>\n"
     "/wx — 查看这个群对应的微信会话\n"
     "/members [关键词] — 查看微信群成员（可点按复制 @名字，别名 /at）\n"
+    "/recall — 回复某条消息发送以撤回微信消息\n"
     "/avatar — 重新获取微信头像作为群头像\n"
     "/rename — 同步最新微信备注/群名到当前群标题（别名 /title）\n"
     "/unlink — 解除当前群与微信会话的绑定\n"
     "/help — 显示群内命令帮助\n\n"
-    "提示：发 @成员名 或 @所有人 可触发微信 @ 提醒；以 // 开头的内容只留在 Telegram。"
+    "提示：发 @成员名 或 @所有人 可触发微信 @ 提醒；删除已发消息或回复 /recall 可撤回（2 分钟内）；以 // 开头的内容只留在 Telegram。"
 )
 
 PRIVATE_BOT_COMMANDS = [
@@ -95,6 +98,7 @@ PRIVATE_BOT_COMMANDS = [
 GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
     ("members", "查看微信群成员（用于 @ 提醒）"),
+    ("recall", "回复某条消息以撤回微信消息"),
     ("avatar", "重新同步微信头像到群头像"),
     ("rename", "同步最新微信名称到群标题"),
     ("unlink", "解除当前群与微信的绑定"),
@@ -343,6 +347,7 @@ class Bridge(LoginMixin):
         # chat -> [(fingerprint, payload, time)] not matched yet.
         self.unpaired_bot: dict[int, list] = defaultdict(list)   # payload: (wx_thread, wx_msg, wx_server)
         self.unpaired_user: dict[int, list] = defaultdict(list)  # payload: user-side message id
+        self.tg_recalls: set[tuple[str, str]] = set()            # (wx_thread, wx_server) recalled from Telegram
 
     # ======================================================================
     # startup
@@ -392,6 +397,7 @@ class Bridge(LoginMixin):
 
         self.user.add_event_handler(self.on_tg_message, events.NewMessage(
             outgoing=True, func=lambda e: self.store.thread_for_chat(e.chat_id) is not None))
+        self.user.add_event_handler(self.on_tg_delete, events.MessageDeleted())
         self.user.add_event_handler(self.on_raw_update, events.Raw(types.UpdateNewMessage))
         self.user.add_event_handler(self.on_user_sees_bot_message, events.NewMessage(
             incoming=True, func=lambda e: e.sender_id == self.bot_me.id
@@ -801,7 +807,11 @@ class Bridge(LoginMixin):
 
     async def on_wx_recall(self, data: dict) -> None:
         tid = data.get("threadId") or ""
-        hit = self.store.tg_for_wx(tid, data.get("messageId"), data.get("serverId"))
+        sid = data.get("serverId")
+        if sid and (tid, str(sid)) in self.tg_recalls:
+            self.tg_recalls.discard((tid, str(sid)))
+            return
+        hit = self.store.tg_for_wx(tid, data.get("messageId"), sid)
         if not hit:
             return
         text = "↩️ 这条消息已在微信中撤回"
@@ -869,6 +879,21 @@ class Bridge(LoginMixin):
                 return
             if cmd_name in ("/members", "/at"):
                 await self._send_members(chat_id, msg.id, thread_id, arg.strip())
+                return
+            if cmd_name == "/recall":
+                reply_id = msg.reply_to.reply_to_msg_id if msg.reply_to and msg.reply_to.reply_to_msg_id else None
+                if not reply_id:
+                    await self.bot.send_message(chat_id, "请回复你要撤回的那条消息再发送 /recall", reply_to=msg.id)
+                    return
+                hit = self.store.wx_for_tg(chat_id, reply_id)
+                if not hit:
+                    await self._report(chat_id, msg.id, "找不到这条消息对应的微信记录")
+                    return
+                ok, info = await self._recall_tg_msg(chat_id, reply_id, thread_id, hit[0], hit[1], "recall-cmd")
+                if ok:
+                    await self.bot.send_message(chat_id, "↩️ " + info, reply_to=reply_id, silent=True)
+                else:
+                    await self._report(chat_id, msg.id, info)
                 return
         if text.startswith("/") and not msg.media:
             return  # other commands are not forwarded
@@ -1026,7 +1051,58 @@ class Bridge(LoginMixin):
         # squeezes every *image* it sends to at most 1280 px / ~64 KB, while files keep their exact bytes.
         return "file", Media(data, mime, name)
 
-    async def _report(self, chat_id: int, reply_to: int, text: str) -> None:
+    async def _recall_tg_msg(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,
+                               wx_server: str | None, key_prefix: str) -> tuple[bool, str]:
+        if not wx_msg and wx_server:
+            try:
+                for m in await self.wx.thread_messages(thread_id, limit=30):
+                    if str(m.get("serverId") or "") == str(wx_server):
+                        wx_msg = m.get("id")
+                        if wx_msg:
+                            self.store.map_message(chat_id, "user", tg_msg, thread_id, wx_msg, wx_server)
+                        break
+            except Exception as e:
+                log.info("Could not resolve wx message id for recall (%s): %s", wx_server, e)
+        if not wx_msg or not wx_server:
+            return False, "这条消息还没有可用的微信消息 ID，暂时无法撤回"
+        tag = (thread_id, str(wx_server))
+        if len(self.tg_recalls) > 500:
+            self.tg_recalls.clear()
+        self.tg_recalls.add(tag)
+        try:
+            op = await self.wx.recall_message(wx_msg, str(wx_server), f"{key_prefix}-{chat_id}-{tg_msg}")
+        except WeChatError as e:
+            self.tg_recalls.discard(tag)
+            return False, f"微信拒绝撤回（{e.code}）"
+        state = op.get("state")
+        if state in ("failed", "expired", "rejected", "cancelled"):
+            self.tg_recalls.discard(tag)
+            err = op.get("error") or op.get("result") or {}
+            code = err.get("code") if isinstance(err, dict) else None
+            return False, f"微信撤回失败（{code or state}）"
+        if state == "needs_review":
+            return False, "撤回结果未确认（needs_review），请在手机微信确认"
+        return True, "已从微信撤回"
+
+    async def on_tg_delete(self, event) -> None:
+        deleted = getattr(event, "deleted_ids", None) or []
+        for tg_msg in deleted:
+            row = self.store.lookup_tg_delete(getattr(event, "chat_id", None), tg_msg)
+            if not row:
+                continue
+            chat_id, thread_id, wx_msg, wx_server = row
+            if not (wx_server and self.store.is_sent(thread_id, wx_server)):
+                continue
+            ok, info = await self._recall_tg_msg(chat_id, tg_msg, thread_id, wx_msg, wx_server, "recall-del")
+            if ok:
+                try:
+                    await self.bot.send_message(chat_id, "↩️ " + info, silent=True)
+                except Exception as e:
+                    log.info("Could not notify recall in chat %s: %s", chat_id, e)
+            elif len(deleted) == 1:
+                await self._report(chat_id, None, info)
+
+    async def _report(self, chat_id: int, reply_to: int | None, text: str) -> None:
         try:
             await self.bot.send_message(chat_id, "⚠️ " + text, reply_to=reply_to)
         except Exception:

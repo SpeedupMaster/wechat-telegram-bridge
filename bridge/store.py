@@ -115,6 +115,22 @@ class Store:
     def add_sent(self, wx_thread: str, wx_server: str) -> None:
         self.db.execute("INSERT OR IGNORE INTO sent(wx_thread,wx_server) VALUES(?,?)", (wx_thread, wx_server))
 
+    def is_sent(self, wx_thread: str, wx_server: str) -> bool:
+        return self.db.execute("SELECT 1 FROM sent WHERE wx_thread=? AND wx_server=?",
+                               (wx_thread, wx_server)).fetchone() is not None
+
+    def lookup_tg_delete(self, tg_chat: int | None, tg_msg: int) -> tuple[int, str, str | None, str | None] | None:
+        """Find (tg_chat, wx_thread, wx_msg, wx_server) for a deleted Telegram message."""
+        if tg_chat is not None:
+            return self.db.execute(
+                "SELECT tg_chat, wx_thread, wx_msg, wx_server FROM msgmap WHERE tg_chat=? AND side='user' AND tg_msg=?",
+                (tg_chat, tg_msg)).fetchone()
+        rows = self.db.execute(
+            "SELECT tg_chat, wx_thread, wx_msg, wx_server FROM msgmap "
+            "WHERE side='user' AND tg_msg=? AND tg_chat < 0 AND tg_chat > -1000000000000",
+            (tg_msg,)).fetchall()
+        return rows[0] if len(rows) == 1 else None
+
     def claim_echo(self, wx_thread: str, wx_server: str, wx_msg: str) -> bool:
         """True if this outgoing WeChat message is one we sent from Telegram (and links its saved id)."""
         if not self.db.execute("SELECT 1 FROM sent WHERE wx_thread=? AND wx_server=?",
