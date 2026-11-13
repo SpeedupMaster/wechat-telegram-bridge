@@ -112,6 +112,41 @@ MEDIA_REASONS = {
     "unsupported_media_transport": "不支持",
 }
 
+WX_TYPE_NAMES = {
+    37: "好友验证请求",
+    42: "名片",
+    50: "语音/视频通话",
+    66: "企业微信名片",
+    10002: "系统通知",
+}
+
+APP_TYPE_NAMES = {
+    1: "文本分享",
+    3: "音乐",
+    4: "视频链接",
+    5: "链接",
+    6: "文件",
+    17: "实时位置共享",
+    19: "聊天记录",
+    24: "收藏笔记",
+    33: "小程序",
+    36: "小程序",
+    51: "视频号",
+    57: "引用消息",
+    63: "视频号直播",
+    87: "群公告",
+    2000: "转账",
+    2001: "红包",
+}
+
+
+def _unsupported_label(t: int | None, sub: int | None) -> str:
+    if t == APP and sub in APP_TYPE_NAMES:
+        return f"[暂不支持的微信消息：{APP_TYPE_NAMES[sub]} ({t}/{sub})]"
+    if t != APP and t in WX_TYPE_NAMES:
+        return f"[暂不支持的微信消息：{WX_TYPE_NAMES[t]} ({t})]"
+    return f"[暂不支持的微信消息类型 {t}/{sub}]"
+
 
 def _avatar_photo(data: bytes, size: int = 512) -> bytes:
     """WeChat hands out small avatars (~132 px) that Telegram rejects as a chat photo
@@ -470,7 +505,7 @@ class Bridge(LoginMixin):
             return "📜 聊天记录\n" + _esc(body)
         if t == STICKER:
             return "[表情]"
-        return _esc(body) or f"[暂不支持的微信消息类型 {t}/{msg.get('appMessageType')}]"
+        return _esc(body) or _unsupported_label(t, msg.get("appMessageType"))
 
     def _quote_prefix(self, msg: dict) -> str:
         q = msg.get("quote") or {}

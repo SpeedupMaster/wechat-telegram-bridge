@@ -476,6 +476,21 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.event("f1", "wxid_bob")
         self.assertEqual(self.b.bot.sent[-1].file.name, "invoice.pdf")
 
+    async def test_unsupported_message_shows_human_type_name(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("u1", "wxid_bob", "", type_=49, appMessageType=33)
+        self.daemon.add_message("u2", "wxid_bob", "", type_=49, appMessageType=2001)
+        self.daemon.add_message("u3", "wxid_bob", "", type_=50)
+        self.daemon.add_message("u4", "wxid_bob", "", type_=49, appMessageType=999)
+        for mid in ("u1", "u2", "u3", "u4"):
+            await self.event(mid, "wxid_bob")
+        self.assertEqual([s.text for s in self.b.bot.sent[-4:]], [
+            "[暂不支持的微信消息：小程序 (49/33)]",
+            "[暂不支持的微信消息：红包 (49/2001)]",
+            "[暂不支持的微信消息：语音/视频通话 (50)]",
+            "[暂不支持的微信消息类型 49/999]",
+        ])
+
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_parsing_and_cursor_expiry(self):
