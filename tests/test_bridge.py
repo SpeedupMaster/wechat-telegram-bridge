@@ -213,6 +213,7 @@ class Sent:
 class FakeBot:
     def __init__(self):
         self.sent: list[Sent] = []
+        self.edited: list[tuple[int, int, str, dict]] = []
         self.commands: list = []
 
     async def __call__(self, request):
@@ -225,6 +226,16 @@ class FakeBot:
         s = Sent(chat, text=text, kwargs=kw)
         self.sent.append(s)
         return s
+
+    async def edit_message(self, chat, msg_id, text, **kw):
+        self.edited.append((chat, msg_id, text, kw))
+        for s in self.sent:
+            if s.chat == chat and s.id == msg_id:
+                s.text = text
+                s.message = text
+                s.kwargs.update(kw)
+                return s
+        return Sent(chat, text=text, kwargs=kw)
 
     async def send_file(self, chat, file, **kw):
         s = Sent(chat, file=file, kwargs=kw)
@@ -1297,3 +1308,380 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         pdf = b"%PDF-1.4..."
         kind_pdf, media_pdf = await b._tg_media(make_msg(pdf, "application/pdf", "doc.pdf", ".pdf"))
         self.assertEqual((kind_pdf, media_pdf.filename, media_pdf.data), ("file", "doc.pdf", pdf))
+
+
+class _FakeCallsSocket:
+    def __init__(self):
+        self.closed = False
+        self.commands: list[dict] = []
+        self.responses: list[dict] = []
+        self.on_command = None
+
+    async def command(self, payload: dict, timeout: float = 10.0) -> dict:
+        self.commands.append(payload)
+        if self.on_command:
+            resp = await self.on_command(payload)
+            if resp is not None:
+                return resp
+        if self.responses:
+            return self.responses.pop(0)
+        return {"type": "command.result", "requestId": payload.get("requestId", "r1"), "status": "accepted"}
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _CallbackEvent:
+    def __init__(self, sender_id: int, data: bytes):
+        self.sender_id = sender_id
+        self.data = data
+        self.answers: list[tuple[str | None, bool]] = []
+
+    async def answer(self, message: str | None = None, *, alert: bool = False) -> None:
+        self.answers.append((message, alert))
+
+
+class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cfg = Config(WeChatConfig(token="secret-token"), TelegramConfig(api_id=1, api_hash="x", bot_token="y"),
+                     BridgeConfig(create_interval_seconds=0, sync_avatar=False), Path(self.tmp.name) / "config.toml")
+        self.daemon = FakeDaemon()
+        self.b = Bridge(cfg)
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(self.daemon.handler),
+                                           headers={"Authorization": "Bearer secret-token"})
+        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.bot_input = object()
+        self.b.bot_me = SimpleNamespace(username="mybot")
+        self.b.tg_ready.set()
+        self.b.owner_id = 999
+        await self.b.wx.resolve_account()
+
+    async def asyncTearDown(self):
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+
+    async def test_pending_offered_and_one_click_reject_from_pending(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+        sock = _FakeCallsSocket()
+        self.b._calls_sock = sock
+
+        async def handle_cmd(cmd: dict):
+            if cmd["type"] == "call.ready" and cmd.get("ready"):
+                # Daemon transitions pending offer to offered asynchronously after scoped call.ready
+                async def push_offered():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({
+                        "type": "call.offered",
+                        "offer": {
+                            "callId": "call-1",
+                            "revision": 3,
+                            "kind": "direct",
+                            "callType": "video",
+                            "callerId": "wxid_alice",
+                        },
+                    })
+                    await self.b.handle_call_event({"type": "call.pending", "offer": None})
+                asyncio.create_task(push_offered())
+                return {"type": "command.result", "requestId": "req-ready", "status": "accepted"}
+            return {"type": "command.result", "requestId": "req-cmd", "status": "accepted"}
+
+        sock.on_command = handle_cmd
+
+        await self.b.handle_call_event({
+            "type": "hello",
+            "protocolVersion": 2,
+            "clientId": "c1",
+            "conferenceInvitations": [],
+            "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
+            "currentPendingOffer": {
+                "callId": "call-1",
+                "revision": 1,
+                "kind": "direct",
+                "callType": "video",
+                "callerId": "wxid_alice",
+                "phase": "waiting_for_ready",
+            },
+        })
+
+        call_msg = self.b.bot.sent[-1]
+        self.assertIn("微信视频来电", call_msg.text)
+        self.assertIn("Alice", call_msg.text)
+        self.assertIn("响铃中", call_msg.text)
+        buttons = call_msg.kwargs["buttons"]
+        self.assertEqual(len(buttons), 1)
+        btn = buttons[0][0]
+        cb_data = btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+        self.assertTrue(cb_data.startswith(b"callrej:"))
+
+        # Unauthorized click is rejected cleanly
+        unauth = _CallbackEvent(111, cb_data)
+        await self.b.on_bot_callback(unauth)
+        self.assertEqual(unauth.answers, [("只有桥接账号本人可以操作", True)])
+        self.assertEqual(sock.commands, [])
+
+        # Authorized click sends scoped call.ready -> call.reject(revision=3) -> call.ready(false)
+        auth = _CallbackEvent(999, cb_data)
+        await self.b.on_bot_callback(auth)
+        self.assertEqual([c["type"] for c in sock.commands], ["call.ready", "call.reject", "call.ready"])
+        self.assertEqual(sock.commands[0]["scope"], {"kind": "offer", "callId": "call-1", "expectedRevision": 1})
+        self.assertEqual(sock.commands[1]["callId"], "call-1")
+        self.assertEqual(sock.commands[1]["expectedRevision"], 3)
+        self.assertFalse(sock.commands[2]["ready"])
+
+        self.assertIn("已在 Telegram 拒接", call_msg.text)
+        self.assertIsNone(call_msg.kwargs["buttons"])
+
+        # Subsequent ended state keeps the rejected status rather than overwriting with missed
+        await self.b.handle_call_event({
+            "type": "call.state",
+            "call": {"callId": "call-1", "revision": 5, "kind": "direct", "callType": "voice",
+                     "direction": "incoming", "state": "ended", "ownedByThisClient": False},
+        })
+        self.assertIn("已在 Telegram 拒接", call_msg.text)
+
+    async def test_call_lifecycle_updates_and_pending_cancelled(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        sock = _FakeCallsSocket()
+        self.b._calls_sock = sock
+
+        # 1) Pending call cancelled before ready/offered
+        await self.b.handle_call_event({
+            "type": "call.pending",
+            "offer": {"callId": "c-cancel", "revision": 1, "kind": "direct", "callType": "voice",
+                      "callerId": "wxid_bob", "phase": "waiting_for_ready"},
+        })
+        msg1 = self.b.bot.sent[-1]
+        self.assertIn("微信语音来电", msg1.text)
+        self.assertIsNotNone(msg1.kwargs["buttons"])
+        await self.b.handle_call_event({"type": "call.pending", "offer": None})
+        self.assertIn("已取消", msg1.text)
+        self.assertIsNone(msg1.kwargs["buttons"])
+
+        # 2) Direct offered call answered elsewhere -> connected -> ended
+        await self.b.handle_call_event({
+            "type": "call.offered",
+            "offer": {"callId": "c-ans", "revision": 3, "kind": "direct", "callType": "voice",
+                      "callerId": "wxid_bob"},
+        })
+        msg2 = self.b.bot.sent[-1]
+        await self.b.handle_call_event({
+            "type": "call.state",
+            "call": {"callId": "c-ans", "revision": 4, "kind": "direct", "callType": "voice",
+                     "direction": "incoming", "state": "connected", "ownedByThisClient": False},
+        })
+        self.assertIn("通话中", msg2.text)
+        self.assertIsNone(msg2.kwargs["buttons"])
+        await self.b.handle_call_event({
+            "type": "call.state",
+            "call": {"callId": "c-ans", "revision": 5, "kind": "direct", "callType": "voice",
+                     "direction": "incoming", "state": "ended", "ownedByThisClient": False},
+        })
+        self.assertIn("通话已结束", msg2.text)
+
+    async def test_conference_invitation_notifies_and_clears(self):
+        self.daemon.add_thread("123@chatroom", "Team", kind="group")
+        await self.b.handle_call_event({
+            "type": "conference.invitations",
+            "invitations": [{"invitationId": "inv-1", "revision": 1, "groupId": "123@chatroom", "callerId": "wxid_a"}],
+        })
+        msg = self.b.bot.sent[-1]
+        self.assertIn("微信群语音通话邀请", msg.text)
+        self.assertIn("Alice in group", msg.text)
+        self.assertIn("邀请中", msg.text)
+        self.assertIsNone(msg.kwargs.get("buttons"))
+
+        await self.b.handle_call_event({"type": "conference.invitations", "invitations": []})
+        self.assertIn("已结束或已过期", msg.text)
+
+    async def test_offered_direct_reject_and_expired_error_and_loop_unavailable(self):
+        from bridge.wechat import WeChatError
+        self.daemon.add_thread("wxid_alice", "Alice")
+        sock = _FakeCallsSocket()
+        self.b._calls_sock = sock
+
+        # Direct offered reject with stale retry -> accepted
+        sock.responses = [
+            {"type": "command.result", "requestId": "r1", "status": "error", "code": "stale"},
+            {"type": "command.result", "requestId": "r2", "status": "accepted"},
+        ]
+        await self.b.handle_call_event({
+            "type": "call.offered",
+            "offer": {"callId": "call-dir", "revision": 3, "kind": "direct", "callType": "voice",
+                      "callerId": "wxid_alice"},
+        })
+        msg = self.b.bot.sent[-1]
+        b1 = msg.kwargs["buttons"][0][0]
+        cb = _CallbackEvent(999, b1.type.data if hasattr(b1, "type") and hasattr(b1.type, "data") else b1.data)
+        await self.b.on_bot_callback(cb)
+        self.assertEqual([c["type"] for c in sock.commands], ["call.reject", "call.reject"])
+        self.assertIn("已在 Telegram 拒接", msg.text)
+        self.assertIsNone(msg.kwargs["buttons"])
+
+        # Offered call whose reject returns offer_expired clears button & marks ended
+        sock.commands.clear()
+        sock.responses = [{"type": "command.result", "requestId": "r3", "status": "error", "code": "offer_expired"}]
+        await self.b.handle_call_event({
+            "type": "call.offered",
+            "offer": {"callId": "call-exp", "revision": 3, "kind": "direct", "callType": "voice",
+                      "callerId": "wxid_alice"},
+        })
+        msg_exp = self.b.bot.sent[-1]
+        b2 = msg_exp.kwargs["buttons"][0][0]
+        cb_exp = _CallbackEvent(999, b2.type.data if hasattr(b2, "type") and hasattr(b2.type, "data") else b2.data)
+        await self.b.on_bot_callback(cb_exp)
+        self.assertIn("已结束或已过期", msg_exp.text)
+        self.assertIsNone(msg_exp.kwargs["buttons"])
+
+        # calls_loop handles 404 unsupported daemon gracefully without crashing
+        async def fail_calls():
+            raise WeChatError(404, "not_found", False)
+
+        self.b.wx.calls_socket = fail_calls
+        self.b._calls_retry_sleep = 60.0
+        task = asyncio.create_task(self.b.calls_loop())
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_calls_websocket_handshake_ping_pong_and_commands(self):
+        import base64
+        import hashlib
+        import struct
+
+        received_client_msgs: list[dict] = []
+        pong_received = asyncio.Event()
+
+        def ws_frame(opcode: int, payload: bytes) -> bytes:
+            head = bytearray([0x80 | opcode])
+            n = len(payload)
+            if n < 126:
+                head.append(n)
+            else:
+                head.append(126)
+                head.extend(struct.pack("!H", n))
+            return bytes(head) + payload
+
+        async def read_client_frame(reader: asyncio.StreamReader) -> tuple[int, bytes] | None:
+            try:
+                hdr = await reader.readexactly(2)
+            except asyncio.IncompleteReadError:
+                return None
+            opcode = hdr[0] & 0x0F
+            masked = (hdr[1] & 0x80) != 0
+            length = hdr[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", await reader.readexactly(2))[0]
+            mask = await reader.readexactly(4) if masked else b""
+            data = await reader.readexactly(length) if length else b""
+            if masked and data:
+                data = bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+            return opcode, data
+
+        async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            try:
+                req = await reader.readuntil(b"\r\n\r\n")
+                lines = req.decode("latin-1").split("\r\n")
+                hdrs = {k.strip().lower(): v.strip() for ln in lines[1:] if ":" in ln for k, _, v in [ln.partition(":")]}
+                if "forbidden" in lines[0]:
+                    body = b'{"error":{"code":"forbidden"}}'
+                    writer.write(
+                        f"HTTP/1.1 403 Forbidden\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+                    )
+                    await writer.drain()
+                    return
+                accept = base64.b64encode(
+                    hashlib.sha1((hdrs["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+                ).decode()
+                writer.write((
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode())
+                await writer.drain()
+
+                op, hello_bytes = await read_client_frame(reader)
+                self.assertEqual(op, 0x1)
+                received_client_msgs.append(json.loads(hello_bytes))
+                writer.write(ws_frame(0x1, json.dumps({
+                    "type": "hello",
+                    "protocolVersion": 2,
+                    "clientId": "c-ws",
+                    "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
+                }).encode()))
+                # Send Ping immediately followed by an offered call
+                writer.write(ws_frame(0x9, b"hb"))
+                writer.write(ws_frame(0x1, json.dumps({
+                    "type": "call.offered",
+                    "offer": {"callId": "ws-call", "revision": 3, "kind": "direct",
+                              "callType": "voice", "callerId": "wxid_bob"},
+                }).encode()))
+                await writer.drain()
+
+                while (frame := await read_client_frame(reader)) is not None:
+                    fop, fdata = frame
+                    if fop == 0x8:
+                        break
+                    if fop == 0xA:
+                        if fdata == b"hb":
+                            pong_received.set()
+                        continue
+                    if fop == 0x1:
+                        msg = json.loads(fdata)
+                        received_client_msgs.append(msg)
+                        if msg.get("type") == "call.reject":
+                            writer.write(ws_frame(0x1, json.dumps({
+                                "type": "command.result",
+                                "requestId": msg["requestId"],
+                                "status": "accepted",
+                            }).encode()))
+                            await writer.drain()
+                            writer.write(ws_frame(0x8, b"\x03\xe8"))
+                            await writer.drain()
+                            break
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        server = await asyncio.start_server(handle_conn, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            wx = WeChatClient(f"http://127.0.0.1:{port}", "secret-token", ACC)
+            try:
+                sock, hello = await wx.calls_socket()
+                self.assertEqual(hello["protocolVersion"], 2)
+                events_iter = sock.events()
+                ev = await anext(events_iter)
+                self.assertEqual(ev["type"], "call.offered")
+                await asyncio.wait_for(pong_received.wait(), timeout=2.0)
+                res = await sock.command({"type": "call.reject", "callId": "ws-call", "expectedRevision": 3})
+                self.assertEqual(res["status"], "accepted")
+                # Close frame from server terminates sock.events() cleanly
+                rest = [e async for e in events_iter]
+                self.assertEqual(rest, [])
+                await sock.close()
+                self.assertEqual([m["type"] for m in received_client_msgs], ["call.hello", "call.reject"])
+            finally:
+                await wx.close()
+
+            # 403 forbidden error parsing
+            wx_bad = WeChatClient(f"http://127.0.0.1:{port}", "secret-token", "forbidden")
+            try:
+                from bridge.wechat import WeChatError
+                with self.assertRaises(WeChatError) as ctx:
+                    await wx_bad.calls_socket()
+                self.assertEqual((ctx.exception.status, ctx.exception.code), (403, "forbidden"))
+            finally:
+                await wx_bad.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+

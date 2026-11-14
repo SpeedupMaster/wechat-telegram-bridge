@@ -6,6 +6,7 @@ import html
 import io
 import logging
 import re
+import secrets
 import shutil
 import time
 from collections import defaultdict
@@ -13,7 +14,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 import httpx
-from telethon import TelegramClient, errors, events, functions, types, utils
+from telethon import Button, TelegramClient, errors, events, functions, types, utils
 
 from .config import Config
 from . import stickers
@@ -405,6 +406,12 @@ class Bridge(LoginMixin):
         self.unpaired_bot: dict[int, list] = defaultdict(list)   # payload: (wx_thread, wx_msg, wx_server)
         self.unpaired_user: dict[int, list] = defaultdict(list)  # payload: user-side message id
         self.tg_recalls: set[tuple[str, str]] = set()            # (wx_thread, wx_server) recalled from Telegram
+        self._calls_sock = None
+        self._calls_audio_format: dict = {"sampleRate": 16000, "channels": 1, "frameMs": 20}
+        self._active_calls: dict[str, dict] = {}
+        self._call_tokens: dict[str, str] = {}
+        self._conf_invites: dict[str, dict] = {}
+        self._calls_retry_sleep: float = 300.0
 
     # ======================================================================
     # startup
@@ -464,7 +471,10 @@ class Bridge(LoginMixin):
     async def wechat_side(self) -> None:
         await self.ensure_wechat()
         log.info("WeChat is logged in; bridging messages")
-        await asyncio.gather(self.event_loop(), self.wechat_monitor())
+        tasks = [self.event_loop(), self.wechat_monitor()]
+        if self.cfg.bridge.call_notifications:
+            tasks.append(self.calls_loop())
+        await asyncio.gather(*tasks)
 
     async def on_bot_private(self, event) -> None:
         if not self.tg_ready.is_set() or self.owner_id is None:
@@ -475,9 +485,19 @@ class Bridge(LoginMixin):
             await self.on_bot_command(event)
 
     async def on_bot_callback(self, event) -> None:
-        await self.on_login_callback(event)
+        if not self.tg_ready.is_set():
+            await self.on_login_callback(event)
+            return
+        data = event.data or b""
+        if data.startswith(b"callrej:"):
+            await self._on_call_reject_callback(event, data[8:].decode("utf-8", errors="ignore"))
+            return
+        await event.answer()
 
     async def close(self) -> None:
+        if self._calls_sock is not None:
+            await self._calls_sock.close()
+            self._calls_sock = None
         await self.wx.close()
 
     # ======================================================================
@@ -916,6 +936,453 @@ class Bridge(LoginMixin):
             await self.bot.send_message(hit[0], text, reply_to=hit[1], parse_mode="html", silent=True)
         except Exception as e:
             log.info("Could not mark recall: %s", e)
+
+    # ======================================================================
+    # WeChat calls -> Telegram notification + one-click reject
+    # ======================================================================
+    async def calls_loop(self) -> None:
+        backoff = 1.0
+        warned_disabled = False
+        while True:
+            sock = None
+            try:
+                sock, hello = await self.wx.calls_socket()
+                self._calls_sock = sock
+                backoff = 1.0
+                warned_disabled = False
+                await self.handle_call_event(hello)
+                async for ev in sock.events():
+                    try:
+                        await self.handle_call_event(ev)
+                    except Exception:
+                        log.exception("Failed to handle WeChat call event %s", ev.get("type"))
+                log.warning("Calls WebSocket ended; reconnecting")
+            except WeChatError as e:
+                if e.status in (403, 404, 501) or e.code in (
+                    "forbidden", "unsupported", "unsupported_protocol_version", "invalid_protocol_version"
+                ):
+                    if not warned_disabled:
+                        log.info("WeChat calls WebSocket unavailable (%s); incoming call notifications paused", e.code)
+                        warned_disabled = True
+                    await asyncio.sleep(self._calls_retry_sleep)
+                    continue
+                log.warning("Calls WebSocket error: %s; retrying in %.0fs", e, backoff)
+            except (OSError, asyncio.TimeoutError, httpx.HTTPError) as e:
+                log.warning("Calls WebSocket connection error: %s; retrying in %.0fs", e, backoff)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("Calls WebSocket unexpected error: %s; retrying in %.0fs", e, backoff)
+            finally:
+                if sock is not None:
+                    if self._calls_sock is sock:
+                        self._calls_sock = None
+                    await sock.close()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+
+    async def handle_call_event(self, event: dict) -> None:
+        etype = event.get("type")
+        if etype == "hello":
+            if fmt := event.get("audioFormat"):
+                self._calls_audio_format = fmt
+            live_ids = {
+                x.get("callId")
+                for x in (event.get("currentOffer"), event.get("currentPendingOffer"), event.get("currentCall"))
+                if isinstance(x, dict) and x.get("callId")
+            }
+            for cid, entry in list(self._active_calls.items()):
+                if not entry["terminal"] and cid not in live_ids:
+                    entry["terminal"] = True
+                    entry["stage"] = "ended"
+                    if not entry["rejected_by_tg"]:
+                        entry["status_text"] = "⚪ 来电已结束或状态已重置"
+                    entry["offered_event"].set()
+                    await self._sync_call_msg(entry)
+            if offer := event.get("currentOffer"):
+                await self._on_call_offer(offer, stage="offered")
+            if pending := event.get("currentPendingOffer"):
+                await self._on_call_offer(pending, stage="pending")
+            if call := event.get("currentCall"):
+                await self._on_call_state(call)
+            await self._on_conf_invitations(event.get("conferenceInvitations") or [])
+        elif etype == "call.pending":
+            if offer := event.get("offer"):
+                await self._on_call_offer(offer, stage="pending")
+            else:
+                for entry in list(self._active_calls.values()):
+                    if not entry["terminal"] and entry["stage"] == "pending":
+                        entry["terminal"] = True
+                        entry["stage"] = "ended"
+                        if not entry["rejected_by_tg"]:
+                            entry["status_text"] = "⚪ 来电已取消或已在其他设备处理"
+                        entry["offered_event"].set()
+                        await self._sync_call_msg(entry)
+        elif etype == "call.offered":
+            if offer := event.get("offer"):
+                await self._on_call_offer(offer, stage="offered")
+        elif etype == "call.state":
+            if call := event.get("call"):
+                await self._on_call_state(call)
+        elif etype == "conference.invitations":
+            await self._on_conf_invitations(event.get("invitations") or [])
+        elif etype == "call.error":
+            log.warning("WeChat call error event: %s", event.get("code"))
+
+    async def _resolve_call_target(self, thread_id: str, caller_id: str, kind: str) -> tuple[dict | None, str]:
+        try:
+            thread = await self.wx.thread(thread_id)
+        except WeChatError:
+            name = thread_id
+            if not thread_id.endswith("@chatroom"):
+                try:
+                    name = (await self.wx.contact(thread_id)).get("displayName") or thread_id
+                except WeChatError:
+                    pass
+            thread = {"id": thread_id, "kind": "group" if kind == "conference" or thread_id.endswith("@chatroom") else "direct",
+                      "displayName": name}
+        if not self._allowed(thread):
+            return None, ""
+        if caller_id == thread_id and not thread_id.endswith("@chatroom"):
+            caller_name = thread.get("displayName") or caller_id
+        else:
+            caller_name = await self._sender_name({"threadId": thread_id, "senderId": caller_id})
+        return thread, caller_name or caller_id
+
+    async def _send_call_tg_msg(self, thread: dict, text: str, buttons=None) -> tuple[int, int] | None:
+        chat = await self.ensure_chat(thread)
+        if chat is None:
+            return None
+        try:
+            sent = await self.bot.send_message(chat, text, parse_mode="html", buttons=buttons, link_preview=False)
+            return chat, sent.id
+        except Exception as e:
+            if not _dead_chat(e):
+                raise
+            log.warning("Telegram group %s for %s is gone (%s); creating a new one", chat, thread["id"], e)
+            self.store.unlink(thread["id"])
+            new_chat = await self.ensure_chat(thread)
+            if not new_chat:
+                return None
+            sent = await self.bot.send_message(new_chat, text, parse_mode="html", buttons=buttons, link_preview=False)
+            return new_chat, sent.id
+
+    @staticmethod
+    def _render_call(entry: dict) -> tuple[str, list | None]:
+        title = "📹 <b>微信视频来电</b>" if entry["call_type"] == "video" else "📞 <b>微信语音来电</b>"
+        text = (
+            f"{title}\n"
+            f"来电人：<b>{_esc(entry['caller_name'])}</b>\n"
+            f"状态：{entry['status_text']}"
+        )
+        buttons = (
+            [[Button.inline("📵 拒接", f"callrej:{entry['token']}".encode())]]
+            if not entry["terminal"] and entry["stage"] in ("pending", "offered")
+            else None
+        )
+        return text, buttons
+
+    async def _sync_call_msg(self, entry: dict) -> None:
+        if not entry.get("chat_id") or not entry.get("msg_id"):
+            return
+        text, buttons = self._render_call(entry)
+        render_key = (text, bool(buttons))
+        if entry.get("_last_render") == render_key:
+            return
+        try:
+            await self.bot.edit_message(entry["chat_id"], entry["msg_id"], text, parse_mode="html",
+                                        buttons=buttons, link_preview=False)
+            entry["_last_render"] = render_key
+        except errors.MessageNotModifiedError:
+            entry["_last_render"] = render_key
+        except Exception as e:
+            log.info("Could not update call notification message for %s: %s", entry["call_id"], e)
+
+    def _prune_calls(self) -> None:
+        if len(self._active_calls) <= 200:
+            return
+        for cid, entry in list(self._active_calls.items()):
+            if entry["terminal"]:
+                self._active_calls.pop(cid, None)
+                self._call_tokens.pop(entry["token"], None)
+            if len(self._active_calls) <= 150:
+                break
+
+    async def _on_call_offer(self, offer: dict, *, stage: str) -> None:
+        call_id = offer.get("callId")
+        if not call_id:
+            return
+        if existing := self._active_calls.get(call_id):
+            if not existing["terminal"]:
+                if stage == "offered" or existing["stage"] == "pending":
+                    existing["stage"] = stage
+                existing["revision"] = offer.get("revision", existing["revision"])
+                existing["phase"] = offer.get("phase")
+                if stage == "offered":
+                    existing["offered_event"].set()
+                await self._sync_call_msg(existing)
+            return
+
+        caller_id = offer.get("callerId") or ""
+        kind = offer.get("kind") or "direct"
+        thread_id = offer.get("groupId") or caller_id
+        if not thread_id:
+            return
+        thread, caller_name = await self._resolve_call_target(thread_id, caller_id or thread_id, kind)
+        if thread is None:
+            return
+
+        self._prune_calls()
+        token = secrets.token_hex(6)
+        entry = {
+            "call_id": call_id,
+            "token": token,
+            "kind": kind,
+            "call_type": offer.get("callType") or "voice",
+            "caller_id": caller_id,
+            "caller_name": caller_name,
+            "thread_id": thread["id"],
+            "stage": stage,
+            "phase": offer.get("phase"),
+            "revision": offer.get("revision", 0),
+            "chat_id": None,
+            "msg_id": None,
+            "terminal": False,
+            "rejected_by_tg": False,
+            "rejecting": False,
+            "was_connected": False,
+            "offered_event": asyncio.Event(),
+            "status_text": "🔔 响铃中…",
+            "_last_render": None,
+        }
+        if stage == "offered":
+            entry["offered_event"].set()
+        self._active_calls[call_id] = entry
+        self._call_tokens[token] = call_id
+
+        text, buttons = self._render_call(entry)
+        res = await self._send_call_tg_msg(thread, text, buttons=buttons)
+        if not res:
+            return
+        entry["chat_id"], entry["msg_id"] = res
+        entry["_last_render"] = (text, bool(buttons))
+        # In case call state updated while ensure_chat was creating the group:
+        await self._sync_call_msg(entry)
+
+    async def _on_call_state(self, call: dict) -> None:
+        call_id = call.get("callId")
+        if not call_id:
+            return
+        state = call.get("state") or ""
+        entry = self._active_calls.get(call_id)
+        if entry is None:
+            if call.get("direction") != "incoming" or state in ("ending", "ended", "uncertain"):
+                return
+            caller_id = next(
+                (c.get("participantId") for c in (call.get("controls") or []) if c.get("participantId")), ""
+            )
+            thread_id = call.get("groupId") or caller_id
+            if not thread_id:
+                return
+            await self._on_call_offer({
+                "callId": call_id,
+                "revision": call.get("revision", 0),
+                "kind": call.get("kind") or "direct",
+                "callType": call.get("callType") or "voice",
+                "callerId": caller_id,
+                "groupId": call.get("groupId"),
+            }, stage=state if state == "offered" else state)
+            entry = self._active_calls.get(call_id)
+            if entry is None:
+                return
+
+        entry["revision"] = call.get("revision", entry["revision"])
+        if state == "offered":
+            entry["stage"] = "offered"
+            entry["status_text"] = "🔔 响铃中…"
+            entry["offered_event"].set()
+        elif state in ("dialing", "ringing"):
+            entry["stage"] = state
+            entry["status_text"] = "🔔 响铃中…"
+        elif state == "connecting":
+            entry["stage"] = "connecting"
+            entry["status_text"] = "🟡 接通中…"
+            entry["offered_event"].set()
+        elif state == "connected":
+            entry["stage"] = "connected"
+            entry["was_connected"] = True
+            entry["status_text"] = "🟢 通话中"
+            entry["offered_event"].set()
+        elif state in ("ending", "ended"):
+            entry["stage"] = state
+            entry["terminal"] = True
+            if not entry["rejected_by_tg"]:
+                entry["status_text"] = "⚪ 通话已结束" if entry["was_connected"] else "⚪ 来电已结束（未接听或已取消）"
+            entry["offered_event"].set()
+        elif state == "uncertain":
+            entry["stage"] = "uncertain"
+            entry["terminal"] = True
+            if not entry["rejected_by_tg"]:
+                entry["status_text"] = "⚠️ 来电状态未确认"
+            entry["offered_event"].set()
+        await self._sync_call_msg(entry)
+
+    async def _on_conf_invitations(self, invitations: list[dict]) -> None:
+        current_ids = {inv.get("invitationId") for inv in invitations if inv.get("invitationId")}
+        for inv_id in list(self._conf_invites):
+            if inv_id not in current_ids:
+                old = self._conf_invites.pop(inv_id)
+                old["status_text"] = "⚪ 邀请已结束或已过期"
+                try:
+                    await self.bot.edit_message(old["chat_id"], old["msg_id"],
+                                                f"📞 <b>微信群语音通话邀请</b>\n"
+                                                f"发起人：<b>{_esc(old['caller_name'])}</b>\n"
+                                                f"状态：{old['status_text']}",
+                                                parse_mode="html", link_preview=False)
+                except errors.MessageNotModifiedError:
+                    pass
+                except Exception as e:
+                    log.info("Could not update conference invitation %s: %s", inv_id, e)
+
+        for inv in invitations:
+            inv_id = inv.get("invitationId")
+            group_id = inv.get("groupId") or ""
+            caller_id = inv.get("callerId") or ""
+            if not inv_id or not group_id or inv_id in self._conf_invites:
+                continue
+            thread, caller_name = await self._resolve_call_target(group_id, caller_id, "conference")
+            if thread is None:
+                continue
+            text = (
+                "📞 <b>微信群语音通话邀请</b>\n"
+                f"发起人：<b>{_esc(caller_name)}</b>\n"
+                "状态：🔔 邀请中…"
+            )
+            res = await self._send_call_tg_msg(thread, text)
+            if res:
+                self._conf_invites[inv_id] = {
+                    "invitation_id": inv_id,
+                    "group_id": group_id,
+                    "caller_name": caller_name,
+                    "chat_id": res[0],
+                    "msg_id": res[1],
+                    "status_text": "🔔 邀请中…",
+                }
+
+    async def _on_call_reject_callback(self, event, token: str) -> None:
+        if event.sender_id != self.owner_id:
+            await event.answer("只有桥接账号本人可以操作", alert=True)
+            return
+        call_id = self._call_tokens.get(token)
+        entry = self._active_calls.get(call_id) if call_id else None
+        if not entry or entry["terminal"] or entry["stage"] not in ("pending", "offered"):
+            await event.answer("来电已结束或已处理")
+            if entry:
+                await self._sync_call_msg(entry)
+            return
+        if entry["rejecting"]:
+            await event.answer("正在拒接中…")
+            return
+        sock = self._calls_sock
+        if sock is None or sock.closed:
+            await event.answer("通话信令未连接，无法拒接", alert=True)
+            return
+
+        entry["rejecting"] = True
+        await event.answer("正在拒接…")
+        readied = False
+        try:
+            if entry["stage"] == "pending":
+                entry["offered_event"].clear()
+                res = await sock.command({
+                    "type": "call.ready",
+                    "ready": True,
+                    "format": self._calls_audio_format,
+                    "scope": {
+                        "kind": "offer",
+                        "callId": call_id,
+                        "expectedRevision": entry["revision"],
+                    },
+                })
+                readied = True
+                if res.get("status") == "error":
+                    code = res.get("code") or "error"
+                    if code == "offer_expired" and entry["stage"] == "pending" and not entry["terminal"]:
+                        # Revision may have advanced to preparing; give the socket a moment to deliver call.offered
+                        try:
+                            await asyncio.wait_for(entry["offered_event"].wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            pass
+                    if not (entry["stage"] == "offered" or entry["terminal"]):
+                        await self._finish_reject_error(entry, code)
+                        return
+                if entry["stage"] == "pending" and not entry["terminal"]:
+                    try:
+                        await asyncio.wait_for(entry["offered_event"].wait(), timeout=10.0)
+                    except asyncio.TimeoutError:
+                        await self._report_call_reject_failure(entry, "等待来电就绪超时")
+                        return
+
+            if entry["terminal"] or entry["stage"] != "offered":
+                await self._sync_call_msg(entry)
+                return
+
+            res = await sock.command({
+                "type": "call.reject",
+                "callId": call_id,
+                "expectedRevision": entry["revision"],
+            })
+            if res.get("status") == "error" and res.get("code") == "stale" and not entry["terminal"] and entry["stage"] == "offered":
+                res = await sock.command({
+                    "type": "call.reject",
+                    "callId": call_id,
+                    "expectedRevision": entry["revision"],
+                })
+            if res.get("status") in ("accepted", "replayed"):
+                entry["rejected_by_tg"] = True
+                entry["terminal"] = True
+                entry["stage"] = "ended"
+                entry["status_text"] = "📵 已在 Telegram 拒接"
+                await self._sync_call_msg(entry)
+            else:
+                await self._finish_reject_error(entry, res.get("code") or "error")
+        except (OSError, WeChatError, asyncio.TimeoutError) as e:
+            await self._report_call_reject_failure(entry, f"拒接请求失败：{e}")
+        finally:
+            entry["rejecting"] = False
+            if readied and not sock.closed:
+                try:
+                    await sock.command({
+                        "type": "call.ready",
+                        "ready": False,
+                        "format": self._calls_audio_format,
+                    })
+                except Exception:
+                    pass
+
+    async def _finish_reject_error(self, entry: dict, code: str) -> None:
+        reasons = {
+            "offer_expired": "来电已结束或已过期",
+            "stale": "来电状态已变化，请重试",
+            "already_claimed": "来电已被其他设备处理",
+            "not_owner": "来电已被其他设备接管",
+            "busy": "当前有其他未决通话",
+            "forbidden": "API Token 缺少 calls 权限",
+            "unsupported": "当前 agent-wechat 不支持拒接操作",
+            "media_not_ready": "来电尚未准备就绪",
+        }
+        msg = reasons.get(code, f"拒接失败（{code}）")
+        if code in ("offer_expired", "already_claimed", "not_owner"):
+            entry["terminal"] = True
+            entry["stage"] = "ended"
+            entry["status_text"] = f"⚪ {msg}"
+            await self._sync_call_msg(entry)
+            return
+        await self._report_call_reject_failure(entry, msg)
+
+    async def _report_call_reject_failure(self, entry: dict, text: str) -> None:
+        if entry.get("chat_id"):
+            await self._report(entry["chat_id"], entry.get("msg_id"), text)
 
     # ======================================================================
     # Telegram -> WeChat

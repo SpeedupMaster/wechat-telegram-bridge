@@ -44,6 +44,7 @@ class BridgeConfig:
     mark_read_on_reply: bool = True
     create_interval_seconds: float = 20.0
     max_media_mb: int = 200
+    call_notifications: bool = True
     skip_threads: list[str] = field(default_factory=list)
 
 

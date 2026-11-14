@@ -44,5 +44,7 @@ mark_read_on_reply = true
 create_interval_seconds = 20
 # 单个媒体文件的大小上限（MB），两个方向都适用
 max_media_mb = 200
+# 实时转发微信语音/视频来电通知，并提供一键拒接按钮（需 agent-wechat >= 2.4.0）
+call_notifications = true
 # 不桥接的微信会话 ID，例如 ["filehelper", "weixin"]
 skip_threads = ["weixin"]
