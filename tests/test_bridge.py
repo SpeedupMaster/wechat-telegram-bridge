@@ -1084,6 +1084,95 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.b.on_tg_message(tg_event(chat, 21, "/recall", reply_to=20))
         self.assertIn("recall_window_expired", self.b.bot.sent[-1].text)
 
+    async def test_send_failure_quotes_failed_message_and_describes_target(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_message("m0", "wxid_alice", "hi")
+        await self.event("m0", "wxid_alice")
+        chat = self.b.store.chat_for_thread("wxid_alice")  # basic group (-501)
+
+        # 1) Basic group: two stickers in a row with distinct Telegram document IDs pair accurately
+        async def fail_timeout(*_a, **_kw):
+            raise httpx.ReadTimeout("")
+
+        self.b.wx.send_sticker = fail_timeout
+        sticker1_user = SimpleNamespace(
+            id=101, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, voice=None, video_note=None, gif=None, video=None,
+            sticker=True, media=SimpleNamespace(document=SimpleNamespace(id=7001)),
+            file=SimpleNamespace(size=100, mime_type="image/webp", ext=".webp", name=None),
+            download_media=lambda file=bytes: asyncio.sleep(0, result=b"RIFFwebp"),
+        )
+        sticker1_bot = SimpleNamespace(
+            id=8801, message="", media=SimpleNamespace(document=SimpleNamespace(id=7001)),
+        )
+        sticker2_user = SimpleNamespace(
+            id=102, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, voice=None, video_note=None, gif=None, video=None,
+            sticker=True, media=SimpleNamespace(document=SimpleNamespace(id=7002)),
+            file=SimpleNamespace(size=100, mime_type="image/webp", ext=".webp", name=None),
+            download_media=lambda file=bytes: asyncio.sleep(0, result=b"RIFFwebp"),
+        )
+        sticker2_bot = SimpleNamespace(
+            id=8802, message="", media=SimpleNamespace(document=SimpleNamespace(id=7002)),
+        )
+
+        # Bot sees sticker 2 before sticker 1, yet document ID matches sticker 1 -> 8801
+        await self.b.on_bot_sees_user_message(SimpleNamespace(chat_id=chat, message=sticker2_bot))
+        await self.b.on_bot_sees_user_message(SimpleNamespace(chat_id=chat, message=sticker1_bot))
+        self.b._tg_media = lambda *_a, **_kw: asyncio.sleep(0, result=("sticker", SimpleNamespace(data=b"gif", mime="image/gif", filename="s.gif")))
+        await self.b.on_tg_message(SimpleNamespace(chat_id=chat, message=sticker1_user))
+        alert1 = self.b.bot.sent[-1]
+        self.assertEqual(alert1.kwargs["reply_to"], 8801)
+        self.assertEqual(alert1.text, "⚠️ 发送[贴纸]到微信失败：ReadTimeout")
+
+        await self.b.on_tg_message(SimpleNamespace(chat_id=chat, message=sticker2_user))
+        alert2 = self.b.bot.sent[-1]
+        self.assertEqual(alert2.kwargs["reply_to"], 8802)
+        self.assertEqual(alert2.text, "⚠️ 发送[贴纸]到微信失败：ReadTimeout")
+
+        # 2) Basic group: bot update arrives slightly after immediate failure -> waits and pairs cleanly
+        self.b._bot_pair_wait = 0.5
+        file_user = SimpleNamespace(
+            id=103, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, voice=None, video_note=None, gif=None, video=None, sticker=None,
+            media=SimpleNamespace(document=SimpleNamespace(id=7003)),
+            file=SimpleNamespace(size=100, mime_type="image/jpeg", ext=".jpg", name="IMG_6186.JPG"),
+        )
+        file_bot = SimpleNamespace(
+            id=8803, message="", media=SimpleNamespace(document=SimpleNamespace(id=7003)),
+        )
+        self.b._tg_media = lambda *_a, **_kw: asyncio.sleep(0, result=(None, "文件太大"))
+
+        async def bot_arrives_later():
+            await asyncio.sleep(0.02)
+            await self.b.on_bot_sees_user_message(SimpleNamespace(chat_id=chat, message=file_bot))
+
+        await asyncio.gather(
+            self.b.on_tg_message(SimpleNamespace(chat_id=chat, message=file_user)),
+            bot_arrives_later(),
+        )
+        alert3 = self.b.bot.sent[-1]
+        self.assertEqual(alert3.kwargs["reply_to"], 8803)
+        self.assertEqual(alert3.text, "⚠️ 发送[文件 IMG_6186.JPG]到微信失败：文件太大")
+
+        # 3) Basic group where bot cannot see user messages -> no bogus user-side reply_to, text still identifies message
+        self.b._bot_pair_wait = 0.0
+        self.b.wx.send_text = fail_timeout
+        await self.b.on_tg_message(tg_event(chat, 104, "这是一条非常重要的长消息测试一下截断效果是否正常"))
+        alert4 = self.b.bot.sent[-1]
+        self.assertIsNone(alert4.kwargs["reply_to"])
+        self.assertIn("发送「这是一条非常重要的长消息测试一下截断效果是否正常」到微信失败：ReadTimeout", alert4.text)
+
+        # 4) Supergroup shares message IDs directly without pairing
+        super_chat = -1001234567890
+        self.b.store.link("wxid_alice", super_chat, "Alice")
+        await self.b.on_tg_message(tg_event(super_chat, 555, "hello"))
+        alert5 = self.b.bot.sent[-1]
+        self.assertEqual(alert5.kwargs["reply_to"], 555)
+        self.assertEqual(alert5.text, "⚠️ 发送「hello」到微信失败：ReadTimeout")
+
+
+
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_parsing_and_cursor_expiry(self):

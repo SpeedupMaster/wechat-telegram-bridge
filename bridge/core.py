@@ -325,6 +325,44 @@ def _fingerprint(m) -> tuple:
     return (getattr(m, "message", None) or "", type(media).__name__ if media else "")
 
 
+def _tg_msg_fingerprint(m) -> tuple:
+    """Fingerprint a user-sent message across user and bot sessions, including Telegram media IDs."""
+    media = getattr(m, "media", None)
+    if isinstance(media, types.MessageMediaWebPage):
+        media = None
+    media_id = None
+    if media is not None:
+        media_id = getattr(getattr(media, "document", None), "id", None) or getattr(
+            getattr(media, "photo", None), "id", None)
+    return (getattr(m, "message", None) or "", type(media).__name__ if media else "", media_id)
+
+
+def _describe_tg_msg(msg) -> str:
+    """Short human-readable label for a Telegram message shown in failure reports."""
+    text = " ".join((getattr(msg, "message", None) or "").split())
+    snippet = (text[:24] + "…") if len(text) > 25 else text
+    if getattr(msg, "sticker", None):
+        return "贴纸"
+    if getattr(msg, "photo", None):
+        return f"图片「{snippet}」" if snippet else "图片"
+    if getattr(msg, "voice", None):
+        return "语音"
+    if getattr(msg, "video_note", None):
+        return "视频消息"
+    if getattr(msg, "gif", None):
+        return f"GIF「{snippet}」" if snippet else "GIF"
+    if getattr(msg, "video", None):
+        return f"视频「{snippet}」" if snippet else "视频"
+    media = getattr(msg, "media", None)
+    if media and not isinstance(media, types.MessageMediaWebPage):
+        f = getattr(msg, "file", None)
+        name = (getattr(f, "name", None) or "").strip()
+        return f"文件 {name}" if name else "文件"
+    if snippet:
+        return f"「{snippet}」"
+    return "消息"
+
+
 def _chunks(text: str, size: int = TG_TEXT_LIMIT) -> list[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
@@ -409,6 +447,11 @@ class Bridge(LoginMixin):
         # chat -> [(fingerprint, payload, time)] not matched yet.
         self.unpaired_bot: dict[int, list] = defaultdict(list)   # payload: (wx_thread, wx_msg, wx_server)
         self.unpaired_user: dict[int, list] = defaultdict(list)  # payload: user-side message id
+        self._unpaired_tg_user: dict[int, list] = defaultdict(list)
+        self._unpaired_tg_bot: dict[int, list] = defaultdict(list)
+        self._user_to_bot_msg: dict[tuple[int, int], int] = {}
+        self._bot_pair_events: dict[tuple[int, int], asyncio.Event] = {}
+        self._bot_pair_wait: float = 0.5
         self.tg_recalls: set[tuple[str, str]] = set()            # (wx_thread, wx_server) recalled from Telegram
         self._calls_sock = None
         self._calls_audio_format: dict = {"sampleRate": 16000, "channels": 1, "frameMs": 20}
@@ -474,6 +517,9 @@ class Bridge(LoginMixin):
         self.user.add_event_handler(self.on_raw_update, events.Raw(types.UpdateNewMessage))
         self.user.add_event_handler(self.on_user_sees_bot_message, events.NewMessage(
             incoming=True, func=lambda e: e.sender_id == self.bot_me.id
+            and self.store.thread_for_chat(e.chat_id) is not None))
+        self.bot.add_event_handler(self.on_bot_sees_user_message, events.NewMessage(
+            incoming=True, func=lambda e: not e.is_private and e.sender_id == self.owner_id
             and self.store.thread_for_chat(e.chat_id) is not None))
         await asyncio.gather(self.wechat_side(), self.user.run_until_disconnected())
 
@@ -855,6 +901,55 @@ class Bridge(LoginMixin):
                 self.store.map_message(chat, "user", user_id, *wx)
                 return
         mine[chat].append((fp, bot or user, now))
+
+    async def on_bot_sees_user_message(self, event) -> None:
+        """The bot received a message you posted in a group; record its bot-side id for replies."""
+        self._pair_tg_user_msg(event.chat_id, _tg_msg_fingerprint(event.message), bot_id=event.message.id)
+
+    def _record_user_bot_pair(self, chat_id: int, user_id: int, bot_id: int) -> None:
+        key = (chat_id, user_id)
+        if len(self._user_to_bot_msg) >= 2000:
+            for k in list(self._user_to_bot_msg)[:1000]:
+                self._user_to_bot_msg.pop(k, None)
+        self._user_to_bot_msg[key] = bot_id
+        if ev := self._bot_pair_events.get(key):
+            ev.set()
+
+    def _pair_tg_user_msg(self, chat_id: int, fp: tuple, *, user_id: int | None = None,
+                          bot_id: int | None = None) -> None:
+        if chat_id < -1000000000000:
+            return
+        now = time.monotonic()
+        mine, other = (self._unpaired_tg_user, self._unpaired_tg_bot) if user_id is not None else (
+            self._unpaired_tg_bot, self._unpaired_tg_user)
+        for q in (mine[chat_id], other[chat_id]):
+            q[:] = [e for e in q if now - e[2] < 300][-50:]
+        for i, (ofp, payload, _) in enumerate(other[chat_id]):
+            if ofp == fp:
+                del other[chat_id][i]
+                uid, bid = (user_id, payload) if user_id is not None else (payload, bot_id)
+                self._record_user_bot_pair(chat_id, uid, bid)
+                return
+        mine[chat_id].append((fp, user_id if user_id is not None else bot_id, now))
+
+    async def _bot_reply_id(self, chat_id: int, user_msg_id: int | None, *, wait: bool = True) -> int | None:
+        if user_msg_id is None:
+            return None
+        if chat_id < -1000000000000:
+            return user_msg_id
+        key = (chat_id, user_msg_id)
+        if (bid := self._user_to_bot_msg.get(key)) is not None:
+            return bid
+        if not wait or self._bot_pair_wait <= 0:
+            return None
+        ev = self._bot_pair_events.setdefault(key, asyncio.Event())
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=self._bot_pair_wait)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._bot_pair_events.pop(key, None)
+        return self._user_to_bot_msg.get(key)
 
     async def _send_tg(self, chat, thread, header, prefix, msg, media, reply_to, silent) -> list:
         async def go(chat_id: int) -> list:
@@ -1420,6 +1515,7 @@ class Bridge(LoginMixin):
         text = msg.message or ""
         if text.startswith("//"):
             return
+        self._pair_tg_user_msg(chat_id, _tg_msg_fingerprint(msg), user_id=msg.id)
         cmd, _, arg = text.strip().partition(" ")
         cmd_name, _, at_bot = cmd.partition("@")
         if not at_bot or at_bot.lower() == self.bot_me.username.lower():
@@ -1434,12 +1530,12 @@ class Bridge(LoginMixin):
                         pass
                 head = f"对应微信会话：<b>{_esc(title)}</b>\n" if title else "对应微信会话："
                 await self.bot.send_message(chat_id, f"{head}<code>{_esc(thread_id)}</code>",
-                                            parse_mode="html", reply_to=msg.id)
+                                            parse_mode="html", reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/avatar":
                 why = await self.sync_avatar(chat_id, thread_id)
                 await self.bot.send_message(chat_id, f"没有拿到这个会话的微信头像（{why}）" if why else "已更新群头像",
-                                            reply_to=msg.id)
+                                            reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name in ("/rename", "/title"):
                 title, status = await self.sync_title(chat_id, thread_id)
@@ -1449,38 +1545,45 @@ class Bridge(LoginMixin):
                     reply = f"无法同步群标题（{_esc(status)}）"
                 else:
                     reply = f"已更新群标题：{_esc(title)}"
-                await self.bot.send_message(chat_id, reply, parse_mode="html", reply_to=msg.id)
+                await self.bot.send_message(chat_id, reply, parse_mode="html",
+                                            reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/unlink":
                 self.store.unlink(thread_id)
                 await self.bot.send_message(
                     chat_id,
                     f"已解除当前群与微信会话 <code>{_esc(thread_id)}</code> 的绑定。",
-                    parse_mode="html", reply_to=msg.id)
+                    parse_mode="html", reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/link":
                 await self._handle_group_link(event, arg.strip())
                 return
             if cmd_name == "/help":
-                await self.bot.send_message(chat_id, GROUP_HELP, parse_mode="html", reply_to=msg.id)
+                await self.bot.send_message(chat_id, GROUP_HELP, parse_mode="html",
+                                            reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name in ("/members", "/at"):
-                await self._send_members(chat_id, msg.id, thread_id, arg.strip())
+                await self._send_members(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg.strip())
                 return
             if cmd_name == "/recall":
                 reply_id = msg.reply_to.reply_to_msg_id if msg.reply_to and msg.reply_to.reply_to_msg_id else None
                 if not reply_id:
-                    await self.bot.send_message(chat_id, "请回复你要撤回的那条消息再发送 /recall", reply_to=msg.id)
+                    await self.bot.send_message(chat_id, "请回复你要撤回的那条消息再发送 /recall",
+                                                reply_to=await self._bot_reply_id(chat_id, msg.id))
                     return
                 hit = self.store.wx_for_tg(chat_id, reply_id)
                 if not hit:
-                    await self._report(chat_id, msg.id, "找不到这条消息对应的微信记录")
+                    await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id),
+                                       "找不到这条消息对应的微信记录")
                     return
                 ok, info = await self._recall_tg_msg(chat_id, reply_id, thread_id, hit[0], hit[1], "recall-cmd")
                 if ok:
-                    await self.bot.send_message(chat_id, "↩️ " + info, reply_to=reply_id, silent=True)
+                    target_reply = await self._bot_reply_id(chat_id, reply_id, wait=False)
+                    if target_reply is None:
+                        target_reply = await self._bot_reply_id(chat_id, msg.id)
+                    await self.bot.send_message(chat_id, "↩️ " + info, reply_to=target_reply, silent=True)
                 else:
-                    await self._report(chat_id, msg.id, info)
+                    await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), info)
                 return
         if text.startswith("/") and not msg.media:
             return  # other commands are not forwarded
@@ -1493,6 +1596,8 @@ class Bridge(LoginMixin):
 
         mentions = await self._resolve_mentions(thread_id, text) if text else None
 
+        label = _describe_tg_msg(msg)
+        fail_prefix = f"发送{label}到微信失败：" if label.startswith("「") else f"发送[{label}]到微信失败："
         key = f"tg-{chat_id}-{msg.id}"
         self.pending_sends[thread_id] += 1
         try:
@@ -1501,7 +1606,7 @@ class Bridge(LoginMixin):
                 native_stickers = await self.wx.supports_stickers() if msg.sticker else False
                 kind, media = await self._tg_media(msg, native_stickers=native_stickers)
                 if kind is None:
-                    await self._report(chat_id, msg.id, media)
+                    await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{media}")
                 else:
                     if kind == "sticker":
                         result = await self.wx.send_sticker(thread_id, media, key)
@@ -1533,17 +1638,19 @@ class Bridge(LoginMixin):
                 if state not in SEND_OK:
                     reason = result.get("errorCode") or result.get("reason") or state
                     hint = "（结果未知，请在手机上确认，不要重复发送）" if state == "needs_review" else ""
-                    await self._report(chat_id, msg.id, f"发送到微信失败：{reason}{hint}")
+                    await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id),
+                                       f"{fail_prefix}{reason}{hint}")
                 elif self.cfg.bridge.mark_read_on_reply:
                     try:
                         await self.wx.mark_read(thread_id)
                     except Exception:
                         pass
         except WeChatError as e:
-            await self._report(chat_id, msg.id, f"发送到微信失败：{e.code}")
+            await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{e.code}")
         except Exception as e:
             log.exception("Telegram -> WeChat failed")
-            await self._report(chat_id, msg.id, f"发送到微信失败：{type(e).__name__}: {e}")
+            err_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{err_detail}")
         finally:
             self.pending_sends[thread_id] -= 1
 
@@ -1706,6 +1813,12 @@ class Bridge(LoginMixin):
         try:
             await self.bot.send_message(chat_id, "⚠️ " + text, reply_to=reply_to)
         except Exception:
+            if reply_to is not None:
+                try:
+                    await self.bot.send_message(chat_id, "⚠️ " + text)
+                    return
+                except Exception:
+                    pass
             log.warning("%s (chat %s)", text, chat_id)
 
     async def on_raw_update(self, update: types.UpdateNewMessage) -> None:
