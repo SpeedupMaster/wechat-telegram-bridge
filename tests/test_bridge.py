@@ -1103,10 +1103,27 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.daemon.recalls), recalls_before)
         self.assertEqual(len(self.b.bot.sent), sent_before)
 
-        # Recall failure reports error cleanly
+        # Recall window expired reports friendly message for both /recall and TG delete
         self.daemon.recall_error = (409, "recall_window_expired")
         await self.b.on_tg_message(tg_event(chat, 21, "/recall", reply_to=20))
-        self.assertIn("recall_window_expired", self.b.bot.sent[-1].text)
+        self.assertIn("已超过微信 2 分钟撤回时限，无法从微信撤回", self.b.bot.sent[-1].text)
+        await self.b.on_tg_delete(SimpleNamespace(chat_id=chat, deleted_ids=[20]))
+        self.assertIn("已超过微信 2 分钟撤回时限，微信端未撤回（仅从 Telegram 删除）", self.b.bot.sent[-1].text)
+
+        # Async operation recall_window_expired and unconfirmed states must NOT report success
+        self.daemon.recall_error = None
+        self.daemon.recall_op = {"id": "rcop", "state": "failed", "error": {"code": "recall_window_expired"}}
+        await self.b.on_tg_message(tg_event(chat, 24, "/recall", reply_to=22))
+        self.assertIn("已超过微信 2 分钟撤回时限，无法从微信撤回", self.b.bot.sent[-1].text)
+
+        self.daemon.recall_op = {"id": "rcop", "state": "running"}
+        await self.b.on_tg_message(tg_event(chat, 25, "/recall", reply_to=22))
+        self.assertNotIn("已从微信撤回", self.b.bot.sent[-1].text)
+        self.assertIn("撤回状态未确认（running）", self.b.bot.sent[-1].text)
+
+        self.daemon.recall_op = {"id": "rcop", "state": "completed"}
+        await self.b.on_tg_message(tg_event(chat, 26, "/recall", reply_to=22))
+        self.assertIn("↩️ 已从微信撤回", self.b.bot.sent[-1].text)
 
     async def test_send_failure_quotes_failed_message_and_describes_target(self):
         self.daemon.add_thread("wxid_alice", "Alice")

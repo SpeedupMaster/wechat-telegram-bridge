@@ -1867,6 +1867,12 @@ class Bridge(LoginMixin):
             return "image", img
         return "file", Media(data, mime, name)
 
+    @staticmethod
+    def _recall_expired_msg(key_prefix: str) -> str:
+        if key_prefix == "recall-del":
+            return "已超过微信 2 分钟撤回时限，微信端未撤回（仅从 Telegram 删除）"
+        return "已超过微信 2 分钟撤回时限，无法从微信撤回"
+
     async def _recall_tg_msg(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,
                                wx_server: str | None, key_prefix: str) -> tuple[bool, str]:
         if not wx_msg and wx_server:
@@ -1889,16 +1895,22 @@ class Bridge(LoginMixin):
             op = await self.wx.recall_message(wx_msg, str(wx_server), f"{key_prefix}-{chat_id}-{tg_msg}")
         except WeChatError as e:
             self.tg_recalls.discard(tag)
+            if e.code == "recall_window_expired":
+                return False, self._recall_expired_msg(key_prefix)
             return False, f"微信拒绝撤回（{e.code}）"
         state = op.get("state")
+        if state in ("succeeded", "completed"):
+            return True, "已从微信撤回"
         if state in ("failed", "expired", "rejected", "cancelled"):
             self.tg_recalls.discard(tag)
             err = op.get("error") or op.get("result") or {}
             code = err.get("code") if isinstance(err, dict) else None
+            if code == "recall_window_expired":
+                return False, self._recall_expired_msg(key_prefix)
             return False, f"微信撤回失败（{code or state}）"
         if state == "needs_review":
             return False, "撤回结果未确认（needs_review），请在手机微信确认"
-        return True, "已从微信撤回"
+        return False, f"撤回状态未确认（{state or 'unknown'}），请在手机微信确认"
 
     async def on_tg_delete(self, event) -> None:
         deleted = getattr(event, "deleted_ids", None) or []
