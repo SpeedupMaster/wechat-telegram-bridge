@@ -47,6 +47,10 @@ class FakeDaemon:
         self.avatar_lag = 0  # reads after a successful refresh that still miss (profile reader lag)
         self.media: dict[str, list[dict]] = {}  # message id -> media assets (default: one available PNG)
         self.media_bytes: dict[str, tuple[bytes, str]] = {}  # asset id -> (bytes, content_type)
+        self.media_transfers: list[tuple[str, dict]] = []
+        self.transfer_fail_variants: set[str] = set()
+        self.transfer_jobs: dict[str, dict] = {}
+        self.reject_image_quality = False
         self.group_members: dict[str, list[dict]] = {}
         self.recalls: list[tuple[str, dict, str]] = []
         self.recall_error: tuple[int, str] | None = None
@@ -82,6 +86,24 @@ class FakeDaemon:
             return httpx.Response(202, json={"id": "rcop", "state": "queued"})
         if rest[:2] == ["operations", "rcop"]:
             return httpx.Response(200, json=self.recall_op)
+        if rest[0] == "messages" and len(rest) == 3 and rest[2] == "media-transfers" and m == "POST":
+            body = json.loads(request.content)
+            mid = rest[1]
+            self.media_transfers.append((mid, body))
+            jid = f"dljob{len(self.media_transfers)}"
+            q = body.get("quality")
+            if q in self.transfer_fail_variants:
+                self.transfer_jobs[jid] = {"id": jid, "state": "failed", "reason": "cdn_failed"}
+            else:
+                for a in self.media.get(mid, []):
+                    if (body.get("assetId") and a.get("id") == body["assetId"]) or (
+                        not body.get("assetId") and q in (a.get("variant"), "best")
+                    ):
+                        a["state"] = "available"
+                        a.setdefault("actualVariant", a.get("variant"))
+                        break
+                self.transfer_jobs[jid] = {"id": jid, "state": "available"}
+            return httpx.Response(202, json={"id": jid, "state": "queued"})
         if rest[0] == "messages" and rest[2] == "media" and rest[1] in self.media:
             return httpx.Response(200, json={"items": self.media[rest[1]]})
         if rest[0] == "messages" and rest[2] == "media":
@@ -140,6 +162,8 @@ class FakeDaemon:
                                              "result": {"id": rest[1], "width": 240, "height": 240}})
         if rest[0] == "sends" and m == "POST":
             body = json.loads(request.content)
+            if self.reject_image_quality and "imageQuality" in body:
+                return httpx.Response(400, json={"error": {"code": "invalid_request"}})
             self.sends.append((body, request.headers["idempotency-key"]))
             n = len(self.sends)
             if body.get("kind") == "sticker":
@@ -151,6 +175,8 @@ class FakeDaemon:
             n = rest[1].removeprefix("send")
             return httpx.Response(200, json={"id": rest[1], "state": "accepted", "serverId": f"90{n}"})
         if rest[0] == "jobs":
+            if rest[1] in self.transfer_jobs:
+                return httpx.Response(200, json=self.transfer_jobs[rest[1]])
             if rest[1].startswith("stjob"):
                 n = rest[1].removeprefix("stjob")
                 return httpx.Response(200, json={"id": rest[1], "state": "available", "kind": "sticker_send",
@@ -565,8 +591,51 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         r = await self.b.wx.send_media("wxid_bob", "image", Media(b"jpeg", "image/jpeg", "photo.jpg"), "k1")
         self.assertEqual(r["state"], "accepted")
         body, key = self.daemon.sends[-1]
-        self.assertEqual((body["kind"], body["sourceId"], key), ("image", "src1", "k1"))
+        self.assertEqual((body["kind"], body["sourceId"], body["imageQuality"], key),
+                         ("image", "src1", "original", "k1"))
         self.assertIn("multipart/form-data", self.daemon.uploads[0][0])
+
+        self.daemon.reject_image_quality = True
+        r_old = await self.b.wx.send_media("wxid_bob", "image", Media(b"jpeg", "image/jpeg", "photo.jpg"), "k-old")
+        self.assertEqual(r_old["state"], "accepted")
+        old_body, old_key = self.daemon.sends[-1]
+        self.assertNotIn("imageQuality", old_body)
+        self.assertEqual(old_key, "k-old-std")
+
+    async def test_image_download_prefers_original_over_cached_previews(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("img_orig", "wxid_bob", None, type_=3)
+        orig_bytes = _png(1200, 900, (10, 200, 30))
+        std_bytes = _png(640, 480, (200, 10, 10))
+        self.daemon.media["img_orig"] = [
+            {"id": "a-thumb", "variant": "thumbnail", "actualVariant": "thumbnail", "state": "available",
+             "contentType": "image/jpeg", "byteLength": 100, "filename": "thumb.jpg"},
+            {"id": "a-std", "variant": "standard", "actualVariant": "standard", "state": "available",
+             "contentType": "image/png", "byteLength": len(std_bytes), "filename": "std.png"},
+            {"id": "a-orig", "variant": "original", "state": "not_cached",
+             "contentType": "image/png", "advertisedByteLength": len(orig_bytes), "filename": "orig.png"},
+        ]
+        self.daemon.media_bytes["a-orig"] = (orig_bytes, "image/png")
+        self.daemon.media_bytes["a-std"] = (std_bytes, "image/png")
+
+        await self.event("img_orig", "wxid_bob")
+        self.assertEqual(self.daemon.media_transfers[-1][1]["quality"], "original")
+        s = self.b.bot.sent[-1]
+        self.assertEqual((s.file.name, s.file.read()), ("orig.png", orig_bytes))
+
+        # When `original` transfer fails, fall back to the cached `standard` copy instead of failing.
+        self.daemon.add_message("img_fallback", "wxid_bob", None, type_=3)
+        self.daemon.transfer_fail_variants.add("original")
+        self.daemon.media["img_fallback"] = [
+            {"id": "f-std", "variant": "standard", "actualVariant": "standard", "state": "available",
+             "contentType": "image/png", "byteLength": len(std_bytes), "filename": "std.png"},
+            {"id": "f-orig", "variant": "original", "state": "not_cached",
+             "contentType": "image/png", "advertisedByteLength": len(orig_bytes), "filename": "orig.png"},
+        ]
+        self.daemon.media_bytes["f-std"] = (std_bytes, "image/png")
+        await self.event("img_fallback", "wxid_bob")
+        s2 = self.b.bot.sent[-1]
+        self.assertEqual((s2.file.name, s2.file.read()), ("std.png", std_bytes))
 
     async def test_video_sent_with_original(self):
         from bridge.wechat import Media
@@ -1181,16 +1250,50 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(webm_bytes), self.stickers.TG_VIDEO_STICKER_MAX_BYTES)
             self.assertLessEqual(ameta["duration"], self.stickers.TG_VIDEO_STICKER_MAX_SECONDS)
 
-    async def test_picture_sent_as_file_stays_a_file(self):
-        """agent-wechat shrinks images to ~64 KB; a Telegram document keeps its bytes as a WeChat file."""
+    async def test_picture_sent_as_file_becomes_original_wechat_image(self):
+        """A picture sent as a Telegram document goes to WeChat as an original image, not a file."""
+        import io
+        from PIL import Image
+
         b = Bridge.__new__(Bridge)
         b.max_media = 50 * 1048576
-        data = b"\xff\xd8" + b"x" * 300_000
 
-        async def download_media(file=None):
-            return data
-        msg = SimpleNamespace(file=SimpleNamespace(size=len(data), mime_type="image/jpeg", name="IMG_7462.JPG", ext=".jpg"),
-                              sticker=None, photo=None, voice=None, video=None, video_note=None, gif=None,
-                              download_media=download_media)
-        kind, media = await b._tg_media(msg)
-        self.assertEqual((kind, media.filename, media.data), ("file", "IMG_7462.JPG", data))
+        def make_msg(payload: bytes, mime: str, name: str, ext: str):
+            async def download_media(file=None):
+                return payload
+            return SimpleNamespace(
+                file=SimpleNamespace(size=len(payload), mime_type=mime, name=name, ext=ext),
+                sticker=None, photo=None, voice=None, video=None, video_note=None, gif=None,
+                download_media=download_media,
+            )
+
+        # 1) JPEG document -> exact source bytes sent as `image`
+        jpg_buf = io.BytesIO()
+        Image.new("RGB", (2400, 1600), (20, 140, 220)).save(jpg_buf, "JPEG", quality=92)
+        jpg = jpg_buf.getvalue()
+        kind, media = await b._tg_media(make_msg(jpg, "image/jpeg", "IMG_7462.JPG", ".jpg"))
+        self.assertEqual((kind, media.mime, media.filename, media.data), ("image", "image/jpeg", "IMG_7462.JPG", jpg))
+
+        # 2) PNG document <= 4096 px -> sent as `image` preserving PNG bytes
+        png = _png(1920, 1080, (240, 60, 40))
+        kind_png, media_png = await b._tg_media(make_msg(png, "application/octet-stream", "shot.png", ".png"))
+        self.assertEqual((kind_png, media_png.mime, media_png.filename, media_png.data),
+                         ("image", "image/png", "shot.png", png))
+
+        # 3) Wide PNG > 4096 px (exceeds agent-wechat's non-JPEG limit) -> full-res JPEG `image`
+        big_png = _png(5000, 16, (10, 180, 90))
+        kind_big, media_big = await b._tg_media(make_msg(big_png, "image/png", "wide.png", ".png"))
+        self.assertEqual((kind_big, media_big.mime, media_big.filename), ("image", "image/jpeg", "wide.jpg"))
+        self.assertEqual(Image.open(io.BytesIO(media_big.data)).size, (5000, 16))
+
+        # 4) Animated GIF document & non-image document -> stay `file`
+        frames = [Image.new("RGBA", (64, 64), (i * 60, 100, 200, 255)) for i in range(3)]
+        gif_buf = io.BytesIO()
+        frames[0].save(gif_buf, "GIF", save_all=True, append_images=frames[1:], duration=80, loop=0)
+        gif = gif_buf.getvalue()
+        kind_gif, media_gif = await b._tg_media(make_msg(gif, "image/gif", "anim.gif", ".gif"))
+        self.assertEqual((kind_gif, media_gif.filename, media_gif.data), ("file", "anim.gif", gif))
+
+        pdf = b"%PDF-1.4..."
+        kind_pdf, media_pdf = await b._tg_media(make_msg(pdf, "application/pdf", "doc.pdf", ".pdf"))
+        self.assertEqual((kind_pdf, media_pdf.filename, media_pdf.data), ("file", "doc.pdf", pdf))

@@ -255,6 +255,63 @@ def _avatar_photo(data: bytes, size: int = 512) -> bytes:
     return out.getvalue()
 
 
+WX_IMAGE_MAX_BYTES = 26_214_383
+WX_JPEG_MAX_EDGE = 8192
+WX_JPEG_MAX_PIXELS = 64_000_000
+WX_OTHER_IMAGE_MAX_EDGE = 4096
+WX_OTHER_IMAGE_MAX_PIXELS = 16_777_216
+_IMAGE_EXT_MIME = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+    ".tif": "image/tiff", ".tiff": "image/tiff", ".heic": "image/heic",
+    ".heif": "image/heif", ".avif": "image/avif",
+}
+
+
+def _image_from_file(data: bytes, mime: str, name: str, ext: str) -> Media | None:
+    """Validate/prepare an image sent as a Telegram file so WeChat receives it as an original image."""
+    from PIL import Image, ImageOps
+    norm_mime = mime.split(";")[0].strip().lower()
+    if norm_mime == "image/jpg":
+        norm_mime = "image/jpeg"
+    file_ext = ext.lower() or (("." + name.rsplit(".", 1)[1].lower()) if "." in name else "")
+    is_img = (norm_mime.startswith("image/") and norm_mime != "image/svg+xml") or (
+        norm_mime in ("application/octet-stream", "") and file_ext in _IMAGE_EXT_MIME
+    )
+    if not is_img:
+        return None
+    try:
+        im = Image.open(io.BytesIO(data))
+        w, h = im.size
+        fmt = (im.format or "").upper()
+    except Exception:
+        return None
+    if fmt == "GIF" and getattr(im, "n_frames", 1) > 1:
+        return None  # keep animated GIF as a file so WeChat doesn't flatten it to a static image
+    if fmt == "JPEG":
+        if len(data) <= WX_IMAGE_MAX_BYTES and max(w, h) <= WX_JPEG_MAX_EDGE and w * h <= WX_JPEG_MAX_PIXELS:
+            out_name = name if file_ext in (".jpg", ".jpeg") else (
+                (name.rsplit(".", 1)[0] if "." in name else name) + ".jpg")
+            return Media(data, "image/jpeg", out_name)
+        return None
+    direct_mime = {"PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}.get(fmt)
+    if direct_mime and len(data) <= WX_IMAGE_MAX_BYTES and max(w, h) <= WX_OTHER_IMAGE_MAX_EDGE and w * h <= WX_OTHER_IMAGE_MAX_PIXELS:
+        return Media(data, direct_mime, name)
+    if max(w, h) <= WX_JPEG_MAX_EDGE and w * h <= WX_JPEG_MAX_PIXELS:
+        try:
+            im.load()
+            im = ImageOps.exif_transpose(im)
+            out = io.BytesIO()
+            stickers.on_white(im).save(out, "JPEG", quality=95)
+            jpg = out.getvalue()
+            if len(jpg) <= WX_IMAGE_MAX_BYTES:
+                stem = name.rsplit(".", 1)[0] if "." in name else name
+                return Media(jpg, "image/jpeg", f"{stem}.jpg")
+        except Exception:
+            return None
+    return None
+
+
 def _fingerprint(m) -> tuple:
     """What the bot's copy and your account's copy of one message have in common."""
     media = getattr(m, "media", None)
@@ -1074,11 +1131,11 @@ class Bridge(LoginMixin):
         if not data:
             return None, "无法下载这条 Telegram 媒体"
         mime = (f.mime_type if f and f.mime_type else "application/octet-stream").lower()
-        name = (f.name if f and f.name else None) or f"telegram{f.ext if f and f.ext else ''}"
+        ext = (getattr(f, "ext", None) or "").lower()
+        name = (f.name if f and f.name else None) or f"telegram{ext}"
         if msg.photo:
             return "image", Media(data, "image/jpeg", "photo.jpg")
         if msg.sticker:
-            ext = (getattr(f, "ext", None) or "").lower()
             if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/", "application/x-tgsticker")):
                 mime = {".webp": "image/webp", ".tgs": "application/x-tgsticker", ".webm": "video/webm"}.get(ext, mime)
             if native_stickers:
@@ -1098,8 +1155,8 @@ class Bridge(LoginMixin):
             return "voice", Media(data, "audio/ogg", "voice.ogg")
         if msg.video or msg.video_note or msg.gif:
             return "video", Media(data, "video/mp4", name if name.endswith(".mp4") else "video.mp4")
-        # Anything sent as a file in Telegram (including pictures) goes to WeChat as a file: agent-wechat
-        # squeezes every *image* it sends to at most 1280 px / ~64 KB, while files keep their exact bytes.
+        if img := await asyncio.to_thread(_image_from_file, data, mime, name, ext):
+            return "image", img
         return "file", Media(data, mime, name)
 
     async def _recall_tg_msg(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,

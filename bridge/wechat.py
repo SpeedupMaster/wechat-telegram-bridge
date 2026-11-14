@@ -298,9 +298,18 @@ class WeChatClient:
         source = await self._req("POST", self._a("uploads"), files=files, timeout=httpx.Timeout(600.0))
         body = {"threadId": thread_id, "kind": kind, "sourceId": source["id"], "standardSourceId": None,
                 "thumbnailSourceId": None, "playSeconds": None, "durationMs": None}
+        if kind == "image":
+            body["imageQuality"] = "original"
         if kind == "video":
             body["videoQuality"] = "original"  # 720p playback copy plus the untouched original
-        job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
+        try:
+            job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
+        except WeChatError as e:
+            if kind == "image" and e.status in (400, 422) and "imageQuality" in body:
+                body.pop("imageQuality", None)
+                job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": f"{key}-std"})
+            else:
+                raise
         return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
 
     async def recall_message(self, message_id: str, server_id: str, key: str) -> dict:
@@ -330,15 +339,53 @@ class WeChatClient:
             return (await self._req("GET", self._a(f"messages/{_id(mid)}/media"))).get("items", [])
 
         items = await assets()
-        asset = _pick(items, mtype)
+        asset = None
+        last_job: dict = {}
+        if mtype == IMAGE and items:
+            # Prefer full-resolution `original` over cached `standard`/`thumbnail` previews:
+            # `agent-wechat` may already hold a cached thumbnail/standard while `original` is `not_cached`.
+            for variant in ("original", "standard", "thumbnail"):
+                cands = [a for a in items if (a.get("actualVariant") or a.get("variant")) == variant]
+                if not cands:
+                    continue
+                avail = [a for a in cands if a.get("state") == "available" and (a.get("byteLength") or 0) <= max_bytes]
+                if avail:
+                    asset = avail[0]
+                    break
+                fetchable = [
+                    a for a in cands
+                    if a.get("state") not in ("expired", "unsupported", "recalled", "available")
+                    and (a.get("advertisedByteLength") or 0) <= max_bytes
+                ]
+                if not fetchable:
+                    continue
+                cand = fetchable[0]
+                last_job = await self._req(
+                    "POST", self._a(f"messages/{_id(mid)}/media-transfers"),
+                    json={"messageId": mid, "assetId": cand.get("id"), "quality": variant},
+                )
+                last_job = await self._wait(last_job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 300)
+                items = await assets()
+                avail = [
+                    a for a in items
+                    if (a.get("id") == cand.get("id") or (a.get("actualVariant") or a.get("variant")) == variant)
+                    and a.get("state") == "available" and (a.get("byteLength") or 0) <= max_bytes
+                ]
+                if avail:
+                    asset = avail[0]
+                    break
+        if not asset:
+            asset = _pick(items, mtype)
         if not asset:
             states = {a.get("state") for a in items}
             if states & {"expired", "unsupported", "recalled"} and not states & {"pending"}:
                 reasons = [a["reason"] for a in items if a.get("reason")]
                 return reasons[0] if reasons else "已过期" if "expired" in states else "不支持"
-            big = [a for a in items if (a.get("advertisedByteLength") or 0) > max_bytes]
-            if big and len(big) == len(items):
+            big = [a for a in items if (a.get("advertisedByteLength") or 0) > max_bytes or (a.get("byteLength") or 0) > max_bytes]
+            if items and len(big) == len(items):
                 return "文件太大"
+            if last_job:
+                return last_job.get("reason") or last_job.get("state") or "下载失败"
             job = await self._req("POST", self._a(f"messages/{_id(mid)}/media-transfers"),
                                   json={"messageId": mid, "assetId": None, "quality": quality})
             job = await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 300)
