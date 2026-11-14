@@ -1086,8 +1086,22 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         recalls_before = len(self.daemon.recalls)
         bot_msg_id = self.b.bot.sent[0].id
         self.b.store.map_message(chat, "user", 99, "wxid_alice", "m0", "100")
-        await self.b.on_tg_delete(SimpleNamespace(chat_id=chat, deleted_ids=[99, bot_msg_id]))
+        await self.b.on_tg_delete(SimpleNamespace(chat_id=chat, deleted_ids=[99]))
+        await self.b.on_tg_delete(SimpleNamespace(chat_id=chat, deleted_ids=[bot_msg_id]))
         self.assertEqual(len(self.daemon.recalls), recalls_before)
+
+        # Clearing history / bulk deleting multiple sent messages must NOT recall on WeChat or spam notices
+        await self.b.on_tg_message(tg_event(chat, 22, "bulk 1"))
+        self.daemon.add_message("wx_local_22", "wxid_alice", "bulk 1", direction="outgoing", server="903")
+        await self.event("wx_local_22", "wxid_alice")
+        await self.b.on_tg_message(tg_event(chat, 23, "bulk 2"))
+        self.daemon.add_message("wx_local_23", "wxid_alice", "bulk 2", direction="outgoing", server="904")
+        await self.event("wx_local_23", "wxid_alice")
+        recalls_before = len(self.daemon.recalls)
+        sent_before = len(self.b.bot.sent)
+        await self.b.on_tg_delete(SimpleNamespace(chat_id=None, deleted_ids=[22, 23]))
+        self.assertEqual(len(self.daemon.recalls), recalls_before)
+        self.assertEqual(len(self.b.bot.sent), sent_before)
 
         # Recall failure reports error cleanly
         self.daemon.recall_error = (409, "recall_window_expired")

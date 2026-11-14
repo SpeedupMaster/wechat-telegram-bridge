@@ -71,7 +71,7 @@ HELP = (
     "• <code>/help</code> — 显示群内帮助\n\n"
     "<b>常用技巧</b>\n"
     "• 群内发送 <code>@成员名</code> 或 <code>@所有人</code> 可触发微信 @ 提醒\n"
-    "• 删除已发消息或回复 <code>/recall</code> 可自动撤回微信消息（2 分钟内有效）\n"
+    "• 删除单条已发消息或回复 <code>/recall</code> 可自动撤回微信消息（2 分钟内有效）\n"
     "• 以 <code>//</code> 开头的内容仅留在 Telegram，不会发到微信\n"
     "• 图片默认原图收发；发文件选原图也会按原图送达微信；支持贴纸与来电一键拒接"
 )
@@ -86,7 +86,7 @@ GROUP_HELP = (
     "• <code>/link</code> [关键词] — 重新绑定当前群到其他微信会话\n"
     "• <code>/unlink</code> — 解除当前群与微信会话的绑定\n"
     "• <code>/help</code> — 显示群内帮助\n\n"
-    "💡 发 <code>@成员名</code> / <code>@所有人</code> 可微信提醒；删消息或回复 <code>/recall</code> 可撤回；<code>//</code> 开头仅留在 Telegram。"
+    "💡 发 <code>@成员名</code> / <code>@所有人</code> 可微信提醒；删单条消息或回复 <code>/recall</code> 可撤回；<code>//</code> 开头仅留在 Telegram。"
 )
 
 PRIVATE_BOT_COMMANDS = [
@@ -1902,21 +1902,25 @@ class Bridge(LoginMixin):
 
     async def on_tg_delete(self, event) -> None:
         deleted = getattr(event, "deleted_ids", None) or []
-        for tg_msg in deleted:
-            row = self.store.lookup_tg_delete(getattr(event, "chat_id", None), tg_msg)
-            if not row:
-                continue
-            chat_id, thread_id, wx_msg, wx_server = row
-            if not (wx_server and self.store.is_sent(thread_id, wx_server)):
-                continue
-            ok, info = await self._recall_tg_msg(chat_id, tg_msg, thread_id, wx_msg, wx_server, "recall-del")
-            if ok:
-                try:
-                    await self.bot.send_message(chat_id, "↩️ " + info, silent=True)
-                except Exception as e:
-                    log.info("Could not notify recall in chat %s: %s", chat_id, e)
-            elif len(deleted) == 1:
-                await self._report(chat_id, None, info)
+        # Bulk deletions (including Telegram "Clear History" in basic groups) emit all
+        # deleted IDs together; only recall when the user explicitly deletes a single message.
+        if len(deleted) != 1:
+            return
+        tg_msg = deleted[0]
+        row = self.store.lookup_tg_delete(getattr(event, "chat_id", None), tg_msg)
+        if not row:
+            return
+        chat_id, thread_id, wx_msg, wx_server = row
+        if not (wx_server and self.store.is_sent(thread_id, wx_server)):
+            return
+        ok, info = await self._recall_tg_msg(chat_id, tg_msg, thread_id, wx_msg, wx_server, "recall-del")
+        if ok:
+            try:
+                await self.bot.send_message(chat_id, "↩️ " + info, silent=True)
+            except Exception as e:
+                log.info("Could not notify recall in chat %s: %s", chat_id, e)
+        else:
+            await self._report(chat_id, None, info)
 
     async def _report(self, chat_id: int, reply_to: int | None, text: str) -> None:
         try:
