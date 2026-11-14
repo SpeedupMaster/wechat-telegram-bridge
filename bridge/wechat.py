@@ -51,19 +51,27 @@ class Media:
     filename: str
 
 
+_DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+_SEND_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+_READ_METHODS = {"GET", "HEAD"}
+_RETRYABLE_HTTP_ERRORS = (httpx.TimeoutException, httpx.ReadError, httpx.RemoteProtocolError)
+
+
 def _id(value: str) -> str:
     return quote(value, safe="")
 
 
 class WeChatClient:
-    def __init__(self, base_url: str, token: str, account: str = ""):
+    def __init__(self, base_url: str, token: str, account: str = "",
+                 *, read_retry_delays: tuple[float, ...] = (1.0, 2.0)):
         self.base = base_url.rstrip("/") + "/v1/"
         self._token = token
         self.account = account
         self._supports_stickers: bool | None = None
+        self._read_retry_delays = read_retry_delays
         # trust_env=False: never route the local daemon (and its token) through a system HTTP proxy
         self.http = httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}, trust_env=False,
-                                      timeout=httpx.Timeout(30.0, connect=10.0))
+                                      timeout=_DEFAULT_TIMEOUT)
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -73,19 +81,38 @@ class WeChatClient:
         return f"accounts/{_id(self.account)}/{path}"
 
     async def _req(self, method: str, path: str, *, raw: bool = False, **kw) -> Any:
-        r = await self.http.request(method, self.base + path, **kw)
-        if r.status_code >= 400:
-            code, retryable = "request_failed", r.status_code >= 500
+        delays = self._read_retry_delays if method.upper() in _READ_METHODS else ()
+        for attempt in range(len(delays) + 1):
             try:
-                err = r.json().get("error", {})
-                code = err.get("code", code)
-                retryable = err.get("retryable", retryable)
-            except Exception:
-                pass
-            raise WeChatError(r.status_code, code, retryable)
-        if raw:
-            return r
-        return r.json() if r.content else None
+                r = await self.http.request(method, self.base + path, **kw)
+                if r.status_code >= 400:
+                    code, retryable = "request_failed", r.status_code >= 500
+                    try:
+                        err = r.json().get("error", {})
+                        code = err.get("code", code)
+                        retryable = err.get("retryable", retryable)
+                    except Exception:
+                        pass
+                    raise WeChatError(r.status_code, code, retryable)
+                if raw:
+                    return r
+                return r.json() if r.content else None
+            except _RETRYABLE_HTTP_ERRORS as e:
+                if attempt >= len(delays):
+                    raise
+                delay = delays[attempt]
+                log.warning("WeChat %s %s failed (%s: %s); retrying in %.1fs (%d/%d)",
+                            method, path, type(e).__name__, e, delay, attempt + 1, len(delays))
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            except WeChatError as e:
+                if attempt >= len(delays) or not (e.retryable and e.status >= 500):
+                    raise
+                delay = delays[attempt]
+                log.warning("WeChat %s %s failed (%s); retrying in %.1fs (%d/%d)",
+                            method, path, e, delay, attempt + 1, len(delays))
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
     # --- account ------------------------------------------------------------
     async def resolve_account(self) -> str:
@@ -276,7 +303,8 @@ class WeChatClient:
             body["quote"] = quote_ref
         if mentions:
             body["mentions"] = mentions
-        intent = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
+        intent = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
+                                 timeout=_SEND_TIMEOUT)
         return await self._wait(intent, lambda i: f"sends/{_id(i['id'])}", SEND_DONE, 120)
 
     async def supports_stickers(self) -> bool:
@@ -294,7 +322,7 @@ class WeChatClient:
         source = await self._req("POST", self._a("uploads"), files=files, timeout=httpx.Timeout(600.0))
         job = await self._req("POST", self._a("sticker-preparations"),
                               json={"sourceId": source["id"], "fit": fit, "trim": None},
-                              headers={"Idempotency-Key": key})
+                              headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
         return await self._wait(job, lambda j: f"sticker-preparations/{_id(j['id'])}", JOB_DONE, 300)
 
     async def send_sticker(self, thread_id: str, media: Media, key: str) -> dict:
@@ -303,7 +331,8 @@ class WeChatClient:
             return prep
         body = {"kind": "sticker", "threadId": thread_id,
                 "source": {"kind": "prepared", "preparationId": prep["id"]}}
-        job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
+        job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
+                              timeout=_SEND_TIMEOUT)
         return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
 
     async def send_media(self, thread_id: str, kind: str, media: Media, key: str) -> dict:
@@ -316,11 +345,13 @@ class WeChatClient:
         if kind == "video":
             body["videoQuality"] = "original"  # 720p playback copy plus the untouched original
         try:
-            job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
+            job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
+                                  timeout=_SEND_TIMEOUT)
         except WeChatError as e:
             if kind == "image" and e.status in (400, 422) and "imageQuality" in body:
                 body.pop("imageQuality", None)
-                job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": f"{key}-std"})
+                job = await self._req("POST", self._a("sends"), json=body,
+                                      headers={"Idempotency-Key": f"{key}-std"}, timeout=_SEND_TIMEOUT)
             else:
                 raise
         return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)

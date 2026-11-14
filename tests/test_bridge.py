@@ -2213,3 +2213,112 @@ class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
             server.close()
             await server.wait_closed()
 
+
+class WeChatClientTimeoutAndRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relaxed_timeouts_and_send_timeout(self):
+        from bridge.wechat import Media
+
+        seen_timeouts: list[tuple[str, str, dict]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            ext = request.extensions.get("timeout", {})
+            seen_timeouts.append((request.method, request.url.path, dict(ext)))
+            path = request.url.path.removeprefix("/v1/")
+            if path.endswith("/uploads"):
+                return httpx.Response(201, json={"id": "src1"})
+            if path.endswith("/sticker-preparations") and request.method == "POST":
+                return httpx.Response(202, json={"id": "prep1", "state": "available"})
+            if path.endswith("/sends") and request.method == "POST":
+                return httpx.Response(202, json={"id": "send1", "state": "accepted"})
+            return httpx.Response(200, json={"id": "msg1"})
+
+        wx = WeChatClient("http://localhost:6174", "secret-token", ACC, read_retry_delays=(0.0, 0.0))
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                    headers={"Authorization": "Bearer secret-token"},
+                                    timeout=wx.http.timeout)
+        try:
+            self.assertEqual(wx.http.timeout.read, 60.0)
+            self.assertEqual(wx.http.timeout.connect, 10.0)
+            await wx.message("m1")
+            await wx.send_text("wxid_alice", "hi", "k1")
+            await wx.send_sticker("wxid_alice", Media(b"GIF89a", "image/gif", "s.gif"), "k2")
+        finally:
+            await wx.close()
+
+        msg_call = [t for t in seen_timeouts if t[1].endswith("/messages/m1")][0]
+        self.assertEqual(msg_call[2]["read"], 60.0)
+        send_calls = [t for t in seen_timeouts if t[0] == "POST" and t[1].endswith("/sends")]
+        self.assertEqual(len(send_calls), 2)
+        for _, _, ext in send_calls:
+            self.assertEqual(ext["read"], 120.0)
+            self.assertEqual(ext["connect"], 10.0)
+        prep_call = [t for t in seen_timeouts if t[0] == "POST" and t[1].endswith("/sticker-preparations")][0]
+        self.assertEqual(prep_call[2]["read"], 120.0)
+
+    async def test_read_only_retries_and_no_write_retries(self):
+        from bridge.wechat import WeChatError
+
+        attempts: dict[str, int] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            key = f"{request.method} {request.url.path}"
+            attempts[key] = attempts.get(key, 0) + 1
+            n = attempts[key]
+            path = request.url.path.removeprefix("/v1/")
+            if path.endswith("/messages/flaky_timeout"):
+                if n < 3:
+                    raise httpx.ReadTimeout("timed out", request=request)
+                return httpx.Response(200, json={"id": "flaky_timeout", "body": "ok"})
+            if path.endswith("/messages/flaky_503"):
+                if n == 1:
+                    return httpx.Response(503, json={"error": {"code": "busy", "retryable": True}})
+                return httpx.Response(200, json={"id": "flaky_503", "body": "ok"})
+            if path.endswith("/messages/always_timeout"):
+                raise httpx.ReadTimeout("still timed out", request=request)
+            if path.endswith("/messages/not_found"):
+                return httpx.Response(404, json={"error": {"code": "not_found", "retryable": False}})
+            if path.endswith("/messages/non_retryable_500"):
+                return httpx.Response(500, json={"error": {"code": "internal", "retryable": False}})
+            if path.endswith("/sends") and request.method == "POST":
+                raise httpx.ReadTimeout("send timed out", request=request)
+            raise AssertionError(f"unexpected {key}")
+
+        wx = WeChatClient("http://localhost:6174", "secret-token", ACC, read_retry_delays=(0.0, 0.0))
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                    headers={"Authorization": "Bearer secret-token"},
+                                    timeout=wx.http.timeout)
+        try:
+            # GET recovers after two ReadTimeouts (3 attempts total)
+            msg = await wx.message("flaky_timeout")
+            self.assertEqual(msg["body"], "ok")
+            self.assertEqual(attempts[f"GET /v1/accounts/{ACC}/messages/flaky_timeout"], 3)
+
+            # GET recovers after retryable 503
+            msg2 = await wx.message("flaky_503")
+            self.assertEqual(msg2["body"], "ok")
+            self.assertEqual(attempts[f"GET /v1/accounts/{ACC}/messages/flaky_503"], 2)
+
+            # GET raises after exhausting retries
+            with self.assertRaises(httpx.ReadTimeout):
+                await wx.message("always_timeout")
+            self.assertEqual(attempts[f"GET /v1/accounts/{ACC}/messages/always_timeout"], 3)
+
+            # Non-retryable 404 and non-retryable 500 fail immediately without retry
+            with self.assertRaises(WeChatError) as ctx404:
+                await wx.message("not_found")
+            self.assertEqual(ctx404.exception.status, 404)
+            self.assertEqual(attempts[f"GET /v1/accounts/{ACC}/messages/not_found"], 1)
+
+            with self.assertRaises(WeChatError) as ctx500:
+                await wx.message("non_retryable_500")
+            self.assertEqual(ctx500.exception.status, 500)
+            self.assertEqual(attempts[f"GET /v1/accounts/{ACC}/messages/non_retryable_500"], 1)
+
+            # Mutating POST sends must NOT be retried on ReadTimeout
+            with self.assertRaises(httpx.ReadTimeout):
+                await wx.send_text("wxid_alice", "hi", "k-no-retry")
+            self.assertEqual(attempts[f"POST /v1/accounts/{ACC}/sends"], 1)
+        finally:
+            await wx.close()
+
+
