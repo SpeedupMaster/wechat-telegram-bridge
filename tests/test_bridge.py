@@ -233,6 +233,7 @@ class FakeBot:
     def __init__(self):
         self.sent: list[Sent] = []
         self.edited: list[tuple[int, int, str, dict]] = []
+        self.deleted: list[int] = []
         self.commands: list = []
         self.dead_chats: set[int] = set()
 
@@ -258,6 +259,9 @@ class FakeBot:
                 s.kwargs.update(kw)
                 return s
         return Sent(chat, text=text, kwargs=kw)
+
+    async def delete_messages(self, chat, ids):
+        self.deleted.extend(ids)
 
     async def send_file(self, chat, file, **kw):
         s = Sent(chat, file=file, kwargs=kw)
@@ -1074,13 +1078,18 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.b.bot.sent), sent_before)
 
         # Deleting a Telegram-sent message (even with chat_id=None as in basic groups) recalls on WeChat
+        # and auto-deletes the orphan recall confirmation notice after TTL
+        self.b._recall_notice_ttl = 0.01
         await self.b.on_tg_message(tg_event(chat, 20, "delete me"))
         self.daemon.add_message("wx_local_20", "wxid_alice", "delete me", direction="outgoing", server="902")
         await self.event("wx_local_20", "wxid_alice")
         await self.b.on_tg_delete(SimpleNamespace(chat_id=None, deleted_ids=[20]))
         self.assertEqual(self.daemon.recalls[-1][0], "wx_local_20")
         self.assertEqual(self.daemon.recalls[-1][1], {"serverId": "902"})
-        self.assertIn("↩️ 已从微信撤回", self.b.bot.sent[-1].text)
+        notice_msg = self.b.bot.sent[-1]
+        self.assertIn("↩️ 已从微信撤回", notice_msg.text)
+        await asyncio.sleep(0.05)
+        self.assertIn(notice_msg.id, self.b.bot.deleted)
 
         # Deleting an incoming message (not in `sent`) must NOT call WeChat recall
         recalls_before = len(self.daemon.recalls)
@@ -1103,12 +1112,15 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.daemon.recalls), recalls_before)
         self.assertEqual(len(self.b.bot.sent), sent_before)
 
-        # Recall window expired reports friendly message for both /recall and TG delete
+        # Recall window expired reports friendly message for both /recall and TG delete (and stays visible)
         self.daemon.recall_error = (409, "recall_window_expired")
         await self.b.on_tg_message(tg_event(chat, 21, "/recall", reply_to=20))
         self.assertIn("已超过微信 2 分钟撤回时限，无法从微信撤回", self.b.bot.sent[-1].text)
         await self.b.on_tg_delete(SimpleNamespace(chat_id=chat, deleted_ids=[20]))
-        self.assertIn("已超过微信 2 分钟撤回时限，微信端未撤回（仅从 Telegram 删除）", self.b.bot.sent[-1].text)
+        err_msg = self.b.bot.sent[-1]
+        self.assertIn("已超过微信 2 分钟撤回时限，微信端未撤回（仅从 Telegram 删除）", err_msg.text)
+        await asyncio.sleep(0.05)
+        self.assertNotIn(err_msg.id, self.b.bot.deleted)
 
         # Async operation recall_window_expired and unconfirmed states must NOT report success
         self.daemon.recall_error = None

@@ -504,6 +504,8 @@ class Bridge(LoginMixin):
         self._calls_retry_sleep: float = 300.0
         self._ui_tokens: dict[str, dict] = {}
         self._link_wait: dict | None = None
+        self._recall_notice_ttl: float = 5.0
+        self._notice_tasks: set[asyncio.Task] = set()
 
     # ======================================================================
     # startup
@@ -606,6 +608,10 @@ class Bridge(LoginMixin):
         await event.answer()
 
     async def close(self) -> None:
+        for task in list(self._notice_tasks):
+            task.cancel()
+        if self._notice_tasks:
+            await asyncio.gather(*list(self._notice_tasks), return_exceptions=True)
         if self._calls_sock is not None:
             await self._calls_sock.close()
             self._calls_sock = None
@@ -1912,6 +1918,21 @@ class Bridge(LoginMixin):
             return False, "撤回结果未确认（needs_review），请在手机微信确认"
         return False, f"撤回状态未确认（{state or 'unknown'}），请在手机微信确认"
 
+    def _schedule_delete_notice(self, chat_id: int, msg_id: int, delay: float) -> None:
+        async def _drop() -> None:
+            try:
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                await self.bot.delete_messages(chat_id, [msg_id])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.info("Could not auto-delete recall notice %s in chat %s: %s", msg_id, chat_id, e)
+
+        task = asyncio.create_task(_drop())
+        self._notice_tasks.add(task)
+        task.add_done_callback(self._notice_tasks.discard)
+
     async def on_tg_delete(self, event) -> None:
         deleted = getattr(event, "deleted_ids", None) or []
         # Bulk deletions (including Telegram "Clear History" in basic groups) emit all
@@ -1928,9 +1949,12 @@ class Bridge(LoginMixin):
         ok, info = await self._recall_tg_msg(chat_id, tg_msg, thread_id, wx_msg, wx_server, "recall-del")
         if ok:
             try:
-                await self.bot.send_message(chat_id, "↩️ " + info, silent=True)
+                notice = await self.bot.send_message(chat_id, "↩️ " + info, silent=True)
             except Exception as e:
                 log.info("Could not notify recall in chat %s: %s", chat_id, e)
+                return
+            if notice is not None and getattr(notice, "id", None) is not None:
+                self._schedule_delete_notice(chat_id, notice.id, self._recall_notice_ttl)
         else:
             await self._report(chat_id, None, info)
 
