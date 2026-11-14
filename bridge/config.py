@@ -46,6 +46,7 @@ class BridgeConfig:
     max_media_mb: int = 200
     call_notifications: bool = True
     link_card_images: bool = True
+    gif_as_sticker: bool = True
     skip_threads: list[str] = field(default_factory=list)
 
 

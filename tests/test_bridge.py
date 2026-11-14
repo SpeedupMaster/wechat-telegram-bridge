@@ -579,6 +579,59 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.daemon.sticker_preparations, [])
         self.assertEqual(self.daemon.sends[-1][0]["kind"], "image")
 
+    async def test_telegram_gif_converted_to_wechat_sticker_with_fallbacks(self):
+        import io
+        from unittest import mock
+        from PIL import Image
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1001, "Bob")
+        chat = -1001
+
+        frames = [Image.new("RGBA", (120, 120), (i * 80, 120, 200, 255)) for i in range(3)]
+        buf = io.BytesIO()
+        frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], duration=80, loop=0)
+        gif_bytes = buf.getvalue()
+
+        def make_gif_ev(mid, payload, mime, name, ext):
+            async def dl(file=None):
+                return payload
+            return SimpleNamespace(chat_id=chat, message=SimpleNamespace(
+                id=mid, message="", action=None, via_bot_id=None, reply_to=None,
+                photo=None, sticker=None, voice=None, video=None, video_note=None, gif=True,
+                file=SimpleNamespace(size=len(payload), mime_type=mime, name=name, ext=ext),
+                media=types.MessageMediaDocument(), download_media=dl))
+
+        # 1) Telegram GIF -> WeChat native sticker when supported and enabled
+        await self.b.on_tg_message(make_gif_ev(8101, gif_bytes, "image/gif", "funny.gif", ".gif"))
+        self.assertEqual(len(self.daemon.sticker_preparations), 1)
+        self.assertEqual(self.daemon.sends[-1][0]["kind"], "sticker")
+        self.assertEqual(self.b.store.wx_for_tg(chat, 8101), ("local-sticker-1", "801"))
+
+        # 2) MP4 Telegram GIF whose sticker conversion fails -> falls back to video
+        with mock.patch("bridge.stickers.gif_to_wechat_sticker", return_value="需要 ffmpeg 才能转换动态表情"):
+            await self.b.on_tg_message(make_gif_ev(8102, b"mp4-bytes", "video/mp4", "clip.mp4", ".mp4"))
+        self.assertEqual(self.daemon.sends[-1][0]["kind"], "video")
+
+        # 3) Disabled via gif_as_sticker=False -> sends as video directly without sticker conversion
+        self.b.cfg.bridge.gif_as_sticker = False
+        preps_before = len(self.daemon.sticker_preparations)
+        with mock.patch("bridge.stickers.gif_to_wechat_sticker") as m_conv:
+            await self.b.on_tg_message(make_gif_ev(8103, b"mp4-bytes", "video/mp4", "clip.mp4", ".mp4"))
+        m_conv.assert_not_called()
+        self.assertEqual(len(self.daemon.sticker_preparations), preps_before)
+        self.assertEqual(self.daemon.sends[-1][0]["kind"], "video")
+
+        # 4) Daemon lacks native sticker support -> sends as video directly without sticker conversion
+        self.b.cfg.bridge.gif_as_sticker = True
+        self.daemon.stickers_supported = False
+        self.b.wx._supports_stickers = None
+        with mock.patch("bridge.stickers.gif_to_wechat_sticker") as m_conv:
+            await self.b.on_tg_message(make_gif_ev(8104, b"mp4-bytes", "video/mp4", "clip.mp4", ".mp4"))
+        m_conv.assert_not_called()
+        self.assertEqual(len(self.daemon.sticker_preparations), preps_before)
+        self.assertEqual(self.daemon.sends[-1][0]["kind"], "video")
+
     async def test_sticker_that_cannot_be_downloaded_says_why(self):
         self.daemon.add_thread("wxid_bob", "Bob")
         self.daemon.add_message("st2", "wxid_bob", None, type_=47)
@@ -2174,6 +2227,44 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         pdf = b"%PDF-1.4..."
         kind_pdf, media_pdf = await b._tg_media(make_msg(pdf, "application/pdf", "doc.pdf", ".pdf"))
         self.assertEqual((kind_pdf, media_pdf.filename, media_pdf.data), ("file", "doc.pdf", pdf))
+
+    async def test_gif_to_wechat_sticker_mp4_and_gif(self):
+        import io
+        from PIL import Image
+
+        # 1) Already-compliant <=240px GIF passes through directly
+        small_frames = [Image.new("RGBA", (100, 80), (i * 80, 180, 40, 255)) for i in range(3)]
+        sbuf = io.BytesIO()
+        small_frames[0].save(sbuf, "GIF", save_all=True, append_images=small_frames[1:], duration=80, loop=0)
+        small_gif = sbuf.getvalue()
+        kind1, out1 = await self.stickers.gif_to_wechat_sticker(small_gif, "image/gif")
+        self.assertEqual((kind1, out1), ("sticker", small_gif))
+
+        # 2) Oversized >240px animated GIF is resized to <=240px and <=1MB
+        big_frames = [Image.new("RGBA", (400, 300), (i * 70, 50, 200, 255)) for i in range(4)]
+        bbuf = io.BytesIO()
+        big_frames[0].save(bbuf, "GIF", save_all=True, append_images=big_frames[1:], duration=80, loop=0)
+        kind2, out2 = await self.stickers.gif_to_wechat_sticker(bbuf.getvalue(), "image/gif")
+        self.assertEqual(kind2, "sticker")
+        self.assertLessEqual(len(out2), self.stickers.WX_STICKER_MAX_BYTES)
+        im2 = Image.open(io.BytesIO(out2))
+        self.assertEqual(im2.size, (240, 180))
+        self.assertGreater(im2.n_frames, 1)
+
+        # 3) MP4 Telegram GIF is transcoded to <=240px <=1MB animated GIF via ffmpeg
+        if self.ffmpeg:
+            import subprocess
+            mp4 = Path(self.tmp.name, "tg_gif.mp4")
+            subprocess.run([self.ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "testsrc=size=480x270:rate=24:duration=1.5",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4)], check=True)
+            kind3, out3 = await self.stickers.gif_to_wechat_sticker(mp4.read_bytes(), "video/mp4")
+            self.assertEqual(kind3, "sticker")
+            self.assertLessEqual(len(out3), self.stickers.WX_STICKER_MAX_BYTES)
+            im3 = Image.open(io.BytesIO(out3))
+            self.assertEqual(im3.size, (240, 135))
+            self.assertGreater(im3.n_frames, 1)
+            self.assertLessEqual(im3.n_frames, self.stickers.WX_STICKER_MAX_FRAMES)
 
 
 class _FakeCallsSocket:

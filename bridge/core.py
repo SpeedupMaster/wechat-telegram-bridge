@@ -1773,7 +1773,8 @@ class Bridge(LoginMixin):
         try:
             result = None
             if msg.media and not isinstance(msg.media, (types.MessageMediaWebPage,)):
-                native_stickers = await self.wx.supports_stickers() if msg.sticker else False
+                want_sticker = bool(msg.sticker or (msg.gif and self.cfg.bridge.gif_as_sticker))
+                native_stickers = await self.wx.supports_stickers() if want_sticker else False
                 kind, media = await self._tg_media(msg, native_stickers=native_stickers)
                 if kind is None:
                     await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{media}")
@@ -1922,6 +1923,17 @@ class Bridge(LoginMixin):
             return "image", Media(out, "image/jpeg", "sticker.jpg")
         if msg.voice:
             return "voice", Media(data, "audio/ogg", "voice.ogg")
+        if msg.gif and native_stickers and self.cfg.bridge.gif_as_sticker:
+            if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/")):
+                mime = {".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm"}.get(ext, mime)
+            converted = await stickers.gif_to_wechat_sticker(data, mime)
+            if not isinstance(converted, str):
+                _, out = converted
+                return "sticker", Media(out, "image/gif", "sticker.gif")
+            log.info("Telegram GIF -> WeChat sticker failed (%s); falling back to %s",
+                     converted, "file" if mime == "image/gif" else "video")
+            if mime == "image/gif":
+                return "file", Media(data, mime, name if name.endswith(".gif") else "animation.gif")
         if msg.video or msg.video_note or msg.gif:
             return "video", Media(data, "video/mp4", name if name.endswith(".mp4") else "video.mp4")
         if img := await asyncio.to_thread(_image_from_file, data, mime, name, ext):
