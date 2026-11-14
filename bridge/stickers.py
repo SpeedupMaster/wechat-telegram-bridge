@@ -178,10 +178,18 @@ def _rgba_to_transparent_gif_pillow(frames: list[tuple[Image.Image, int]], max_e
     return out.getvalue()
 
 
+def _gif_palette_vf(max_colors: int, stats_mode: str, dither: str) -> str:
+    use_opts = f"dither={dither}:alpha_threshold=128"
+    if stats_mode == "single":
+        use_opts = "new=1:" + use_opts
+    return (f"split[s0][s1];[s0]palettegen=max_colors={max_colors}:reserve_transparent=1:stats_mode={stats_mode}[p];"
+            f"[s1][p]paletteuse={use_opts}")
+
+
 def _ffmpeg_rgba_to_gif(frames: list[bytes], width: int, height: int, fps: float, ffmpeg: str,
-                        *, max_colors: int = 256) -> bytes:
-    vf = (f"split[s0][s1];[s0]palettegen=max_colors={max_colors}:reserve_transparent=1:stats_mode=diff[p];"
-          "[s1][p]paletteuse=dither=bayer:bayer_scale=5:alpha_threshold=128")
+                        *, max_colors: int = 256, stats_mode: str = "single",
+                        dither: str = "floyd_steinberg") -> bytes:
+    vf = _gif_palette_vf(max_colors, stats_mode, dither)
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "out.gif")
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
@@ -194,7 +202,7 @@ def _ffmpeg_rgba_to_gif(frames: list[bytes], width: int, height: int, fps: float
             return f.read()
 
 
-def _subsample_frames(frames: list[tuple[Image.Image, int]], max_frames: int = 150,
+def _subsample_frames(frames: list[tuple[Image.Image, int]], max_frames: int = 180,
                       max_ms: int = int(WX_STICKER_MAX_SECONDS * 1000)) -> list[tuple[Image.Image, int]]:
     capped: list[tuple[Image.Image, int]] = []
     acc = 0
@@ -228,16 +236,23 @@ def webp_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
         return out
     raw_frames = [(frame.convert("RGBA"), int(frame.info.get("duration") or 50))
                   for frame in ImageSequence.Iterator(im)]
-    frames = _subsample_frames(raw_frames, max_frames=150)
+    frames = _subsample_frames(raw_frames, max_frames=180)
     total_ms = sum(d for _, d in frames)
-    fps = min(20.0, max(5.0, len(frames) * 1000.0 / max(1, total_ms)))
-    for edge, colors in ((WX_STICKER_SIZE, 255), (192, 127), (144, 63)):
+    fps = min(24.0, max(5.0, len(frames) * 1000.0 / max(1, total_ms)))
+    attempts = (
+        (WX_STICKER_SIZE, 256, "single", "floyd_steinberg"),
+        (WX_STICKER_SIZE, 256, "full", "sierra2_4a"),
+        (192, 128, "full", "sierra2_4a"),
+        (144, 64, "full", "bayer:bayer_scale=2"),
+    )
+    for edge, colors, stats_mode, dither in attempts:
         if ffmpeg:
             w, h = _fit_size(im.size[0], im.size[1], edge)
             raw = [f.resize((w, h), Image.LANCZOS).tobytes() for f, _ in frames]
-            out = _ffmpeg_rgba_to_gif(raw, w, h, fps, ffmpeg, max_colors=colors)
+            out = _ffmpeg_rgba_to_gif(raw, w, h, fps, ffmpeg, max_colors=colors,
+                                      stats_mode=stats_mode, dither=dither)
         else:
-            out = _rgba_to_transparent_gif_pillow(frames, max_edge=edge, max_colors=colors)
+            out = _rgba_to_transparent_gif_pillow(frames, max_edge=edge, max_colors=min(255, colors))
         if len(out) <= WX_STICKER_MAX_BYTES:
             return out
     raise ValueError("sticker_output_size_limit")
@@ -253,15 +268,23 @@ def tgs_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
         return _rgba_to_transparent_gif_pillow([(frame, 0)], max_edge=WX_STICKER_SIZE)
     duration = min(WX_STICKER_MAX_SECONDS, total / src_fps)
     usable_src_frames = max(1, min(total, round(duration * src_fps)))
-    for edge, max_fps, colors in ((WX_STICKER_SIZE, 20.0, 256), (192, 15.0, 128), (160, 12.0, 64)):
-        target_fps = min(max_fps, src_fps, 150.0 / max(duration, 0.1))
-        n_out = max(1, min(150, round(duration * target_fps)))
+    attempts = (
+        (WX_STICKER_SIZE, 24.0, 256, "single", "floyd_steinberg"),
+        (WX_STICKER_SIZE, 20.0, 256, "full", "sierra2_4a"),
+        (WX_STICKER_SIZE, 15.0, 256, "full", "sierra2_4a"),
+        (192, 15.0, 128, "full", "sierra2_4a"),
+        (160, 12.0, 64, "full", "bayer:bayer_scale=2"),
+    )
+    for edge, max_fps, colors, stats_mode, dither in attempts:
+        target_fps = min(max_fps, src_fps, 180.0 / max(duration, 0.1))
+        n_out = max(1, min(180, round(duration * target_fps)))
         actual_fps = max(1.0, n_out / max(duration, 0.05))
         indices = [min(usable_src_frames - 1, int(i * usable_src_frames / n_out)) for i in range(n_out)]
         if ffmpeg:
             raw = [anim.render_pillow_frame(frame_num=idx, width=edge, height=edge).convert("RGBA").tobytes()
                    for idx in indices]
-            out = _ffmpeg_rgba_to_gif(raw, edge, edge, actual_fps, ffmpeg, max_colors=colors)
+            out = _ffmpeg_rgba_to_gif(raw, edge, edge, actual_fps, ffmpeg, max_colors=colors,
+                                      stats_mode=stats_mode, dither=dither)
         else:
             delay_ms = max(20, round(1000.0 / actual_fps))
             pil_frames = [(anim.render_pillow_frame(frame_num=idx, width=edge, height=edge), delay_ms)
@@ -277,10 +300,16 @@ def webm_to_wechat_gif(data: bytes, ffmpeg: str) -> bytes:
         src, out_path = os.path.join(tmp, "in.webm"), os.path.join(tmp, "out.gif")
         with open(src, "wb") as f:
             f.write(data)
-        for edge, fps, colors in ((WX_STICKER_SIZE, 15, 256), (180, 12, 128), (144, 10, 64)):
-            vf = (f"fps={fps},scale={edge}:{edge}:force_original_aspect_ratio=decrease,"
-                  f"split[s0][s1];[s0]palettegen=max_colors={colors}:reserve_transparent=1:stats_mode=diff[p];"
-                  "[s1][p]paletteuse=dither=bayer:bayer_scale=5:alpha_threshold=128")
+        attempts = (
+            (WX_STICKER_SIZE, 24, 256, "single", "floyd_steinberg"),
+            (WX_STICKER_SIZE, 20, 256, "full", "sierra2_4a"),
+            (WX_STICKER_SIZE, 15, 256, "full", "sierra2_4a"),
+            (180, 12, 128, "full", "sierra2_4a"),
+            (144, 10, 64, "full", "bayer:bayer_scale=2"),
+        )
+        for edge, fps, colors, stats_mode, dither in attempts:
+            vf = (f"fps={fps},scale={edge}:{edge}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                  + _gif_palette_vf(colors, stats_mode, dither))
             cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                    "-c:v", "libvpx-vp9", "-i", src, "-t", f"{WX_STICKER_MAX_SECONDS:g}",
                    "-vf", vf, "-loop", "0", out_path]
@@ -316,7 +345,7 @@ def wechat_image_to_tg_webp(im: Image.Image) -> tuple[bytes, int, int]:
     if (w, h) != rgba.size:
         rgba = rgba.resize((w, h), Image.LANCZOS)
     out = io.BytesIO()
-    rgba.save(out, "WEBP", quality=90, method=4)
+    rgba.save(out, "WEBP", quality=92, method=6)
     return out.getvalue(), w, h
 
 
@@ -337,10 +366,11 @@ def wechat_gif_to_tg_webm(data: bytes, ffmpeg: str) -> tuple[bytes, int, int, fl
         with open(src, "wb") as f:
             f.write(data)
         vf = f"fps={target_fps},scale={out_w}:{out_h}:flags=lanczos,format=yuva420p"
-        for crf, bitrate in ((30, "400k"), (38, "200k"), (45, "120k")):
+        for crf, bitrate in ((20, "650k"), (26, "450k"), (34, "280k"), (42, "150k")):
             cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                    "-i", src, "-t", f"{TG_VIDEO_STICKER_MAX_SECONDS:g}", "-vf", vf,
                    "-c:v", "libvpx-vp9", "-b:v", bitrate, "-crf", str(crf),
+                   "-deadline", "good", "-cpu-used", "2",
                    "-auto-alt-ref", "0", "-an", out_path]
             res = subprocess.run(cmd, capture_output=True, timeout=120)
             if res.returncode != 0:
