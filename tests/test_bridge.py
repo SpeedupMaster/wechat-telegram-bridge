@@ -739,12 +739,22 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.event("lk1", "wxid_bob")
         await self.event("q1", "wxid_bob")
 
-        ch1_text, ch2_text, lk1_text, q1_text = [s.text for s in self.b.bot.sent[-4:]]
-        self.assertEqual(ch1_text, "🎬 <b>视频号 · 老抽搞笑动画</b>\n视频文案 &lt;tag&gt;")
-        self.assertEqual(ch2_text, "🎬 <b>视频号</b>\n仅正文")
-        self.assertIn("🔗 <b>文章标题</b>", lk1_text)
-        self.assertIn("https://example.com", lk1_text)
-        self.assertEqual(q1_text, "<blockquote>Bob：引用的视频文案</blockquote>好看")
+        from bridge import cards as cards_mod
+
+        ch1_sent, ch2_sent, lk1_sent, q1_sent = self.b.bot.sent[-4:]
+        self.assertEqual(ch1_sent.text, "🎬 <b>视频号 · 老抽搞笑动画</b>\n视频文案 &lt;tag&gt;")
+        self.assertEqual(ch2_sent.text, "🎬 <b>视频号</b>\n仅正文")
+        if cards_mod._font_paths()[3]:
+            self.assertEqual(lk1_sent.file.name, "link-card.png")
+            self.assertIs(lk1_sent.kwargs.get("force_document"), False)
+            self.assertIsNone(lk1_sent.kwargs.get("caption"))
+        else:
+            self.assertIn("🔗 <b>文章标题</b>", lk1_sent.text)
+            self.assertIn("来自 公众号", lk1_sent.text)
+            self.assertNotIn("https://example.com", lk1_sent.text)
+        btn0 = lk1_sent.kwargs["buttons"][0][0]
+        self.assertEqual(btn0.type.url if hasattr(btn0, "type") else btn0.url, "https://example.com")
+        self.assertEqual(q1_sent.text, "<blockquote>Bob：引用的视频文案</blockquote>好看")
 
     async def test_file_upload_notice_is_skipped(self):
         self.daemon.add_thread("wxid_bob", "Bob")
@@ -2494,3 +2504,299 @@ class WeChatClientTimeoutAndRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, 2)
         finally:
             await wx.close()
+
+
+class LinkCardTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cfg = Config(
+            WeChatConfig(token="secret-token"),
+            TelegramConfig(api_id=1, api_hash="x", bot_token="y"),
+            BridgeConfig(create_interval_seconds=0, sync_avatar=False, link_card_images=True),
+            Path(self.tmp.name) / "config.toml",
+        )
+        self.daemon = FakeDaemon()
+        self.b = Bridge(cfg)
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(self.daemon.handler),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.bot_input = object()
+        self.b.bot_me = SimpleNamespace(username="mybot")
+        await self.b.wx.resolve_account()
+
+    async def asyncTearDown(self):
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+
+    async def event(self, mid, tid, origin="live", direction="incoming"):
+        await self.b.handle_event({
+            "cursor": "1",
+            "kind": "message.committed",
+            "data": {"messageId": mid, "threadId": tid, "origin": origin, "direction": direction},
+        })
+
+    def test_identify_link_source(self):
+        from bridge import cards
+
+        xhs = cards.identify_link_source(
+            {"url": "https://www.xiaohongshu.com/discovery/item/66f1?xsec_token=abc", "sourceName": None}, 5
+        )
+        self.assertEqual((xhs.label, xhs.brand, xhs.button_label), ("小红书", "xhs", "📕 打开小红书"))
+
+        xhs_short = cards.identify_link_source({"url": "http://xhslink.com/o/12345"}, 5)
+        self.assertEqual((xhs_short.label, xhs_short.brand), ("小红书", "xhs"))
+
+        wxmp = cards.identify_link_source({"url": "https://mp.weixin.qq.com/s/xyz", "sourceName": "量子位"}, 5)
+        self.assertEqual((wxmp.label, wxmp.brand, wxmp.button_label), ("量子位", "wxmp", "📄 阅读全文"))
+
+        wxmp_anon = cards.identify_link_source({"url": "https://mp.weixin.qq.com/s/xyz"}, 5)
+        self.assertEqual(wxmp_anon.label, "微信公众号")
+
+        bili = cards.identify_link_source({"url": "https://b23.tv/abc"}, 5)
+        self.assertEqual((bili.label, bili.brand), ("哔哩哔哩", "bili"))
+
+        zhihu = cards.identify_link_source({"url": "https://zhuanlan.zhihu.com/p/123"}, 5)
+        self.assertEqual((zhihu.label, zhihu.brand), ("知乎", "zhihu"))
+
+        music = cards.identify_link_source({"url": "https://example.org/song", "sourceName": "网易云音乐"}, 3)
+        self.assertEqual((music.label, music.brand), ("网易云音乐", "music"))
+
+        video = cards.identify_link_source({"url": "https://example.org/watch"}, 4)
+        self.assertEqual((video.label, video.brand), ("example.org", "video"))
+
+        generic = cards.identify_link_source({"url": "https://news.ycombinator.com/item?id=1"}, 5)
+        self.assertEqual((generic.label, generic.brand, generic.button_label),
+                         ("news.ycombinator.com", "link", "🔗 打开链接"))
+
+    def test_render_link_card_and_font_fallback(self):
+        import io
+        from unittest import mock
+        from PIL import Image
+        from bridge import cards
+
+        # Without a CJK font, non-ASCII text returns None so caller uses clean HTML text fallback,
+        # while pure-ASCII cards can still render via Latin fallback fonts.
+        with mock.patch("bridge.cards._font_paths", return_value=(None, None, None, False)):
+            self.assertIsNone(cards.render_link_card(
+                title="小红书笔记",
+                description="摘要内容",
+                url="https://www.xiaohongshu.com/discovery/item/1",
+            ))
+            ascii_png = cards.render_link_card(
+                title="GitHub Repository Title",
+                description="Short ASCII summary for CI hosts without CJK fonts.",
+                url="https://github.com/octocat/Hello-World",
+                thumbnail_bytes=_png(120, 120, (30, 30, 30)),
+            )
+            self.assertIsNotNone(ascii_png)
+            im_ascii = Image.open(io.BytesIO(ascii_png))
+            self.assertEqual(im_ascii.size[0], cards.CARD_WIDTH)
+            self.assertEqual(im_ascii.mode, "RGB")
+
+        # When CJK fonts are installed on the host, render full Xiaohongshu card with thumbnail & emoji.
+        if cards._font_paths()[3]:
+            full_png = cards.render_link_card(
+                title="周末去哪玩🌟 这家咖啡店超好看",
+                description="分享一段很长很长的探店笔记描述，用来测试三行省略号截断效果以及右侧圆角缩略图排版是否紧凑清晰。",
+                url="https://www.xiaohongshu.com/discovery/item/66f1?xsec_token=tok123",
+                source_name=None,
+                app_type=5,
+                thumbnail_bytes=_png(180, 140, (240, 80, 90)),
+            )
+            self.assertIsNotNone(full_png)
+            im = Image.open(io.BytesIO(full_png))
+            self.assertEqual(im.size[0], cards.CARD_WIDTH)
+            self.assertTrue(160 <= im.size[1] <= 380, im.size)
+            self.assertEqual(im.mode, "RGB")
+
+            # Missing or corrupt thumbnail must still produce a valid card without crashing.
+            no_thumb = cards.render_link_card(
+                title="无缩略图卡片",
+                description="只有正文和来源栏",
+                url="https://mp.weixin.qq.com/s/1",
+                thumbnail_bytes=b"not-an-image",
+            )
+            self.assertIsNotNone(no_thumb)
+
+    async def test_download_link_thumbnail(self):
+        thumb_ok = _png(120, 120, (255, 60, 80))
+        self.daemon.media["m_avail"] = [{
+            "id": "th1", "kind": "image", "state": "available",
+            "variant": "thumbnail", "actualVariant": "thumbnail",
+            "contentType": "image/png", "byteLength": len(thumb_ok),
+        }]
+        self.daemon.media_bytes["th1"] = (thumb_ok, "image/png")
+        got1 = await self.b.wx.download_link_thumbnail({"id": "m_avail"})
+        self.assertEqual(got1, thumb_ok)
+        self.assertEqual(self.daemon.media_transfers, [])
+
+        # Lazy / uncached thumbnail triggers media-transfers with quality="thumbnail".
+        thumb_lazy = _png(100, 100, (50, 180, 90))
+        self.daemon.media["m_lazy"] = [{
+            "id": "th2", "kind": "image", "state": "not_cached",
+            "variant": "thumbnail", "advertisedByteLength": len(thumb_lazy),
+            "contentType": "image/png",
+        }]
+        self.daemon.media_bytes["th2"] = (thumb_lazy, "image/png")
+        got2 = await self.b.wx.download_link_thumbnail({"id": "m_lazy"})
+        self.assertEqual(got2, thumb_lazy)
+        self.assertEqual(
+            self.daemon.media_transfers[-1],
+            ("m_lazy", {"messageId": "m_lazy", "assetId": "th2", "quality": "thumbnail"}),
+        )
+
+        # Missing or non-image media returns None cleanly.
+        self.daemon.media["m_empty"] = []
+        self.assertIsNone(await self.b.wx.download_link_thumbnail({"id": "m_empty"}))
+        self.daemon.media["m_video"] = [{
+            "id": "vid1", "kind": "video", "state": "available",
+            "variant": "thumbnail", "contentType": "video/mp4", "byteLength": 100,
+        }]
+        self.assertIsNone(await self.b.wx.download_link_thumbnail({"id": "m_video"}))
+
+    async def test_xiaohongshu_link_card_end_to_end_and_text_mode(self):
+        from unittest import mock
+
+        xhs_url = (
+            "https://www.xiaohongshu.com/discovery/item/66f1234567890"
+            "?app_platform=ios&xsec_token=AB1234567890xyz&xsec_source=pc_feed"
+        )
+        thumb = _png(150, 150, (255, 36, 66))
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_message(
+            "xhs1", "wxid_alice", "[Link] 标题", type_=49, appMessageType=5,
+            link={
+                "title": "#周末探店# [捂脸] 超好吃的店",
+                "description": "打卡成功[破涕为笑] 人均50",
+                "sourceName": None,
+                "url": xhs_url,
+            },
+        )
+        self.daemon.media["xhs1"] = [{
+            "id": "xhs-thumb", "kind": "image", "state": "available",
+            "variant": "thumbnail", "actualVariant": "thumbnail",
+            "contentType": "image/png", "byteLength": len(thumb),
+        }]
+        self.daemon.media_bytes["xhs-thumb"] = (thumb, "image/png")
+
+        def _btn_url(btn):
+            return btn.type.url if hasattr(btn, "type") and hasattr(btn.type, "url") else btn.url
+
+        # 1) Photo card + inline button (hides raw xsec_token URL from bubble text)
+        fake_card = _png(800, 220, (255, 255, 255))
+        with mock.patch("bridge.cards.render_link_card", return_value=fake_card) as rmock:
+            await self.event("xhs1", "wxid_alice")
+        rmock.assert_called_once_with(
+            title="#周末探店 🤦 超好吃的店",
+            description="打卡成功😂 人均50",
+            url=xhs_url,
+            source_name="",
+            app_type=5,
+            thumbnail_bytes=thumb,
+        )
+        sent = self.b.bot.sent[-1]
+        self.assertEqual(sent.file.name, "link-card.png")
+        self.assertEqual(sent.file.getvalue(), fake_card)
+        self.assertIs(sent.kwargs["force_document"], False)
+        self.assertIsNone(sent.kwargs["caption"])
+        self.assertEqual(sent.kwargs["buttons"][0][0].text, "📕 打开小红书")
+        self.assertEqual(_btn_url(sent.kwargs["buttons"][0][0]), xhs_url)
+
+        # 2) Group message preserves sender name as photo caption
+        self.daemon.add_thread("123@chatroom", "Friends", kind="group")
+        self.daemon.add_contact("wxid_bob", "Bob")
+        self.daemon.add_message(
+            "xhs2", "123@chatroom", "", type_=49, appMessageType=5, sender="wxid_bob",
+            link={"title": "群里分享的笔记", "description": "内容", "sourceName": None, "url": xhs_url},
+        )
+        self.daemon.media["xhs2"] = []
+        with mock.patch("bridge.cards.render_link_card", return_value=fake_card):
+            await self.event("xhs2", "123@chatroom")
+        grp_sent = self.b.bot.sent[-1]
+        self.assertEqual(grp_sent.file.name, "link-card.png")
+        self.assertEqual(grp_sent.kwargs["caption"], "<b>Alice in group</b>：")
+        self.assertEqual(_btn_url(grp_sent.kwargs["buttons"][0][0]), xhs_url)
+
+        # 3) Text-only mode (link_card_images = False) uses clean HTML + CTA button without raw URL text
+        self.b.cfg.bridge.link_card_images = False
+        self.daemon.add_message(
+            "xhs3", "wxid_alice", "", type_=49, appMessageType=5,
+            link={"title": "纯文字卡片测试", "description": "简洁摘要", "sourceName": None, "url": xhs_url},
+        )
+        await self.event("xhs3", "wxid_alice")
+        txt_sent = self.b.bot.sent[-1]
+        self.assertIsNone(txt_sent.file)
+        self.assertEqual(txt_sent.text, "📕 <b>纯文字卡片测试</b>\n简洁摘要\n<i>来自 小红书</i>")
+        self.assertNotIn("xsec_token", txt_sent.text)
+        self.assertEqual(txt_sent.kwargs["buttons"][0][0].text, "📕 打开小红书")
+        self.assertEqual(_btn_url(txt_sent.kwargs["buttons"][0][0]), xhs_url)
+
+    async def test_link_card_rpc_fallbacks(self):
+        from unittest import mock
+
+        def _btn_url(btn):
+            return btn.type.url if hasattr(btn, "type") and hasattr(btn.type, "url") else btn.url
+
+        xhs_url = "https://www.xiaohongshu.com/discovery/item/999?xsec_token=t1"
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.media["xhs_btn_err"] = []
+        self.daemon.media["xhs_photo_err"] = []
+        self.daemon.add_message(
+            "xhs_btn_err", "wxid_alice", "", type_=49, appMessageType=5,
+            link={"title": "按钮降级测试", "description": "摘要", "url": xhs_url},
+        )
+        self.daemon.add_message(
+            "xhs_photo_err", "wxid_alice", "", type_=49, appMessageType=5,
+            link={"title": "图片降级测试", "description": "摘要", "url": xhs_url},
+        )
+        self.daemon.add_message(
+            "xhs_txt_btn_err", "wxid_alice", "", type_=49, appMessageType=5,
+            link={"title": "文本按钮降级测试", "description": "摘要", "url": xhs_url},
+        )
+
+        # Case 1: send_file rejects inline buttons -> retries photo with HTML link in caption
+        orig_send_file = self.b.bot.send_file
+        async def reject_buttons_on_file(chat, file, **kw):
+            if kw.get("buttons"):
+                raise errors.ButtonDataInvalidError(None)
+            return await orig_send_file(chat, file, **kw)
+
+        fake_card = _png(800, 200, (255, 255, 255))
+        with mock.patch("bridge.cards.render_link_card", return_value=fake_card), \
+             mock.patch.object(self.b.bot, "send_file", side_effect=reject_buttons_on_file):
+            await self.event("xhs_btn_err", "wxid_alice")
+        s1 = self.b.bot.sent[-1]
+        self.assertEqual(s1.file.name, "link-card.png")
+        self.assertIsNone(s1.kwargs["buttons"])
+        self.assertIn(f'<a href="{xhs_url}"><b>📕 打开小红书</b></a>', s1.kwargs["caption"])
+
+        # Case 2: send_file fails completely -> falls back to clean text card + button
+        async def fail_send_file(*_a, **_kw):
+            raise errors.PhotoInvalidError(None)
+
+        with mock.patch("bridge.cards.render_link_card", return_value=fake_card), \
+             mock.patch.object(self.b.bot, "send_file", side_effect=fail_send_file):
+            await self.event("xhs_photo_err", "wxid_alice")
+        s2 = self.b.bot.sent[-1]
+        self.assertIsNone(s2.file)
+        self.assertIn("📕 <b>图片降级测试</b>", s2.text)
+        self.assertEqual(_btn_url(s2.kwargs["buttons"][0][0]), xhs_url)
+
+        # Case 3: text-mode send_message rejects buttons -> retries text with clickable title link
+        self.b.cfg.bridge.link_card_images = False
+        orig_send_msg = self.b.bot.send_message
+        async def reject_buttons_on_msg(chat, text, **kw):
+            if kw.get("buttons"):
+                raise errors.ButtonDataInvalidError(None)
+            return await orig_send_msg(chat, text, **kw)
+
+        with mock.patch.object(self.b.bot, "send_message", side_effect=reject_buttons_on_msg):
+            await self.event("xhs_txt_btn_err", "wxid_alice")
+        s3 = self.b.bot.sent[-1]
+        self.assertIn(f'<a href="{xhs_url}"><b>文本按钮降级测试</b></a>', s3.text)
+        self.assertNotIn("buttons", s3.kwargs)
+

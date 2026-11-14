@@ -17,7 +17,7 @@ import httpx
 from telethon import Button, TelegramClient, errors, events, functions, types, utils
 
 from .config import Config
-from . import stickers
+from . import cards, stickers
 from .login import LoginMixin
 from .store import Store
 from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE, LOCATION, SEND_OK, STICKER,
@@ -145,8 +145,8 @@ _WX_TOPIC_RE = re.compile(r"(?<![A-Za-z0-9_/:.?&=])#([^\s#<>/?&=]{1,30})#")
 _TOPIC_BOUNDARY = set(" \t\r\n,，。！？、；：.!?;:)）]】\"'”’")
 
 
-def _fmt_wx_text(s: str | None) -> str:
-    """Convert WeChat #topic# tags and [emoji] codes into Telegram-friendly HTML-escaped text."""
+def _normalize_wx_text(s: str | None) -> str:
+    """Convert WeChat #topic# tags and [emoji] codes into plain Telegram-friendly text."""
     text = s or ""
     if not text:
         return ""
@@ -160,7 +160,12 @@ def _fmt_wx_text(s: str | None) -> str:
             return f"{lead}#{m.group(1)}{tail}"
 
         text = _WX_TOPIC_RE.sub(_topic_sub, text)
-    return _esc(text)
+    return text
+
+
+def _fmt_wx_text(s: str | None) -> str:
+    """Convert WeChat #topic# tags and [emoji] codes into Telegram-friendly HTML-escaped text."""
+    return _esc(_normalize_wx_text(s))
 
 
 _CHANNELS_PLACEHOLDER_TITLE = "当前版本不支持展示该内容"
@@ -187,6 +192,44 @@ def _channels_body(link: dict | None, body: str = "") -> str:
     lines = [ln for ln in (body or "").splitlines()
              if ln.strip() and not _is_channels_placeholder(ln.strip()) and _CHANNELS_PLACEHOLDER_URL not in ln]
     return "\n".join(["🎬 <b>视频号</b>", *(_fmt_wx_text(ln) for ln in lines)])
+
+
+def _is_link_card(msg: dict) -> bool:
+    return msg.get("type") == APP and msg.get("appMessageType") != APP_CHANNELS and bool(msg.get("link"))
+
+
+def _link_url(link: dict | None) -> str:
+    url = ((link or {}).get("url") or "").strip()
+    return url if url.startswith(("http://", "https://")) else ""
+
+
+def _link_buttons(link: dict | None, app_type: int | None) -> list | None:
+    if url := _link_url(link):
+        src = cards.identify_link_source(link, app_type)
+        return [[Button.url(src.button_label, url)]]
+    return None
+
+
+def _link_body(link: dict, app_type: int | None = None, *, inline_url: bool = False) -> str:
+    src = cards.identify_link_source(link, app_type)
+    icon = {"xhs": "📕", "wxmp": "📄", "bili": "📺", "zhihu": "💡", "music": "🎵", "video": "🎬"}.get(src.brand, "🔗")
+    title = (link.get("title") or "").strip()
+    desc = (link.get("description") or "").strip()
+    url = _link_url(link)
+    if title:
+        head = (
+            f'{icon} <a href="{_esc(url)}"><b>{_fmt_wx_text(title)}</b></a>'
+            if (url and inline_url) else f"{icon} <b>{_fmt_wx_text(title)}</b>"
+        )
+    elif url and inline_url:
+        head = f'{icon} <a href="{_esc(url)}"><b>{_esc(src.label)}</b></a>'
+    else:
+        head = f"{icon} <b>{_esc(src.label)}</b>"
+    parts = [head]
+    if desc:
+        parts.append(_fmt_wx_text(desc))
+    parts.append(f"<i>来自 {_esc(src.label)}</i>")
+    return "\n".join(parts)
 
 
 # agent-wechat reason codes for attachments it could not fetch
@@ -824,11 +867,7 @@ class Bridge(LoginMixin):
         if t == APP and msg.get("appMessageType") == APP_CHANNELS:
             return _channels_body(msg.get("link"), body)
         if t == APP and (link := msg.get("link")):
-            parts = [f"🔗 <b>{_fmt_wx_text(link.get('title'))}</b>" if link.get("title") else "🔗",
-                     _fmt_wx_text(link.get("description")), _esc(link.get("url"))]
-            if link.get("sourceName"):
-                parts.append(f"<i>来自 {_esc(link['sourceName'])}</i>")
-            return "\n".join(p for p in parts if p)
+            return _link_body(link, msg.get("appMessageType"), inline_url=True)
         if t == APP and msg.get("appMessageType") == 19:
             return "📜 聊天记录\n" + _fmt_wx_text(body)
         if t == STICKER:
@@ -876,6 +915,20 @@ class Bridge(LoginMixin):
             if isinstance(media, Media) and t == VOICE and media.mime == "audio/wav":
                 if ogg := await wav_to_ogg(media.data):
                     media = Media(ogg, "audio/ogg", "voice.ogg")
+        elif _is_link_card(msg) and self.cfg.bridge.link_card_images:
+            link = msg["link"]
+            thumb_bytes = await self.wx.download_link_thumbnail(msg)
+            card_png = await asyncio.to_thread(
+                cards.render_link_card,
+                title=_normalize_wx_text(link.get("title")),
+                description=_normalize_wx_text(link.get("description")),
+                url=link.get("url"),
+                source_name=_normalize_wx_text(link.get("sourceName")),
+                app_type=msg.get("appMessageType"),
+                thumbnail_bytes=thumb_bytes,
+            )
+            if card_png:
+                media = Media(card_png, "image/png", "link-card.png")
 
         silent = outgoing and self.cfg.bridge.outgoing_silent
         sent = await self._send_tg(chat, thread, header, prefix, msg, media, reply_to, silent)
@@ -956,11 +1009,45 @@ class Bridge(LoginMixin):
             out = []
             reply = reply_to
             t = msg.get("type")
-            if isinstance(media, Media):
+            is_link = _is_link_card(msg)
+            send_media = media
+            if isinstance(send_media, Media) and is_link:
+                f = io.BytesIO(send_media.data)
+                f.name = send_media.filename
+                caption = (header + prefix).rstrip("\n")
+                buttons = _link_buttons(msg.get("link"), msg.get("appMessageType"))
+                kw = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
+                          silent=silent, force_document=False, buttons=buttons)
+                try:
+                    out.append(await self.bot.send_file(chat_id, f, **kw))
+                    return out
+                except errors.RPCError as e:
+                    if _dead_chat(e):
+                        raise
+                    if buttons:
+                        url = _link_url(msg.get("link"))
+                        src = cards.identify_link_source(msg.get("link"), msg.get("appMessageType"))
+                        link_line = f'<a href="{_esc(url)}"><b>{_esc(src.button_label)}</b></a>'
+                        fallback_cap = f"{caption}\n{link_line}" if caption else link_line
+                        f.seek(0)
+                        kw["buttons"] = None
+                        kw["caption"] = fallback_cap[:TG_CAPTION_LIMIT]
+                        try:
+                            out.append(await self.bot.send_file(chat_id, f, **kw))
+                            return out
+                        except errors.RPCError as e2:
+                            if _dead_chat(e2):
+                                raise
+                            log.info("Telegram refused link card photo (%s); falling back to text", e2)
+                    else:
+                        log.info("Telegram refused link card photo (%s); falling back to text", e)
+                    send_media = None
+
+            if isinstance(send_media, Media):
                 caption = header + prefix + (self._body(msg) if t == APP and msg.get("appMessageType") != APP_FILE
                                              else "")
                 if t == STICKER:
-                    converted = await asyncio.to_thread(stickers.from_wechat_sticker, media.data, media.mime)
+                    converted = await asyncio.to_thread(stickers.from_wechat_sticker, send_media.data, send_media.mime)
                     if converted is not None:
                         sk_kind, sk_bytes, sk_meta = converted
                         sf = io.BytesIO(sk_bytes)
@@ -996,12 +1083,12 @@ class Bridge(LoginMixin):
                             if out:
                                 caption = ""
                                 reply = None
-                f = io.BytesIO(media.data)
-                f.name = media.filename
-                is_voice = t == VOICE and media.mime in ("audio/ogg", "audio/opus")
+                f = io.BytesIO(send_media.data)
+                f.name = send_media.filename
+                is_voice = t == VOICE and send_media.mime in ("audio/ogg", "audio/opus")
                 kwargs = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
                               silent=silent, voice_note=is_voice, supports_streaming=t == VIDEO,
-                              force_document=t == APP or (t == VOICE and not media.mime.startswith("audio/")))
+                              force_document=t == APP or (t == VOICE and not send_media.mime.startswith("audio/")))
                 try:
                     out.append(await self.bot.send_file(chat_id, f, **kwargs))
                 except errors.RPCError as e:
@@ -1013,15 +1100,37 @@ class Bridge(LoginMixin):
                     kwargs.update(force_document=True, voice_note=False, supports_streaming=False)
                     out.append(await self.bot.send_file(chat_id, f, **kwargs))
                 return out
-            if isinstance(media, str):
+            if isinstance(send_media, str):
                 label = {IMAGE: "图片", VIDEO: "视频", VOICE: "语音", STICKER: "表情"}.get(t, "文件")
-                text = header + prefix + f"[{label}，无法获取：{_esc(MEDIA_REASONS.get(media, media))}]"
+                text = header + prefix + f"[{label}，无法获取：{_esc(MEDIA_REASONS.get(send_media, send_media))}]"
+                buttons = None
+            elif is_link:
+                buttons = _link_buttons(msg.get("link"), msg.get("appMessageType"))
+                text = header + prefix + _link_body(msg["link"], msg.get("appMessageType"), inline_url=not buttons)
             else:
+                buttons = None
                 text = header + prefix + self._body(msg)
-            for i, part in enumerate(_chunks(text)):
-                out.append(await self.bot.send_message(chat_id, part, parse_mode="html", silent=silent,
-                                                       reply_to=reply if i == 0 else None,
-                                                       link_preview=False))
+            parts = _chunks(text)
+            try:
+                for i, part in enumerate(parts):
+                    out.append(await self.bot.send_message(
+                        chat_id, part, parse_mode="html", silent=silent,
+                        reply_to=reply if i == 0 else None,
+                        buttons=buttons if i == len(parts) - 1 else None,
+                        link_preview=False,
+                    ))
+            except errors.RPCError as e:
+                if _dead_chat(e) or not (is_link and buttons):
+                    raise
+                out.clear()
+                fallback_parts = _chunks(header + prefix + _link_body(
+                    msg["link"], msg.get("appMessageType"), inline_url=True))
+                for i, part in enumerate(fallback_parts):
+                    out.append(await self.bot.send_message(
+                        chat_id, part, parse_mode="html", silent=silent,
+                        reply_to=reply if i == 0 else None,
+                        link_preview=False,
+                    ))
             if t == LOCATION and (loc := msg.get("location")):
                 geo = types.InputMediaGeoPoint(types.InputGeoPoint(lat=loc["latitude"], long=loc["longitude"]))
                 out.append(await self.bot.send_file(chat_id, geo, silent=silent))

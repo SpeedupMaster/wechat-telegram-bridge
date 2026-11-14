@@ -1,8 +1,8 @@
 FROM python:3.13-slim
 
-# ffmpeg and gifsicle convert/optimize stickers and voice notes
+# ffmpeg and gifsicle convert/optimize stickers and voice notes; noto fonts render link cards
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg gifsicle tini \
+    && apt-get install -y --no-install-recommends ffmpeg gifsicle tini fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

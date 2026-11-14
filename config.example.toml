@@ -46,5 +46,7 @@ create_interval_seconds = 20
 max_media_mb = 200
 # 实时转发微信语音/视频来电通知，并提供一键拒接按钮（需 agent-wechat >= 2.4.0）
 call_notifications = true
+# 将微信链接分享（小红书、公众号、网页等）渲染为微信风格卡片图并附带直达按钮
+link_card_images = true
 # 不桥接的微信会话 ID，例如 ["filehelper", "weixin"]
 skip_threads = ["weixin"]

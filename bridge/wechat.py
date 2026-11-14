@@ -451,6 +451,67 @@ class WeChatClient:
             name = name.rsplit(".", 1)[0] + _ext(mime)
         return Media(r.content, mime, name)
 
+    async def download_link_thumbnail(self, message: dict, max_bytes: int = 4 * 1024 * 1024) -> bytes | None:
+        """Fetch a shared link's thumbnail image bytes when available, or return None."""
+        mid = message["id"]
+        try:
+            items = (await self._req("GET", self._a(f"messages/{_id(mid)}/media"))).get("items", [])
+        except (WeChatError, httpx.HTTPError):
+            return None
+        cands = [
+            a for a in items
+            if a.get("kind") in (None, "image")
+            and (a.get("actualVariant") or a.get("variant")) in ("thumbnail", None)
+        ]
+        if not cands:
+            cands = [a for a in items if a.get("kind") == "image"]
+        if not cands:
+            return None
+
+        def _usable(a: dict) -> bool:
+            return a.get("state") == "available" and (a.get("byteLength") or 0) <= max_bytes
+
+        asset = next((a for a in cands if _usable(a)), None)
+        if not asset:
+            fetchable = [
+                a for a in cands
+                if a.get("state") not in ("expired", "unsupported", "recalled", "available")
+                and (a.get("advertisedByteLength") or 0) <= max_bytes
+            ]
+            if not fetchable:
+                return None
+            cand = fetchable[0]
+            try:
+                job = await self._req(
+                    "POST", self._a(f"messages/{_id(mid)}/media-transfers"),
+                    json={"messageId": mid, "assetId": cand.get("id"), "quality": cand.get("variant") or "thumbnail"},
+                )
+                await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 20)
+                items = (await self._req("GET", self._a(f"messages/{_id(mid)}/media"))).get("items", [])
+            except (WeChatError, httpx.HTTPError):
+                return None
+            asset = next(
+                (a for a in items if a.get("id") == cand.get("id") and _usable(a)),
+                None,
+            ) or next(
+                (a for a in items if a.get("kind") in (None, "image") and _usable(a)),
+                None,
+            )
+        if not asset:
+            return None
+        mime = (asset.get("contentType") or "").split(";")[0].strip().lower()
+        params = {}
+        if mime == "image/x-wxgf" and asset.get("preview"):
+            params = {"representation": "preview"}
+            mime = (asset["preview"].get("contentType") or "").split(";")[0].strip().lower()
+        if mime and not mime.startswith("image/"):
+            return None
+        try:
+            r = await self._req("GET", self._a(f"media/{_id(asset['id'])}/content"), params=params, raw=True)
+        except (WeChatError, httpx.HTTPError):
+            return None
+        return r.content or None
+
 
 def _pick(assets: list[dict], mtype: int) -> dict | None:
     order = ["normal"] if mtype == VOICE else ["normal", "original"] if mtype == VIDEO else \

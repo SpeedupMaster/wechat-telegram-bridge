@@ -45,6 +45,7 @@ class BridgeConfig:
     create_interval_seconds: float = 20.0
     max_media_mb: int = 200
     call_notifications: bool = True
+    link_card_images: bool = True
     skip_threads: list[str] = field(default_factory=list)
 
 
