@@ -760,14 +760,52 @@ class Bridge(LoginMixin):
     async def _send_tg(self, chat, thread, header, prefix, msg, media, reply_to, silent) -> list:
         async def go(chat_id: int) -> list:
             out = []
+            reply = reply_to
             t = msg.get("type")
             if isinstance(media, Media):
-                f = io.BytesIO(media.data)
-                f.name = media.filename
                 caption = header + prefix + (self._body(msg) if t == APP and msg.get("appMessageType") != APP_FILE
                                              else "")
+                if t == STICKER:
+                    converted = await asyncio.to_thread(stickers.from_wechat_sticker, media.data, media.mime)
+                    if converted is not None:
+                        sk_kind, sk_bytes, sk_meta = converted
+                        sf = io.BytesIO(sk_bytes)
+                        if sk_kind == "static":
+                            sf.name = "sticker.webp"
+                            attrs = [
+                                types.DocumentAttributeSticker(alt="😊", stickerset=types.InputStickerSetEmpty()),
+                                types.DocumentAttributeImageSize(w=sk_meta["w"], h=sk_meta["h"]),
+                            ]
+                            sk_kwargs = dict(reply_to=reply, silent=silent, force_document=False,
+                                             mime_type="image/webp", attributes=attrs)
+                        else:
+                            sf.name = "sticker.webm"
+                            attrs = [
+                                types.DocumentAttributeSticker(alt="😊", stickerset=types.InputStickerSetEmpty()),
+                                types.DocumentAttributeVideo(duration=sk_meta["duration"],
+                                                             w=sk_meta["w"], h=sk_meta["h"], nosound=True),
+                            ]
+                            sk_kwargs = dict(reply_to=reply, silent=silent, force_document=False,
+                                             mime_type="video/webm", nosound_video=True, attributes=attrs)
+                        if caption:
+                            out.append(await self.bot.send_message(
+                                chat_id, caption.rstrip("\n"), parse_mode="html",
+                                reply_to=reply, silent=silent, link_preview=False))
+                            sk_kwargs["reply_to"] = None
+                        try:
+                            out.append(await self.bot.send_file(chat_id, sf, **sk_kwargs))
+                            return out
+                        except errors.RPCError as e:
+                            if _dead_chat(e):
+                                raise
+                            log.info("Telegram refused sticker as-is (%s); falling back to original media", e)
+                            if out:
+                                caption = ""
+                                reply = None
+                f = io.BytesIO(media.data)
+                f.name = media.filename
                 is_voice = t == VOICE and media.mime in ("audio/ogg", "audio/opus")
-                kwargs = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply_to,
+                kwargs = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
                               silent=silent, voice_note=is_voice, supports_streaming=t == VIDEO,
                               force_document=t == APP or (t == VOICE and not media.mime.startswith("audio/")))
                 try:
@@ -788,7 +826,7 @@ class Bridge(LoginMixin):
                 text = header + prefix + self._body(msg)
             for i, part in enumerate(_chunks(text)):
                 out.append(await self.bot.send_message(chat_id, part, parse_mode="html", silent=silent,
-                                                       reply_to=reply_to if i == 0 else None,
+                                                       reply_to=reply if i == 0 else None,
                                                        link_preview=False))
             if t == LOCATION and (loc := msg.get("location")):
                 geo = types.InputMediaGeoPoint(types.InputGeoPoint(lat=loc["latitude"], long=loc["longitude"]))
@@ -911,11 +949,15 @@ class Bridge(LoginMixin):
         try:
             result = None
             if msg.media and not isinstance(msg.media, (types.MessageMediaWebPage,)):
-                kind, media = await self._tg_media(msg)
+                native_stickers = await self.wx.supports_stickers() if msg.sticker else False
+                kind, media = await self._tg_media(msg, native_stickers=native_stickers)
                 if kind is None:
                     await self._report(chat_id, msg.id, media)
                 else:
-                    result = await self.wx.send_media(thread_id, kind, media, key)
+                    if kind == "sticker":
+                        result = await self.wx.send_sticker(thread_id, media, key)
+                    else:
+                        result = await self.wx.send_media(thread_id, kind, media, key)
                     self._record_send(chat_id, msg.id, thread_id, result, media=True)
                     if text:  # caption goes as a separate text message
                         result = await self.wx.send_text(thread_id, text, key + "-caption", mentions=mentions)
@@ -1011,18 +1053,19 @@ class Bridge(LoginMixin):
             await self.bot.send_message(chat_id, part, parse_mode="html", reply_to=reply_to if i == 0 else None)
 
     def _record_send(self, chat_id: int, tg_msg: int, thread_id: str, result: dict, media: bool = False) -> None:
-        server = result.get("serverMessageId") if media else result.get("serverId")
+        res = result.get("result") if isinstance(result.get("result"), dict) else {}
+        server = (result.get("serverMessageId") or res.get("serverMessageId")) if media else result.get("serverId")
         local = result.get("localMessageId")
-        if media and isinstance(result.get("result"), dict):
-            ids = result["result"].get("messageIds") or []
-            local = ids[0] if ids else None
+        if media and res:
+            ids = res.get("messageIds") or []
+            local = ids[0] if ids else res.get("messageId") or local
         if server:
             self.store.add_sent(thread_id, server)
         # One Telegram message may become two WeChat sends (media + caption); quotes point at the first.
         if (server or local) and self.store.wx_for_tg(chat_id, tg_msg) is None:
             self.store.map_message(chat_id, "user", tg_msg, thread_id, local, server)
 
-    async def _tg_media(self, msg) -> tuple[str | None, Media | str]:
+    async def _tg_media(self, msg, *, native_stickers: bool = True) -> tuple[str | None, Media | str]:
         f = msg.file
         size = f.size if f else 0
         if size and size > self.max_media:
@@ -1035,7 +1078,15 @@ class Bridge(LoginMixin):
         if msg.photo:
             return "image", Media(data, "image/jpeg", "photo.jpg")
         if msg.sticker:
-            # WeChat stickers cannot be sent through agent-wechat; send a picture or a short video instead
+            ext = (getattr(f, "ext", None) or "").lower()
+            if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/", "application/x-tgsticker")):
+                mime = {".webp": "image/webp", ".tgs": "application/x-tgsticker", ".webm": "video/webm"}.get(ext, mime)
+            if native_stickers:
+                converted = await stickers.to_wechat_sticker(data, mime)
+                if isinstance(converted, str):
+                    return None, converted
+                _, out = converted
+                return "sticker", Media(out, "image/gif", "sticker.gif")
             converted = await stickers.convert(data, mime)
             if isinstance(converted, str):
                 return None, converted

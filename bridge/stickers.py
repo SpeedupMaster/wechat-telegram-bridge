@@ -1,10 +1,15 @@
-"""Telegram stickers -> something WeChat can show.
+"""Bidirectional sticker conversion between Telegram and WeChat (agent-wechat >= 2.4.0).
 
-agent-wechat cannot send WeChat stickers (表情), and it re-encodes every image it sends as JPEG,
-which drops transparency and animation. So:
-  - static stickers (.webp)        -> JPEG on a white background, sent as an image
-  - video stickers (.webm, VP9)    -> short MP4 on white, sent as a video
-  - animated stickers (.tgs Lottie) -> rendered with rlottie into a short MP4, sent as a video
+Telegram -> WeChat (native sticker, type=47):
+  agent-wechat 2.4.0 sends stickers as validated GIFs (<= 240x240, <= 1 MB, <= 200 frames, <= 10 s):
+  - static stickers (.webp)          -> <= 240x240 transparent GIF
+  - animated stickers (.tgs Lottie)  -> rendered with rlottie into <= 240x240 transparent GIF
+  - video stickers (.webm, VP9)      -> transcoded with libvpx-vp9 into <= 240x240 transparent GIF
+  Legacy fallback (for agent-wechat < 2.4.0) converts to white-background JPEG or MP4 via `convert()`.
+
+WeChat -> Telegram (native Telegram sticker):
+  - static images / WXGF preview     -> 512 px RGBA .webp
+  - animated GIF                     -> 512 px VP9 .webm (<= 3 s, <= 30 fps, <= 256 KB, alpha kept)
 """
 from __future__ import annotations
 
@@ -18,13 +23,23 @@ import shutil
 import subprocess
 import tempfile
 
-from PIL import Image
+from PIL import Image, ImageSequence
 
 log = logging.getLogger("stickers")
 
-SIZE = 384          # output video is SIZE x SIZE; Telegram stickers are at most 512 x 512
-MIN_SECONDS = 3.0   # short animations are repeated until the video lasts about this long
+SIZE = 384          # legacy MP4 output size
+MIN_SECONDS = 3.0   # legacy MP4 repeat target
 MAX_LOOPS = 4
+
+WX_STICKER_SIZE = 240
+WX_STICKER_MAX_BYTES = 1024 * 1024
+WX_STICKER_MAX_FRAMES = 200
+WX_STICKER_MAX_SECONDS = 9.5
+
+TG_STICKER_SIZE = 512
+TG_VIDEO_STICKER_MAX_BYTES = 256 * 1024
+TG_VIDEO_STICKER_MAX_SECONDS = 3.0
+TG_VIDEO_STICKER_MAX_FPS = 30
 
 
 def find_ffmpeg() -> str | None:
@@ -107,8 +122,274 @@ def wxgf_to_image(data: bytes, ffmpeg: str) -> Image.Image:
         return im
 
 
+def _fit_size(w: int, h: int, max_edge: int, *, even: bool = False, upscale: bool = False) -> tuple[int, int]:
+    w, h = max(1, w), max(1, h)
+    longest = max(w, h)
+    if not upscale and longest <= max_edge:
+        nw, nh = w, h
+    else:
+        scale = max_edge / longest
+        nw = max(1, round(w * scale))
+        nh = max(1, round(h * scale))
+    if even:
+        nw = max(2, min(max_edge if max_edge % 2 == 0 else max_edge - 1, (nw // 2) * 2 or 2))
+        nh = max(2, min(max_edge if max_edge % 2 == 0 else max_edge - 1, (nh // 2) * 2 or 2))
+    return nw, nh
+
+
+def _rgba_frame_to_pal(im: Image.Image, max_colors: int = 255) -> tuple[Image.Image, bool]:
+    im = im.convert("RGBA")
+    alpha = im.getchannel("A")
+    has_alpha = alpha.getextrema()[0] < 128
+    if not has_alpha:
+        return im.convert("RGB").quantize(colors=min(256, max_colors + 1), method=Image.Quantize.MEDIANCUT), False
+    mask = alpha.point(lambda a: 255 if a < 128 else 0)
+    pal = im.convert("RGB").quantize(colors=min(255, max_colors), method=Image.Quantize.MEDIANCUT)
+    p = pal.getpalette() or []
+    if len(p) < 768:
+        p = p + [0] * (768 - len(p))
+        pal.putpalette(p)
+    pal.paste(255, mask=mask)
+    pal.info["transparency"] = 255
+    return pal, True
+
+
+def _rgba_to_transparent_gif_pillow(frames: list[tuple[Image.Image, int]], max_edge: int = WX_STICKER_SIZE,
+                                    max_colors: int = 255) -> bytes:
+    pals: list[Image.Image] = []
+    durations: list[int] = []
+    any_alpha = False
+    for frame, delay_ms in frames:
+        im = frame.convert("RGBA")
+        if max(im.size) > max_edge:
+            im.thumbnail((max_edge, max_edge), Image.LANCZOS)
+        pal, has_alpha = _rgba_frame_to_pal(im, max_colors=max_colors)
+        any_alpha = any_alpha or has_alpha
+        pals.append(pal)
+        durations.append(max(20, delay_ms or 50))
+    out = io.BytesIO()
+    kw: dict = {"disposal": 2}
+    if any_alpha:
+        kw["transparency"] = 255
+    if len(pals) == 1:
+        pals[0].save(out, "GIF", **kw)
+    else:
+        pals[0].save(out, "GIF", save_all=True, append_images=pals[1:], duration=durations, loop=0, **kw)
+    return out.getvalue()
+
+
+def _ffmpeg_rgba_to_gif(frames: list[bytes], width: int, height: int, fps: float, ffmpeg: str,
+                        *, max_colors: int = 256) -> bytes:
+    vf = (f"split[s0][s1];[s0]palettegen=max_colors={max_colors}:reserve_transparent=1:stats_mode=diff[p];"
+          "[s1][p]paletteuse=dither=bayer:bayer_scale=5:alpha_threshold=128")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "out.gif")
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{width}x{height}", "-r", f"{fps:g}", "-i", "pipe:0",
+               "-vf", vf, "-loop", "0", out]
+        res = subprocess.run(cmd, input=b"".join(frames), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode(errors="replace").strip() or f"ffmpeg exited {res.returncode}")
+        with open(out, "rb") as f:
+            return f.read()
+
+
+def _subsample_frames(frames: list[tuple[Image.Image, int]], max_frames: int = 150,
+                      max_ms: int = int(WX_STICKER_MAX_SECONDS * 1000)) -> list[tuple[Image.Image, int]]:
+    capped: list[tuple[Image.Image, int]] = []
+    acc = 0
+    for im, d in frames:
+        d = max(20, d)
+        if acc + d > max_ms and capped:
+            break
+        capped.append((im, d))
+        acc += d
+    if len(capped) <= max_frames:
+        return capped
+    step = len(capped) / max_frames
+    out: list[tuple[Image.Image, int]] = []
+    for idx in range(max_frames):
+        start = int(idx * step)
+        end = int((idx + 1) * step)
+        dur = sum(d for _, d in capped[start:max(start + 1, end)])
+        out.append((capped[start][0], max(20, dur)))
+    return out
+
+
+def webp_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    n_frames = getattr(im, "n_frames", 1)
+    if n_frames <= 1:
+        for edge, colors in ((WX_STICKER_SIZE, 255), (192, 127), (144, 63)):
+            out = _rgba_to_transparent_gif_pillow([(im, 0)], max_edge=edge, max_colors=colors)
+            if len(out) <= WX_STICKER_MAX_BYTES:
+                return out
+        return out
+    raw_frames = [(frame.convert("RGBA"), int(frame.info.get("duration") or 50))
+                  for frame in ImageSequence.Iterator(im)]
+    frames = _subsample_frames(raw_frames, max_frames=150)
+    total_ms = sum(d for _, d in frames)
+    fps = min(20.0, max(5.0, len(frames) * 1000.0 / max(1, total_ms)))
+    for edge, colors in ((WX_STICKER_SIZE, 255), (192, 127), (144, 63)):
+        if ffmpeg:
+            w, h = _fit_size(im.size[0], im.size[1], edge)
+            raw = [f.resize((w, h), Image.LANCZOS).tobytes() for f, _ in frames]
+            out = _ffmpeg_rgba_to_gif(raw, w, h, fps, ffmpeg, max_colors=colors)
+        else:
+            out = _rgba_to_transparent_gif_pillow(frames, max_edge=edge, max_colors=colors)
+        if len(out) <= WX_STICKER_MAX_BYTES:
+            return out
+    raise ValueError("sticker_output_size_limit")
+
+
+def tgs_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
+    from rlottie_python import LottieAnimation
+    anim = LottieAnimation.from_data(gzip.decompress(data).decode("utf-8"))
+    total = max(1, anim.lottie_animation_get_totalframe())
+    src_fps = anim.lottie_animation_get_framerate() or 30
+    if total == 1:
+        frame = anim.render_pillow_frame(frame_num=0, width=WX_STICKER_SIZE, height=WX_STICKER_SIZE)
+        return _rgba_to_transparent_gif_pillow([(frame, 0)], max_edge=WX_STICKER_SIZE)
+    duration = min(WX_STICKER_MAX_SECONDS, total / src_fps)
+    usable_src_frames = max(1, min(total, round(duration * src_fps)))
+    for edge, max_fps, colors in ((WX_STICKER_SIZE, 20.0, 256), (192, 15.0, 128), (160, 12.0, 64)):
+        target_fps = min(max_fps, src_fps, 150.0 / max(duration, 0.1))
+        n_out = max(1, min(150, round(duration * target_fps)))
+        actual_fps = max(1.0, n_out / max(duration, 0.05))
+        indices = [min(usable_src_frames - 1, int(i * usable_src_frames / n_out)) for i in range(n_out)]
+        if ffmpeg:
+            raw = [anim.render_pillow_frame(frame_num=idx, width=edge, height=edge).convert("RGBA").tobytes()
+                   for idx in indices]
+            out = _ffmpeg_rgba_to_gif(raw, edge, edge, actual_fps, ffmpeg, max_colors=colors)
+        else:
+            delay_ms = max(20, round(1000.0 / actual_fps))
+            pil_frames = [(anim.render_pillow_frame(frame_num=idx, width=edge, height=edge), delay_ms)
+                          for idx in indices]
+            out = _rgba_to_transparent_gif_pillow(pil_frames, max_edge=edge, max_colors=min(255, colors))
+        if len(out) <= WX_STICKER_MAX_BYTES:
+            return out
+    raise ValueError("sticker_output_size_limit")
+
+
+def webm_to_wechat_gif(data: bytes, ffmpeg: str) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out_path = os.path.join(tmp, "in.webm"), os.path.join(tmp, "out.gif")
+        with open(src, "wb") as f:
+            f.write(data)
+        for edge, fps, colors in ((WX_STICKER_SIZE, 15, 256), (180, 12, 128), (144, 10, 64)):
+            vf = (f"fps={fps},scale={edge}:{edge}:force_original_aspect_ratio=decrease,"
+                  f"split[s0][s1];[s0]palettegen=max_colors={colors}:reserve_transparent=1:stats_mode=diff[p];"
+                  "[s1][p]paletteuse=dither=bayer:bayer_scale=5:alpha_threshold=128")
+            cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                   "-c:v", "libvpx-vp9", "-i", src, "-t", f"{WX_STICKER_MAX_SECONDS:g}",
+                   "-vf", vf, "-loop", "0", out_path]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+            with open(out_path, "rb") as f:
+                out = f.read()
+            if len(out) <= WX_STICKER_MAX_BYTES:
+                return out
+    raise ValueError("sticker_output_size_limit")
+
+
+async def to_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes] | str:
+    """Convert a Telegram sticker (.webp / .tgs / .webm) to a <=240px <=1MB transparent GIF for WeChat."""
+    try:
+        ffmpeg = find_ffmpeg()
+        if mime == "image/webp":
+            return "sticker", await asyncio.to_thread(webp_to_wechat_gif, data, ffmpeg)
+        if mime == "application/x-tgsticker":
+            return "sticker", await asyncio.to_thread(tgs_to_wechat_gif, data, ffmpeg)
+        if mime == "video/webm":
+            if not ffmpeg:
+                return "需要 ffmpeg 才能转换视频贴纸"
+            return "sticker", await asyncio.to_thread(webm_to_wechat_gif, data, ffmpeg)
+    except Exception as e:
+        log.warning("WeChat sticker conversion failed (%s): %s", mime, e)
+        return f"贴纸转换失败：{type(e).__name__}"
+    return f"不支持的贴纸格式 {mime}"
+
+
+def wechat_image_to_tg_webp(im: Image.Image) -> tuple[bytes, int, int]:
+    rgba = im.convert("RGBA")
+    w, h = _fit_size(rgba.size[0], rgba.size[1], TG_STICKER_SIZE, upscale=True)
+    if (w, h) != rgba.size:
+        rgba = rgba.resize((w, h), Image.LANCZOS)
+    out = io.BytesIO()
+    rgba.save(out, "WEBP", quality=90, method=4)
+    return out.getvalue(), w, h
+
+
+def wechat_gif_to_tg_webm(data: bytes, ffmpeg: str) -> tuple[bytes, int, int, float] | None:
+    im = Image.open(io.BytesIO(data))
+    n_frames = getattr(im, "n_frames", 1)
+    if n_frames <= 1:
+        return None
+    total_ms = 0
+    for frame in ImageSequence.Iterator(im):
+        total_ms += max(20, int(frame.info.get("duration") or 100))
+    dur_s = max(0.1, total_ms / 1000.0)
+    out_dur = min(TG_VIDEO_STICKER_MAX_SECONDS, dur_s)
+    target_fps = min(TG_VIDEO_STICKER_MAX_FPS, max(1, round(n_frames / dur_s)))
+    out_w, out_h = _fit_size(im.size[0], im.size[1], TG_STICKER_SIZE, even=True, upscale=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out_path = os.path.join(tmp, "in.gif"), os.path.join(tmp, "out.webm")
+        with open(src, "wb") as f:
+            f.write(data)
+        vf = f"fps={target_fps},scale={out_w}:{out_h}:flags=lanczos,format=yuva420p"
+        for crf, bitrate in ((30, "400k"), (38, "200k"), (45, "120k")):
+            cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                   "-i", src, "-t", f"{TG_VIDEO_STICKER_MAX_SECONDS:g}", "-vf", vf,
+                   "-c:v", "libvpx-vp9", "-b:v", bitrate, "-crf", str(crf),
+                   "-auto-alt-ref", "0", "-an", out_path]
+            res = subprocess.run(cmd, capture_output=True, timeout=120)
+            if res.returncode != 0:
+                return None
+            with open(out_path, "rb") as f:
+                out = f.read()
+            if len(out) <= TG_VIDEO_STICKER_MAX_BYTES:
+                return out, out_w, out_h, out_dur
+    return None
+
+
+def from_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes, dict] | None:
+    """Convert a downloaded WeChat sticker to a Telegram static (.webp) or video (.webm) sticker.
+
+    Returns ("static", bytes, {"w", "h"}) or ("video", bytes, {"w", "h", "duration"}) or None.
+    """
+    ffmpeg = find_ffmpeg()
+    try:
+        if mime == "image/x-wxgf":
+            if not ffmpeg:
+                return None
+            im = wxgf_to_image(data, ffmpeg)
+            webp, w, h = wechat_image_to_tg_webp(im)
+            return "static", webp, {"w": w, "h": h}
+        if mime == "image/gif":
+            im = Image.open(io.BytesIO(data))
+            if getattr(im, "n_frames", 1) > 1:
+                if not ffmpeg:
+                    return None
+                res = wechat_gif_to_tg_webm(data, ffmpeg)
+                if not res:
+                    return None
+                webm, w, h, dur = res
+                return "video", webm, {"w": w, "h": h, "duration": dur}
+            im.load()
+            webp, w, h = wechat_image_to_tg_webp(im)
+            return "static", webp, {"w": w, "h": h}
+        if mime in ("image/png", "image/jpeg", "image/webp"):
+            im = Image.open(io.BytesIO(data))
+            im.load()
+            webp, w, h = wechat_image_to_tg_webp(im)
+            return "static", webp, {"w": w, "h": h}
+    except Exception as e:
+        log.info("Could not convert WeChat sticker (%s) to Telegram sticker: %s", mime, e)
+    return None
+
+
 def _encode_cmd(ffmpeg: str, source: list[str], out: str, fps: float) -> list[str]:
-    """Input 0 is a white background, input 1 the sticker (with alpha), centred and padded."""
+    """Legacy MP4 encoder: Input 0 is a white background, input 1 the sticker (with alpha), centred and padded."""
     graph = (f"[1:v]scale={SIZE}:{SIZE}:force_original_aspect_ratio=decrease,"
              f"pad={SIZE}:{SIZE}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba[fg];"
              "[0:v][fg]overlay=shortest=1,format=yuv420p")
@@ -139,27 +420,19 @@ def tgs_to_mp4(data: bytes, ffmpeg: str) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "out.mp4")
         source = ["-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{SIZE}x{SIZE}", "-r", f"{fps:g}", "-i", "pipe:0"]
-        proc = subprocess.Popen(_encode_cmd(ffmpeg, source, out, fps), stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        try:
-            frames = [anim.render_pillow_frame(frame_num=i, width=SIZE, height=SIZE).convert("RGBA").tobytes()
-                      for i in range(total)]
-            for _ in range(loops):
-                for frame in frames:
-                    proc.stdin.write(frame)
-            proc.stdin.close()
-            _, err = proc.communicate(timeout=120)
-        except BaseException:
-            proc.kill()
-            raise
-        if proc.returncode != 0:
-            raise RuntimeError(err.decode(errors="replace").strip() or f"ffmpeg exited {proc.returncode}")
+        frames = [anim.render_pillow_frame(frame_num=i, width=SIZE, height=SIZE).convert("RGBA").tobytes()
+                  for i in range(total)]
+        raw = b"".join(frames) * loops
+        res = subprocess.run(_encode_cmd(ffmpeg, source, out, fps), input=raw,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode(errors="replace").strip() or f"ffmpeg exited {res.returncode}")
         with open(out, "rb") as f:
             return f.read()
 
 
 async def convert(data: bytes, mime: str) -> tuple[str, bytes] | str:
-    """("image" | "video", bytes) ready for WeChat, or a reason it could not be converted."""
+    """Legacy fallback for agent-wechat < 2.4.0: ("image" | "video", bytes), or error reason."""
     try:
         if mime == "image/webp":
             return "image", await asyncio.to_thread(static_to_jpeg, data)

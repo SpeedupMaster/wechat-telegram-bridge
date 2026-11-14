@@ -38,12 +38,15 @@ class FakeDaemon:
         self.threads: dict[str, dict] = {}
         self.sends: list[tuple[dict, str]] = []
         self.uploads: list[tuple[str, bytes]] = []
+        self.sticker_preparations: list[tuple[dict, str]] = []
+        self.stickers_supported = True
         self.sse_body = ""
         self.marked_read: list[str] = []
         self.avatar_refreshed: list[str] = []
         self.avatar_op = {"id": "avop", "state": "succeeded"}
         self.avatar_lag = 0  # reads after a successful refresh that still miss (profile reader lag)
         self.media: dict[str, list[dict]] = {}  # message id -> media assets (default: one available PNG)
+        self.media_bytes: dict[str, tuple[bytes, str]] = {}  # asset id -> (bytes, content_type)
         self.group_members: dict[str, list[dict]] = {}
         self.recalls: list[tuple[str, dict, str]] = []
         self.recall_error: tuple[int, str] | None = None
@@ -66,6 +69,8 @@ class FakeDaemon:
         assert parts[:2] == ["accounts", ACC], path
         rest = parts[2:]
         m = request.method
+        if rest[0] == "capabilities" and m == "GET":
+            return httpx.Response(200, json={"nativeRuntime": True, "stickers": self.stickers_supported})
         if rest[0] == "messages" and len(rest) == 2:
             return httpx.Response(200, json=self.messages[rest[1]])
         if rest[0] == "messages" and len(rest) == 3 and rest[2] == "recall" and m == "POST":
@@ -85,6 +90,9 @@ class FakeDaemon:
                                                         "contentType": "image/png", "byteLength": 4,
                                                         "filename": "pic.png"}]})
         if rest[0] == "media" and rest[2] == "content":
+            if rest[1] in self.media_bytes:
+                raw, ctype = self.media_bytes[rest[1]]
+                return httpx.Response(200, content=raw, headers={"content-type": ctype})
             return httpx.Response(200, content=b"\x89PNG", headers={"content-type": "image/png"})
         if rest[0] == "threads" and len(rest) == 2:
             t = self.threads.get(rest[1])
@@ -121,11 +129,21 @@ class FakeDaemon:
             return httpx.Response(200, json={"id": rest[1], "displayName": "Contact " + rest[1]})
         if rest[0] == "uploads" and m == "POST":
             self.uploads.append((request.headers["content-type"], request.content))
-            return httpx.Response(201, json={"id": "src1", "name": "x", "mediaType": "image/jpeg"})
+            return httpx.Response(201, json={"id": f"src{len(self.uploads)}", "name": "x", "mediaType": "image/gif"})
+        if rest[0] == "sticker-preparations" and m == "POST":
+            body = json.loads(request.content)
+            self.sticker_preparations.append((body, request.headers["idempotency-key"]))
+            pid = f"prep{len(self.sticker_preparations)}"
+            return httpx.Response(202, json={"id": pid, "kind": "sticker_prepare", "state": "queued"})
+        if rest[0] == "sticker-preparations" and m == "GET":
+            return httpx.Response(200, json={"id": rest[1], "kind": "sticker_prepare", "state": "available",
+                                             "result": {"id": rest[1], "width": 240, "height": 240}})
         if rest[0] == "sends" and m == "POST":
             body = json.loads(request.content)
             self.sends.append((body, request.headers["idempotency-key"]))
             n = len(self.sends)
+            if body.get("kind") == "sticker":
+                return httpx.Response(202, json={"id": f"stjob{n}", "state": "queued", "kind": "sticker_send"})
             if "sourceId" in body:
                 return httpx.Response(202, json={"id": f"job{n}", "state": "queued", "kind": "send"})
             return httpx.Response(202, json={"id": f"send{n}", "state": "queued"})
@@ -133,6 +151,12 @@ class FakeDaemon:
             n = rest[1].removeprefix("send")
             return httpx.Response(200, json={"id": rest[1], "state": "accepted", "serverId": f"90{n}"})
         if rest[0] == "jobs":
+            if rest[1].startswith("stjob"):
+                n = rest[1].removeprefix("stjob")
+                return httpx.Response(200, json={"id": rest[1], "state": "available", "kind": "sticker_send",
+                                                 "result": {"serverAcceptance": "accepted",
+                                                            "serverMessageId": f"80{n}",
+                                                            "messageId": f"local-sticker-{n}"}})
             n = rest[1].removeprefix("job")
             return httpx.Response(200, json={"id": rest[1], "state": "accepted", "serverMessageId": f"80{n}",
                                              "result": {"messageIds": [f"local-media-{n}"]}})
@@ -360,15 +384,115 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s.file.read(), b"\x89PNG")
         self.assertEqual(s.file.name, "pic.png")
 
-    async def test_sticker_is_forwarded_as_its_image(self):
+    async def test_sticker_is_forwarded_as_telegram_sticker(self):
+        import io
+        from PIL import Image
         self.daemon.add_thread("wxid_bob", "Bob")
         self.daemon.add_message("st1", "wxid_bob", None, type_=47)
+        png = _png(240, 240, (255, 0, 0))
         self.daemon.media["st1"] = [{"id": "asset-st1", "kind": "sticker", "state": "available", "variant": "original",
-                                     "actualVariant": "original", "contentType": "image/gif", "byteLength": 4}]
+                                     "actualVariant": "original", "contentType": "image/png", "byteLength": len(png)}]
+        self.daemon.media_bytes["asset-st1"] = (png, "image/png")
         await self.event("st1", "wxid_bob")
         s = self.b.bot.sent[-1]
-        self.assertEqual(s.file.name, "st1.gif")
+        self.assertEqual(s.file.name, "sticker.webp")
+        self.assertEqual(s.kwargs["mime_type"], "image/webp")
         self.assertFalse(s.kwargs["force_document"])
+        self.assertTrue(any(isinstance(a, types.DocumentAttributeSticker) for a in s.kwargs["attributes"]))
+        im = Image.open(io.BytesIO(s.file.read()))
+        self.assertEqual((im.format, im.size), ("WEBP", (512, 512)))
+
+    async def test_group_animated_sticker_sends_header_then_webm_sticker(self):
+        import io
+        from PIL import Image
+        from bridge import stickers
+        if not stickers.find_ffmpeg():
+            self.skipTest("ffmpeg not installed")
+        frames = [Image.new("RGBA", (120, 120), (i * 40, 200, 0, 255)) for i in range(4)]
+        gif_buf = io.BytesIO()
+        frames[0].save(gif_buf, "GIF", save_all=True, append_images=frames[1:], duration=80, loop=0)
+        gif_bytes = gif_buf.getvalue()
+
+        self.daemon.add_thread("123@chatroom", "Team", kind="group")
+        self.daemon.add_message("st_anim", "123@chatroom", None, type_=47, sender="wxid_alice")
+        self.daemon.media["st_anim"] = [{"id": "asset-st_anim", "kind": "sticker", "state": "available",
+                                          "variant": "original", "actualVariant": "original",
+                                          "contentType": "image/gif", "byteLength": len(gif_bytes)}]
+        self.daemon.media_bytes["asset-st_anim"] = (gif_bytes, "image/gif")
+        await self.event("st_anim", "123@chatroom")
+        header_msg, sticker_msg = self.b.bot.sent[-2], self.b.bot.sent[-1]
+        self.assertEqual(header_msg.text, "<b>Alice in group</b>：")
+        self.assertEqual(sticker_msg.file.name, "sticker.webm")
+        self.assertEqual(sticker_msg.kwargs["mime_type"], "video/webm")
+        self.assertTrue(sticker_msg.kwargs["nosound_video"])
+        self.assertTrue(any(isinstance(a, types.DocumentAttributeSticker) for a in sticker_msg.kwargs["attributes"]))
+        self.assertTrue(any(isinstance(a, types.DocumentAttributeVideo) and a.nosound
+                            for a in sticker_msg.kwargs["attributes"]))
+
+    async def test_telegram_stickers_sent_as_native_wechat_stickers_and_echo_dropped(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m0", "wxid_bob", "hi", server="100")
+        await self.event("m0", "wxid_bob")
+        chat = self.b.store.chat_for_thread("wxid_bob")
+
+        webp = StickerTests.webp()
+        async def dl_webp(file=None):
+            return webp
+        ev_webp = SimpleNamespace(chat_id=chat, message=SimpleNamespace(
+            id=8001, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, sticker=True, voice=None, video=None, video_note=None, gif=None,
+            file=SimpleNamespace(size=len(webp), mime_type="image/webp", name=None, ext=".webp"),
+            media=types.MessageMediaDocument(), download_media=dl_webp))
+        await self.b.on_tg_message(ev_webp)
+
+        self.assertEqual(len(self.daemon.sticker_preparations), 1)
+        prep_body, prep_key = self.daemon.sticker_preparations[-1]
+        self.assertEqual((prep_body["sourceId"], prep_body["fit"], prep_key), ("src1", True, f"tg-{chat}-8001-prep"))
+        send_body, send_key = self.daemon.sends[-1]
+        self.assertEqual(send_body, {"kind": "sticker", "threadId": "wxid_bob",
+                                     "source": {"kind": "prepared", "preparationId": "prep1"}})
+        self.assertEqual(send_key, f"tg-{chat}-8001")
+        self.assertEqual(self.b.store.wx_for_tg(chat, 8001), ("local-sticker-1", "801"))
+        self.assertFalse(any("发送到微信失败" in (s.text or "") for s in self.b.bot.sent))
+
+        # Echo from daemon is dropped cleanly
+        sent_before = len(self.b.bot.sent)
+        self.daemon.add_message("echo_st", "wxid_bob", "", type_=47, direction="outgoing", server="801")
+        await self.event("echo_st", "wxid_bob", direction="outgoing")
+        self.assertEqual(len(self.b.bot.sent), sent_before)
+
+        # Animated .tgs sticker also uses native sticker preparation + send
+        tgs = StickerTests.tgs()
+        async def dl_tgs(file=None):
+            return tgs
+        ev_tgs = SimpleNamespace(chat_id=chat, message=SimpleNamespace(
+            id=8002, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, sticker=True, voice=None, video=None, video_note=None, gif=None,
+            file=SimpleNamespace(size=len(tgs), mime_type="application/x-tgsticker", name="a.tgs", ext=".tgs"),
+            media=types.MessageMediaDocument(), download_media=dl_tgs))
+        await self.b.on_tg_message(ev_tgs)
+        self.assertEqual(len(self.daemon.sticker_preparations), 2)
+        self.assertEqual(self.daemon.sends[-1][0]["kind"], "sticker")
+        self.assertEqual(self.b.store.wx_for_tg(chat, 8002), ("local-sticker-2", "802"))
+
+    async def test_telegram_sticker_falls_back_when_daemon_lacks_sticker_support(self):
+        self.daemon.stickers_supported = False
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m0", "wxid_bob", "hi", server="100")
+        await self.event("m0", "wxid_bob")
+        chat = self.b.store.chat_for_thread("wxid_bob")
+
+        webp = StickerTests.webp()
+        async def dl_webp(file=None):
+            return webp
+        ev_webp = SimpleNamespace(chat_id=chat, message=SimpleNamespace(
+            id=8003, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, sticker=True, voice=None, video=None, video_note=None, gif=None,
+            file=SimpleNamespace(size=len(webp), mime_type="image/webp", name=None, ext=".webp"),
+            media=types.MessageMediaDocument(), download_media=dl_webp))
+        await self.b.on_tg_message(ev_webp)
+        self.assertEqual(self.daemon.sticker_preparations, [])
+        self.assertEqual(self.daemon.sends[-1][0]["kind"], "image")
 
     async def test_sticker_that_cannot_be_downloaded_says_why(self):
         self.daemon.add_thread("wxid_bob", "Bob")
@@ -891,10 +1015,15 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         lottie = {"v": "5.5.2", "fr": 30, "ip": 0, "op": 30, "w": 512, "h": 512, "layers": [{
             "ty": 4, "ip": 0, "op": 30, "st": 0,
             "ks": {"o": still(100), "p": still([256, 256, 0]), "a": still([0, 0, 0]), "s": still([100, 100, 100]),
-                   "r": {"a": 1, "k": [{"t": 0, "s": [0], "e": [90], "i": {"x": [1], "y": [1]}, "o": {"x": [0], "y": [0]}},
-                                       {"t": 30, "s": [90]}]}},
-            "shapes": [{"ty": "rc", "p": still([0, 0]), "s": still([200, 200]), "r": still(0)},
-                       {"ty": "fl", "c": still([1, 0, 0, 1]), "o": still(100)}]}]}
+                   "r": still(0)},
+            "shapes": [{"ty": "gr", "it": [
+                {"ty": "rc", "p": still([0, 0]), "s": still([200, 200]), "r": still(0)},
+                {"ty": "fl", "c": still([1, 0, 0, 1]), "o": still(100)},
+                {"ty": "tr", "p": still([0, 0]), "a": still([0, 0]), "s": still([100, 100]),
+                 "r": {"a": 1, "k": [{"t": 0, "s": [0], "e": [90], "i": {"x": [1], "y": [1]}, "o": {"x": [0], "y": [0]}},
+                                     {"t": 30, "s": [90]}]},
+                 "o": still(100)}
+            ]}]}]}
         return gzip.compress(json.dumps(lottie).encode())
 
     def frame(self, mp4: bytes):
@@ -952,7 +1081,7 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kind, "image")
         self.assertColor(Image.open(io.BytesIO(data)).getpixel((192, 192)), (255, 0, 0))
 
-    async def test_bridge_sends_sticker_as_jpeg(self):
+    async def test_bridge_sends_sticker_as_native_gif_and_legacy_fallback(self):
         b = Bridge.__new__(Bridge)
         b.max_media = 50 * 1048576
         data = self.webp()
@@ -961,9 +1090,96 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             return data
         msg = SimpleNamespace(file=SimpleNamespace(size=len(data), mime_type="image/webp", name=None, ext=".webp"),
                               sticker=True, photo=None, download_media=download_media)
-        kind, media = await b._tg_media(msg)
-        self.assertEqual((kind, media.mime, media.filename), ("image", "image/jpeg", "sticker.jpg"))
-        self.assertTrue(media.data.startswith(b"\xff\xd8"))
+        kind, media = await b._tg_media(msg, native_stickers=True)
+        self.assertEqual((kind, media.mime, media.filename), ("sticker", "image/gif", "sticker.gif"))
+        self.assertTrue(media.data.startswith(b"GIF8"))
+
+        kind_old, media_old = await b._tg_media(msg, native_stickers=False)
+        self.assertEqual((kind_old, media_old.mime, media_old.filename), ("image", "image/jpeg", "sticker.jpg"))
+        self.assertTrue(media_old.data.startswith(b"\xff\xd8"))
+
+    async def test_to_wechat_sticker_preserves_alpha_and_limits(self):
+        import io
+        from unittest import mock
+        from PIL import Image
+
+        # Static WebP -> <=240px transparent GIF
+        kind, gif = await self.stickers.to_wechat_sticker(self.webp(), "image/webp")
+        self.assertEqual(kind, "sticker")
+        self.assertLessEqual(len(gif), self.stickers.WX_STICKER_MAX_BYTES)
+        im = Image.open(io.BytesIO(gif))
+        self.assertEqual((im.format, im.size), ("GIF", (240, 240)))
+        rgba = im.convert("RGBA")
+        self.assertEqual(rgba.getpixel((5, 5))[3], 0)
+        self.assertColor(rgba.getpixel((120, 120))[:3], (255, 0, 0))
+
+        # Animated .tgs -> multi-frame transparent GIF (both with and without ffmpeg)
+        for use_ffmpeg in (True, False):
+            if use_ffmpeg and not self.ffmpeg:
+                continue
+            ctx = mock.patch.object(self.stickers, "find_ffmpeg", return_value=self.ffmpeg if use_ffmpeg else None)
+            with ctx:
+                kind, tgs_gif = await self.stickers.to_wechat_sticker(self.tgs(), "application/x-tgsticker")
+            self.assertEqual(kind, "sticker")
+            self.assertLessEqual(len(tgs_gif), self.stickers.WX_STICKER_MAX_BYTES)
+            gim = Image.open(io.BytesIO(tgs_gif))
+            self.assertGreater(gim.n_frames, 1)
+            self.assertLessEqual(gim.n_frames, self.stickers.WX_STICKER_MAX_FRAMES)
+            self.assertEqual(gim.size, (240, 240))
+            self.assertEqual(gim.convert("RGBA").getpixel((5, 5))[3], 0)
+            self.assertColor(gim.convert("RGBA").getpixel((120, 120))[:3], (255, 0, 0))
+
+        # Video .webm (VP9 with alpha) -> multi-frame transparent GIF
+        if self.ffmpeg:
+            import subprocess
+            webm = Path(self.tmp.name, "in_wx.webm")
+            subprocess.run([self.ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "color=c=green:s=512x512:d=1,format=rgba,"
+                            "geq=r=0:g=200:b=0:a='if(between(X,100,300)*between(Y,100,300),255,0)'",
+                            "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", str(webm)], check=True)
+            kind, webm_gif = await self.stickers.to_wechat_sticker(webm.read_bytes(), "video/webm")
+            self.assertEqual(kind, "sticker")
+            self.assertLessEqual(len(webm_gif), self.stickers.WX_STICKER_MAX_BYTES)
+            wim = Image.open(io.BytesIO(webm_gif))
+            self.assertGreater(wim.n_frames, 1)
+            self.assertEqual(wim.size, (240, 240))
+            self.assertEqual(wim.convert("RGBA").getpixel((5, 5))[3], 0)
+            self.assertColor(wim.convert("RGBA").getpixel((100, 100))[:3], (0, 200, 0))
+
+    async def test_from_wechat_sticker_static_and_animated(self):
+        import io
+        from unittest import mock
+        from PIL import Image
+
+        # Static PNG -> 512px RGBA WebP
+        png_buf = io.BytesIO()
+        src = Image.new("RGBA", (240, 120), (0, 0, 0, 0))
+        src.paste((20, 100, 240, 255), (20, 20, 100, 100))
+        src.save(png_buf, "PNG")
+        res = self.stickers.from_wechat_sticker(png_buf.getvalue(), "image/png")
+        self.assertIsNotNone(res)
+        kind, webp_bytes, meta = res
+        self.assertEqual((kind, meta), ("static", {"w": 512, "h": 256}))
+        wim = Image.open(io.BytesIO(webp_bytes))
+        self.assertEqual((wim.format, wim.size), ("WEBP", (512, 256)))
+        self.assertEqual(wim.convert("RGBA").getpixel((5, 5))[3], 0)
+
+        # Animated GIF without ffmpeg -> None (falls back to sending original GIF)
+        frames = [Image.new("RGBA", (120, 120), (i * 50, 180, 0, 255)) for i in range(4)]
+        gif_buf = io.BytesIO()
+        frames[0].save(gif_buf, "GIF", save_all=True, append_images=frames[1:], duration=80, loop=0)
+        with mock.patch.object(self.stickers, "find_ffmpeg", return_value=None):
+            self.assertIsNone(self.stickers.from_wechat_sticker(gif_buf.getvalue(), "image/gif"))
+
+        # Animated GIF with ffmpeg -> 512px VP9 WebM <= 256 KB
+        if self.ffmpeg:
+            res_anim = self.stickers.from_wechat_sticker(gif_buf.getvalue(), "image/gif")
+            self.assertIsNotNone(res_anim)
+            akind, webm_bytes, ameta = res_anim
+            self.assertEqual(akind, "video")
+            self.assertEqual((ameta["w"], ameta["h"]), (512, 512))
+            self.assertLessEqual(len(webm_bytes), self.stickers.TG_VIDEO_STICKER_MAX_BYTES)
+            self.assertLessEqual(ameta["duration"], self.stickers.TG_VIDEO_STICKER_MAX_SECONDS)
 
     async def test_picture_sent_as_file_stays_a_file(self):
         """agent-wechat shrinks images to ~64 KB; a Telegram document keeps its bytes as a WeChat file."""

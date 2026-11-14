@@ -16,8 +16,8 @@ log = logging.getLogger("wechat")
 TEXT, IMAGE, VOICE, VIDEO, STICKER, LOCATION, APP, SYSTEM = 1, 3, 34, 43, 47, 48, 49, 10000
 APP_FILE, APP_CHANNELS, APP_QUOTE, APP_UPLOAD_NOTICE = 6, 51, 57, 74
 
-SEND_DONE = {"accepted", "completed", "succeeded", "failed", "needs_review", "cancelled"}
-SEND_OK = {"accepted", "completed", "succeeded"}
+SEND_DONE = {"accepted", "completed", "succeeded", "available", "failed", "needs_review", "cancelled"}
+SEND_OK = {"accepted", "completed", "succeeded", "available"}
 JOB_DONE = {"accepted", "completed", "succeeded", "available", "failed", "partial", "cancelled",
             "expired", "needs_review", "unsupported"}
 
@@ -51,6 +51,7 @@ class WeChatClient:
     def __init__(self, base_url: str, token: str, account: str = ""):
         self.base = base_url.rstrip("/") + "/v1/"
         self.account = account
+        self._supports_stickers: bool | None = None
         # trust_env=False: never route the local daemon (and its token) through a system HTTP proxy
         self.http = httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}, trust_env=False,
                                       timeout=httpx.Timeout(30.0, connect=10.0))
@@ -264,6 +265,33 @@ class WeChatClient:
             body["mentions"] = mentions
         intent = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
         return await self._wait(intent, lambda i: f"sends/{_id(i['id'])}", SEND_DONE, 120)
+
+    async def supports_stickers(self) -> bool:
+        if self._supports_stickers is not None:
+            return self._supports_stickers
+        try:
+            caps = await self._req("GET", self._a("capabilities"))
+            self._supports_stickers = bool(isinstance(caps, dict) and caps.get("stickers"))
+        except (WeChatError, httpx.HTTPError):
+            self._supports_stickers = False
+        return self._supports_stickers
+
+    async def prepare_sticker(self, media: Media, key: str, *, fit: bool = True) -> dict:
+        files = {"file": (media.filename, media.data, media.mime)}
+        source = await self._req("POST", self._a("uploads"), files=files, timeout=httpx.Timeout(600.0))
+        job = await self._req("POST", self._a("sticker-preparations"),
+                              json={"sourceId": source["id"], "fit": fit, "trim": None},
+                              headers={"Idempotency-Key": key})
+        return await self._wait(job, lambda j: f"sticker-preparations/{_id(j['id'])}", JOB_DONE, 300)
+
+    async def send_sticker(self, thread_id: str, media: Media, key: str) -> dict:
+        prep = await self.prepare_sticker(media, f"{key}-prep", fit=True)
+        if prep.get("state") != "available":
+            return prep
+        body = {"kind": "sticker", "threadId": thread_id,
+                "source": {"kind": "prepared", "preparationId": prep["id"]}}
+        job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key})
+        return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
 
     async def send_media(self, thread_id: str, kind: str, media: Media, key: str) -> dict:
         files = {"file": (media.filename, media.data, media.mime)}
