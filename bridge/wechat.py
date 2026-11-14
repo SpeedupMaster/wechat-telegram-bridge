@@ -314,7 +314,7 @@ class WeChatClient:
             caps = await self._req("GET", self._a("capabilities"))
             self._supports_stickers = bool(isinstance(caps, dict) and caps.get("stickers"))
         except (WeChatError, httpx.HTTPError):
-            self._supports_stickers = False
+            return False
         return self._supports_stickers
 
     async def prepare_sticker(self, media: Media, key: str, *, fit: bool = True) -> dict:

@@ -1838,6 +1838,69 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(wim.convert("RGBA").getpixel((5, 5))[3], 0)
             self.assertColor(wim.convert("RGBA").getpixel((100, 100))[:3], (0, 200, 0))
 
+    async def test_tgs_unpremultiplied_alpha_and_aspect_ratio(self):
+        import gzip
+        import io
+        from PIL import Image
+
+        still = lambda v: {"a": 0, "k": v}
+        # 512x256 non-square white shape at 55% opacity (alpha >= 128 -> opaque in GIF, must stay white not grey)
+        lottie = {"v": "5.5.2", "fr": 30, "ip": 0, "op": 20, "w": 512, "h": 256, "layers": [{
+            "ty": 4, "ip": 0, "op": 20, "st": 0,
+            "ks": {"o": still(55), "p": still([256, 128, 0]), "a": still([0, 0, 0]), "s": still([100, 100, 100]),
+                   "r": still(0)},
+            "shapes": [{"ty": "gr", "it": [
+                {"ty": "rc", "p": still([0, 0]), "s": still([200, 100]), "r": still(0)},
+                {"ty": "fl", "c": still([1, 1, 1, 1]), "o": still(100)},
+                {"ty": "tr", "p": still([0, 0]), "a": still([0, 0]), "s": still([100, 100]), "r": still(0),
+                 "o": still(100)},
+            ]}],
+        }]}
+        tgs_bytes = gzip.compress(json.dumps(lottie).encode())
+        kind, gif = await self.stickers.to_wechat_sticker(tgs_bytes, "application/x-tgsticker")
+        self.assertEqual(kind, "sticker")
+        gim = Image.open(io.BytesIO(gif))
+        self.assertEqual(gim.size, (240, 120))
+        rgba = gim.convert("RGBA")
+        self.assertEqual(rgba.getpixel((5, 5))[3], 0)
+        self.assertColor(rgba.getpixel((120, 60))[:3], (255, 255, 255))
+
+    async def test_animated_webp_resamples_fps_and_preserves_240px_quality(self):
+        import io
+        from unittest import mock
+        from PIL import Image
+
+        # Build a 25fps (40ms/frame) 1s animated WebP
+        src_frames = []
+        for i in range(25):
+            im = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
+            im.paste((255, (i * 10) % 256, 40, 255), (40 + i * 2, 60, 220 + i * 2, 240))
+            src_frames.append(im)
+        webp_buf = io.BytesIO()
+        src_frames[0].save(webp_buf, "WEBP", save_all=True, append_images=src_frames[1:], duration=40, loop=0)
+        webp_data = webp_buf.getvalue()
+
+        seen_calls: list[tuple[int, int, int, int, str]] = []
+
+        def fake_ffmpeg(frames, w, h, fps, ffmpeg, *, max_colors=256, stats_mode="full", dither="none"):
+            seen_calls.append((w, h, len(frames), max_colors, dither))
+            # 20fps (20 frames) is > FAST_BYTES (450KB) but <= MAX_BYTES (1MB);
+            # 16.67fps (17 frames) is also > FAST_BYTES; 12.5fps (12/13 frames) is STILL 600KB;
+            # then 160-color attempt must NOT run because we already have a 240px/256-color GIF <= 1MB!
+            return b"GIF89a" + (b"x" * (600 * 1024))
+
+        with mock.patch.object(self.stickers, "find_ffmpeg", return_value="ffmpeg"), \
+             mock.patch.object(self.stickers, "find_gifsicle", return_value=None), \
+             mock.patch.object(self.stickers, "_ffmpeg_rgba_to_gif", side_effect=fake_ffmpeg):
+            out = self.stickers.webp_to_wechat_gif(webp_data, "ffmpeg")
+
+        self.assertEqual(len(out), 6 + 600 * 1024)
+        self.assertEqual(len(seen_calls), 3)
+        self.assertTrue(all(w == 240 and h == 240 and colors == 256 for w, h, _, colors, _ in seen_calls))
+        # Verify FPS actually decreased across the three 240px attempts
+        self.assertGreater(seen_calls[0][2], seen_calls[1][2])
+        self.assertGreater(seen_calls[1][2], seen_calls[2][2])
+
     async def test_from_wechat_sticker_static_and_animated(self):
         import io
         from unittest import mock
@@ -2410,4 +2473,24 @@ class WeChatClientTimeoutAndRetryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await wx.close()
 
+    async def test_supports_stickers_does_not_cache_transient_failure(self):
+        calls = 0
 
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(503, json={"error": {"code": "starting", "retryable": False}})
+            return httpx.Response(200, json={"stickers": True})
+
+        wx = WeChatClient("http://localhost:6174", "secret-token", ACC, read_retry_delays=())
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                    headers={"Authorization": "Bearer secret-token"},
+                                    timeout=wx.http.timeout)
+        try:
+            self.assertFalse(await wx.supports_stickers())
+            self.assertTrue(await wx.supports_stickers())
+            self.assertTrue(await wx.supports_stickers())
+            self.assertEqual(calls, 2)
+        finally:
+            await wx.close()

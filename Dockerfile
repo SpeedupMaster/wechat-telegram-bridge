@@ -1,8 +1,8 @@
 FROM python:3.13-slim
 
-# ffmpeg converts WeChat voice (WAV) into Telegram voice notes (OGG/Opus)
+# ffmpeg and gifsicle convert/optimize stickers and voice notes
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tini \
+    && apt-get install -y --no-install-recommends ffmpeg gifsicle tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
