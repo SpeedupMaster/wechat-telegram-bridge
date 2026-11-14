@@ -702,6 +702,62 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         body, _ = self.daemon.sends[-1]
         self.assertEqual((body["kind"], body["videoQuality"]), ("video", "original"))
 
+    async def test_video_download_fetches_video_instead_of_cached_thumbnail(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1001, "Bob")
+        thumb_bytes = _png(320, 180, (50, 50, 50))
+        mp4_bytes = b"\x00\x00\x00\x18ftypmp42"
+
+        # 1) Cached thumbnail + uncached normal video -> transfers and sends MP4, not thumbnail
+        self.daemon.add_message("vid1", "wxid_bob", None, type_=43)
+        self.daemon.media["vid1"] = [
+            {"id": "v1-thumb", "kind": "image", "variant": "thumbnail", "actualVariant": "thumbnail",
+             "state": "available", "contentType": "image/jpeg", "byteLength": len(thumb_bytes),
+             "filename": "thumb.jpg"},
+            {"id": "v1-norm", "kind": "video", "variant": "normal", "state": "not_cached",
+             "contentType": "video/mp4", "advertisedByteLength": len(mp4_bytes), "filename": "clip.mp4"},
+        ]
+        self.daemon.media_bytes["v1-thumb"] = (thumb_bytes, "image/jpeg")
+        self.daemon.media_bytes["v1-norm"] = (mp4_bytes, "video/mp4")
+        await self.event("vid1", "wxid_bob")
+        self.assertEqual(self.daemon.media_transfers[-1][1]["quality"], "normal")
+        s1 = self.b.bot.sent[-1]
+        self.assertEqual((s1.file.name, s1.file.read()), ("clip.mp4", mp4_bytes))
+        self.assertTrue(s1.kwargs["supports_streaming"])
+
+        # 2) Cached thumbnail + unsupported normal + uncached original -> falls back to original video
+        self.daemon.add_message("vid2", "wxid_bob", None, type_=43)
+        self.daemon.media["vid2"] = [
+            {"id": "v2-thumb", "kind": "image", "variant": "thumbnail", "actualVariant": "thumbnail",
+             "state": "available", "contentType": "image/jpeg", "byteLength": len(thumb_bytes),
+             "filename": "thumb.jpg"},
+            {"id": "v2-norm", "kind": "video", "variant": "normal", "state": "unsupported",
+             "contentType": "video/mp4"},
+            {"id": "v2-orig", "kind": "video", "variant": "original", "state": "not_cached",
+             "contentType": "video/mp4", "advertisedByteLength": len(mp4_bytes), "filename": "raw.mp4"},
+        ]
+        self.daemon.media_bytes["v2-orig"] = (mp4_bytes, "video/mp4")
+        await self.event("vid2", "wxid_bob")
+        self.assertEqual(self.daemon.media_transfers[-1][1]["quality"], "original")
+        s2 = self.b.bot.sent[-1]
+        self.assertEqual((s2.file.name, s2.file.read()), ("raw.mp4", mp4_bytes))
+        self.assertTrue(s2.kwargs["supports_streaming"])
+
+        # 3) If video transfer fails, never send the thumbnail as a substitute photo
+        self.daemon.add_message("vid3", "wxid_bob", None, type_=43)
+        self.daemon.transfer_fail_variants.add("normal")
+        self.daemon.media["vid3"] = [
+            {"id": "v3-thumb", "kind": "image", "variant": "thumbnail", "actualVariant": "thumbnail",
+             "state": "available", "contentType": "image/jpeg", "byteLength": len(thumb_bytes),
+             "filename": "thumb.jpg"},
+            {"id": "v3-norm", "kind": "video", "variant": "normal", "state": "not_cached",
+             "contentType": "video/mp4", "advertisedByteLength": len(mp4_bytes), "filename": "fail.mp4"},
+        ]
+        await self.event("vid3", "wxid_bob")
+        s3 = self.b.bot.sent[-1]
+        self.assertIsNone(s3.file)
+        self.assertIn("[视频，无法获取：", s3.text)
+
     async def test_latest_cursor(self):
         self.assertEqual(await self.b.wx.latest_cursor(), "42")
 

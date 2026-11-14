@@ -385,11 +385,19 @@ class WeChatClient:
         items = await assets()
         asset = None
         last_job: dict = {}
-        if mtype == IMAGE and items:
-            # Prefer full-resolution `original` over cached `standard`/`thumbnail` previews:
-            # `agent-wechat` may already hold a cached thumbnail/standard while `original` is `not_cached`.
-            for variant in ("original", "standard", "thumbnail"):
-                cands = [a for a in items if (a.get("actualVariant") or a.get("variant")) == variant]
+        variant_order = (
+            ("original", "standard", "thumbnail") if mtype == IMAGE
+            else ("normal", "original") if mtype == VIDEO
+            else ()
+        )
+        if variant_order and items:
+            # Prefer full-resolution `original` for images and actual video variants over cached thumbnails:
+            # `agent-wechat` may already hold a cached thumbnail/preview while the full media is `not_cached`.
+            for variant in variant_order:
+                cands = [
+                    a for a in items
+                    if _eligible_asset(a, mtype) and (a.get("actualVariant") or a.get("variant")) == variant
+                ]
                 if not cands:
                     continue
                 avail = [a for a in cands if a.get("state") == "available" and (a.get("byteLength") or 0) <= max_bytes]
@@ -412,7 +420,8 @@ class WeChatClient:
                 items = await assets()
                 avail = [
                     a for a in items
-                    if (a.get("id") == cand.get("id") or (a.get("actualVariant") or a.get("variant")) == variant)
+                    if _eligible_asset(a, mtype)
+                    and (a.get("id") == cand.get("id") or (a.get("actualVariant") or a.get("variant")) == variant)
                     and a.get("state") == "available" and (a.get("byteLength") or 0) <= max_bytes
                 ]
                 if avail:
@@ -421,12 +430,16 @@ class WeChatClient:
         if not asset:
             asset = _pick(items, mtype)
         if not asset:
-            states = {a.get("state") for a in items}
-            if states & {"expired", "unsupported", "recalled"} and not states & {"pending"}:
-                reasons = [a["reason"] for a in items if a.get("reason")]
+            eligible_items = [a for a in items if _eligible_asset(a, mtype)]
+            states = {a.get("state") for a in eligible_items}
+            if states & {"expired", "unsupported", "recalled"} and not states & {"pending", "not_cached"}:
+                reasons = [a["reason"] for a in eligible_items if a.get("reason")]
                 return reasons[0] if reasons else "已过期" if "expired" in states else "不支持"
-            big = [a for a in items if (a.get("advertisedByteLength") or 0) > max_bytes or (a.get("byteLength") or 0) > max_bytes]
-            if items and len(big) == len(items):
+            big = [
+                a for a in eligible_items
+                if (a.get("advertisedByteLength") or 0) > max_bytes or (a.get("byteLength") or 0) > max_bytes
+            ]
+            if eligible_items and len(big) == len(eligible_items):
                 return "文件太大"
             if last_job:
                 return last_job.get("reason") or last_job.get("state") or "下载失败"
@@ -513,10 +526,24 @@ class WeChatClient:
         return r.content or None
 
 
+def _eligible_asset(asset: dict, mtype: int) -> bool:
+    """Reject preview thumbnails/images when downloading a video or voice message."""
+    variant = asset.get("actualVariant") or asset.get("variant")
+    kind = asset.get("kind")
+    ct = (asset.get("contentType") or "").split(";")[0].strip().lower()
+    if mtype == VIDEO:
+        if variant == "thumbnail" or (kind is not None and kind != "video") or ct.startswith("image/"):
+            return False
+    elif mtype == VOICE:
+        if variant == "thumbnail" or (kind is not None and kind != "audio") or ct.startswith("image/"):
+            return False
+    return True
+
+
 def _pick(assets: list[dict], mtype: int) -> dict | None:
     order = ["normal"] if mtype == VOICE else ["normal", "original"] if mtype == VIDEO else \
         ["original", "standard", "thumbnail", "encoded", "normal"]
-    ok = [a for a in assets if a.get("state") == "available"]
+    ok = [a for a in assets if a.get("state") == "available" and _eligible_asset(a, mtype)]
     ok.sort(key=lambda a: order.index(v) if (v := a.get("actualVariant") or a.get("variant")) in order else 99)
     return ok[0] if ok else None
 
