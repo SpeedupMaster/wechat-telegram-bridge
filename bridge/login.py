@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import io
 import logging
 import re
@@ -29,6 +30,17 @@ def qr_png(data: str) -> io.BytesIO:
     return buf
 
 
+def _describe_code_delivery(sent) -> str:
+    kind = type(getattr(sent, "type", None)).__name__
+    return {
+        "SentCodeTypeApp": "Telegram 客户端内（系统通知消息）",
+        "SentCodeTypeSms": "手机短信",
+        "SentCodeTypeCall": "语音电话",
+        "SentCodeTypeFragmentSms": "Fragment 短信",
+        "SentCodeTypeFirebaseSms": "手机短信",
+    }.get(kind, "你的 Telegram（或手机短信）")
+
+
 class LoginMixin:
     """Mixed into Bridge. Expects self.user, self.bot, self.wx, self.store, self.cfg."""
 
@@ -39,6 +51,10 @@ class LoginMixin:
         self.login_owner: int | None = None  # Telegram user id that entered the pairing code
         self.login_step: str | None = None  # None / "method" / "phone" / "code" / "password" / "qr"
         self.login_phone = ""
+        self.login_phone_code_hash: str | None = None
+        self.login_delivery = "你的 Telegram（或手机短信）"
+        self.login_code_buf = ""
+        self.login_code_msg_id: int | None = None
         self.login_msgs: list[int] = []  # QR messages to clean up
         self.qr_task: asyncio.Task | None = None
         self.wx_ready = False
@@ -47,6 +63,11 @@ class LoginMixin:
         self.wx_state = "unknown"
         self.owner_id: int | None = None
         self.login_poll_interval = 2.0
+        self._wx_login_phase = ""
+        self._wx_force_qr_restart = False
+        self._wx_force_qr_next = False
+        self._wx_login_interrupt = asyncio.Event()
+        self._wx_login_task: asyncio.Task | None = None
 
     # ======================================================================
     # Telegram account login, driven from the bot's private chat
@@ -70,17 +91,34 @@ class LoginMixin:
                 self.pairing_failures += 1
                 log.warning("Wrong pairing code from Telegram user %s (%d/%d)", sender, self.pairing_failures,
                             MAX_PAIRING_FAILURES)
-                await event.reply("配对码不对。配对码在服务器日志里（docker compose logs telegram-bridge）。")
+                await event.reply("配对码不对。请在服务器日志中查看（docker compose logs telegram-bridge）。")
                 return
             self.login_owner = sender
             await self._ask_method(event)
             return
         if sender != self.login_owner:
             if text == "/start":
-                await event.reply("这个桥还没有完成设置。请发送 /login 配对码（在服务器日志里）。")
+                await event.reply("这个桥还没有完成配对。请先发送 /login 配对码（在服务器日志里）。")
             return
         step = self.login_step
         if step == "phone":
+            msg = getattr(event, "message", None)
+            contact = getattr(msg, "contact", None) or getattr(event, "contact", None)
+            if contact and getattr(contact, "phone_number", None):
+                phone = str(contact.phone_number).strip()
+                if not phone.startswith("+"):
+                    phone = "+" + phone
+                await self._delete_quietly(event)
+                await self._send_tg_code(event.chat_id, phone)
+                return
+            if text == "📷 改用扫码登录":
+                await self.bot.send_message(event.chat_id, "🔄 已切换为扫码登录：", buttons=Button.clear())
+                await self._start_tg_qr(event.chat_id)
+                return
+            if text == "⬅️ 返回选择方式":
+                await self.bot.send_message(event.chat_id, "已返回登录方式选择：", buttons=Button.clear())
+                await self._ask_method(event)
+                return
             await self._login_phone(event, text)
         elif step == "code":
             await self._login_code(event, text)
@@ -93,37 +131,194 @@ class LoginMixin:
         if event.sender_id != self.login_owner or self.tg_ready.is_set():
             await event.answer()
             return
-        data = event.data or b""
+        data = (event.data or b"").decode("utf-8", errors="ignore")
+        if data == "tg:method":
+            was_phone = self.login_step == "phone"
+            self._cancel_qr_task()
+            self.login_code_buf = ""
+            await event.answer()
+            if was_phone:
+                await self.bot.send_message(event.chat_id, "已返回登录方式选择：", buttons=Button.clear())
+            await self._ask_method_chat(event.chat_id, edit_event=None if was_phone else event)
+            return
+        if data == "tg:qr":
+            was_phone = self.login_step == "phone"
+            await event.answer("正在生成二维码…")
+            if was_phone:
+                await self.bot.send_message(event.chat_id, "🔄 已切换为扫码登录：", buttons=Button.clear())
+            await self._start_tg_qr(event.chat_id)
+            return
+        if data == "tg:phone":
+            self._cancel_qr_task()
+            self.login_code_buf = ""
+            await event.answer()
+            await self._ask_phone(event.chat_id)
+            return
+        if data == "tg:resend":
+            if not self.login_phone:
+                await event.answer("请先输入手机号", alert=True)
+                await self._ask_phone(event.chat_id)
+                return
+            await event.answer("正在重新发送验证码…")
+            await self._send_tg_code(event.chat_id, self.login_phone)
+            return
+        if data.startswith("tg:k:"):
+            await self._on_code_key(event, data[5:])
+            return
         await event.answer()
-        if data == b"tg:qr":
-            if self.qr_task and not self.qr_task.done():
-                self.qr_task.cancel()
-            self.login_step = "qr"
-            self.qr_task = asyncio.create_task(self._login_qr(event.chat_id))
-        elif data == b"tg:phone":
-            if self.qr_task and not self.qr_task.done():
-                self.qr_task.cancel()
-            self.login_step = "phone"
-            await self.bot.send_message(event.chat_id, "请发送要登录的 Telegram 账号手机号，带国家码，例如 <code>+8613800000000</code>",
-                                        parse_mode="html")
+
+    def _cancel_qr_task(self) -> None:
+        if self.qr_task and not self.qr_task.done():
+            self.qr_task.cancel()
+
+    async def _start_tg_qr(self, chat_id: int) -> None:
+        self._cancel_qr_task()
+        self.login_step = "qr"
+        self.qr_task = asyncio.create_task(self._login_qr(chat_id))
+
+    @staticmethod
+    def _method_text() -> str:
+        return (
+            "🔗 <b>配对成功</b>\n\n"
+            "接下来登录<b>你的 Telegram 账号</b>（用于自动创建微信群聊与同步状态），请选择方式：\n\n"
+            "• <b>💬 验证码登录（单台手机推荐）</b>：支持一键使用当前手机号，并在机器人键盘上点按输入验证码，"
+            "不会发到聊天记录里，避免被 Telegram 判定泄露作废。\n"
+            "• <b>📷 扫码登录</b>：需在另一台设备（电脑版或网页版）打开本对话，再用手机 Telegram「设置 → 设备 → 关联桌面设备」扫码。"
+        )
+
+    @staticmethod
+    def _method_buttons() -> list[list]:
+        return [[Button.inline("💬 验证码登录（推荐）", b"tg:phone"), Button.inline("📷 扫码登录", b"tg:qr")]]
 
     async def _ask_method(self, event) -> None:
         self.login_step = "method"
-        await event.reply(
-            "配对成功。接下来登录<b>你自己的 Telegram 账号</b>（程序用它来自动建群），请选择方式：\n\n"
-            "• <b>扫码登录</b>：我会发一张二维码，用手机 Telegram 的「设置 → 设备 → 关联桌面设备」扫码。"
-            "二维码需要显示在另一台设备上（比如电脑版或网页版 Telegram 打开这个对话）。\n"
-            "• <b>验证码登录</b>：发手机号，再把收到的验证码<b>用空格隔开</b>发给我。",
-            parse_mode="html", buttons=[[Button.inline("扫码登录", b"tg:qr"), Button.inline("验证码登录", b"tg:phone")]])
+        await event.reply(self._method_text(), parse_mode="html", buttons=self._method_buttons())
+
+    async def _ask_method_chat(self, chat_id: int, *, edit_event=None) -> None:
+        self.login_step = "method"
+        if edit_event is not None and hasattr(edit_event, "edit"):
+            try:
+                await edit_event.edit(self._method_text(), parse_mode="html", buttons=self._method_buttons())
+                return
+            except Exception:
+                pass
+        await self.bot.send_message(chat_id, self._method_text(), parse_mode="html", buttons=self._method_buttons())
+
+    async def _ask_phone(self, chat_id: int) -> None:
+        self.login_step = "phone"
+        await self.bot.send_message(
+            chat_id,
+            "📱 <b>第 1 步：输入手机号</b>\n\n"
+            "• 如果是当前正在使用的 Telegram 账号，可直接点底部「<b>📱 一键使用当前手机号</b>」。\n"
+            "• 也可以手动输入带国家码的手机号（例如 <code>+8613800000000</code>）。",
+            parse_mode="html",
+            buttons=[
+                [Button.request_phone("📱 一键使用当前手机号", resize=True, single_use=True)],
+                [Button.text("📷 改用扫码登录", resize=True, single_use=True),
+                 Button.text("⬅️ 返回选择方式", resize=True, single_use=True)],
+            ],
+        )
+
+    def _code_prompt_text(self, notice: str = "") -> str:
+        slots = " ".join(list(self.login_code_buf) + ["_"] * max(0, 5 - len(self.login_code_buf)))
+        head = f"{notice}\n\n" if notice else ""
+        return (
+            f"{head}"
+            "📩 <b>第 2 步：输入验证码</b>\n"
+            f"已发送至：{html.escape(self.login_delivery)}（<code>{html.escape(self.login_phone)}</code>）\n\n"
+            "请点按下方<b>数字键盘</b>输入（不发聊天消息，防泄露作废）：\n"
+            f"当前输入：<code>{slots}</code>\n\n"
+            "💡 也可以直接回复用空格隔开的数字（如 <code>1 2 3 4 5</code>）。"
+        )
+
+    def _code_keypad_buttons(self) -> list[list]:
+        submit = (
+            Button.inline("✅ 确认登录", b"tg:k:submit")
+            if len(self.login_code_buf) >= 4
+            else Button.inline("⏳ 请输入验证码", b"tg:k:noop")
+        )
+        return [
+            [Button.inline("1", b"tg:k:1"), Button.inline("2", b"tg:k:2"), Button.inline("3", b"tg:k:3")],
+            [Button.inline("4", b"tg:k:4"), Button.inline("5", b"tg:k:5"), Button.inline("6", b"tg:k:6")],
+            [Button.inline("7", b"tg:k:7"), Button.inline("8", b"tg:k:8"), Button.inline("9", b"tg:k:9")],
+            [Button.inline("⌫ 退格", b"tg:k:back"), Button.inline("0", b"tg:k:0"), Button.inline("🗑 清空", b"tg:k:clear")],
+            [submit],
+            [Button.inline("🔄 重发", b"tg:resend"), Button.inline("📱 换号", b"tg:phone"),
+             Button.inline("📷 扫码", b"tg:qr")],
+        ]
+
+    async def _send_code_keypad(self, chat_id: int, notice: str = "") -> None:
+        msg = await self.bot.send_message(
+            chat_id, self._code_prompt_text(notice), parse_mode="html", buttons=self._code_keypad_buttons())
+        self.login_code_msg_id = getattr(msg, "id", None)
+
+    async def _refresh_code_keypad(self, event, notice: str = "") -> None:
+        text = self._code_prompt_text(notice)
+        buttons = self._code_keypad_buttons()
+        if hasattr(event, "edit"):
+            try:
+                await event.edit(text, parse_mode="html", buttons=buttons)
+                return
+            except errors.MessageNotModifiedError:
+                return
+            except Exception:
+                pass
+        if self.login_code_msg_id:
+            try:
+                await self.bot.edit_message(event.chat_id, self.login_code_msg_id, text,
+                                            parse_mode="html", buttons=buttons)
+                return
+            except Exception:
+                pass
+        await self._send_code_keypad(event.chat_id, notice)
+
+    async def _on_code_key(self, event, key: str) -> None:
+        if self.login_step != "code":
+            await event.answer("当前不在验证码输入阶段，请重新操作", alert=True)
+            return
+        if key == "noop":
+            await event.answer("请先在键盘上输入至少 4 位验证码")
+            return
+        if key == "submit":
+            if not 4 <= len(self.login_code_buf) <= 8:
+                await event.answer("请先输入 4-8 位验证码", alert=True)
+                return
+            await event.answer("正在验证登录…")
+            code = self.login_code_buf
+            self.login_code_buf = ""
+            await self._submit_tg_code(event.chat_id, code, keypad_event=event)
+            return
+        if key == "back":
+            if not self.login_code_buf:
+                await event.answer("当前没有已输入的数字")
+                return
+            self.login_code_buf = self.login_code_buf[:-1]
+        elif key == "clear":
+            if not self.login_code_buf:
+                await event.answer("输入框已是空的")
+                return
+            self.login_code_buf = ""
+        elif len(key) == 1 and key.isdigit():
+            if len(self.login_code_buf) >= 8:
+                await event.answer("验证码最多 8 位")
+                return
+            self.login_code_buf += key
+        else:
+            await event.answer()
+            return
+        await event.answer()
+        await self._refresh_code_keypad(event)
 
     async def _login_qr(self, chat_id: int) -> None:
         try:
             qr = await self.user.qr_login()
-            for attempt in range(6):
+            qr_btn = [[Button.inline("💬 改用验证码登录", b"tg:phone")]]
+            for _ in range(6):
                 await self._clear_login_msgs(chat_id)
                 msg = await self.bot.send_file(
                     chat_id, qr_png(qr.url),
-                    caption="用手机 Telegram 扫码：设置 → 设备 → 关联桌面设备。二维码过期后会自动换新的。")
+                    caption="📱 请用手机 Telegram「设置 → 设备 → 关联桌面设备」扫描此二维码（过期会自动刷新）。",
+                    buttons=qr_btn)
                 self.login_msgs.append(msg.id)
                 timeout = max(5.0, qr.expires.timestamp() - time.time())
                 try:
@@ -134,66 +329,129 @@ class LoginMixin:
                 except asyncio.TimeoutError:
                     await qr.recreate()
             await self._clear_login_msgs(chat_id)
-            await self.bot.send_message(chat_id, "二维码多次过期。发送任意消息重新选择登录方式。")
             self.login_step = "method"
+            await self.bot.send_message(
+                chat_id, "⏱ 二维码多次过期，请选择其他方式重试：", buttons=self._method_buttons())
         except errors.SessionPasswordNeededError:
             await self._clear_login_msgs(chat_id)
             self.login_step = "password"
-            await self.bot.send_message(chat_id, "这个账号开了两步验证，请发送密码（我读到后会立即删除这条消息）。")
+            await self.bot.send_message(
+                chat_id,
+                "🔐 <b>已扫码确认，请输入两步验证密码</b>\n我读取后会立即删除你的消息。",
+                parse_mode="html",
+                buttons=[[Button.inline("⬅️ 返回选择方式", b"tg:method")]])
         except asyncio.CancelledError:
             await self._clear_login_msgs(chat_id)
             raise
         except Exception as e:
             log.exception("QR login failed")
-            await self.bot.send_message(chat_id, f"扫码登录出错：{e}\n发送任意消息重新选择登录方式。")
             self.login_step = "method"
+            await self.bot.send_message(
+                chat_id, f"⚠️ 扫码登录出错：{html.escape(str(e))}",
+                parse_mode="html", buttons=self._method_buttons())
 
     async def _login_phone(self, event, text: str) -> None:
         phone = re.sub(r"[^\d+]", "", text)
         if not re.fullmatch(r"\+?\d{6,16}", phone):
-            await event.reply("手机号格式不对，请带国家码，例如 +8613800000000")
+            await event.reply(
+                "手机号格式不对，请带上国家码，例如 <code>+8613800000000</code>",
+                parse_mode="html")
             return
+        await self._send_tg_code(event.chat_id, phone)
+
+    async def _send_tg_code(self, chat_id: int, phone: str) -> None:
+        await self.bot.send_message(chat_id, "⏳ 正在发送验证码…", buttons=Button.clear())
         try:
-            await self.user.send_code_request(phone)
+            sent = await self.user.send_code_request(phone)
         except errors.FloodWaitError as e:
-            await event.reply(f"请求太频繁，Telegram 要求等待 {e.seconds} 秒后再试。")
+            await self.bot.send_message(
+                chat_id, f"⏳ 请求太频繁，Telegram 要求等待 {e.seconds} 秒后再试。",
+                buttons=[[Button.inline("🔄 重试手机号", b"tg:phone"), Button.inline("📷 改用扫码登录", b"tg:qr")]])
             return
         except (errors.PhoneNumberInvalidError, errors.PhoneNumberBannedError) as e:
-            await event.reply(f"这个手机号不能登录：{type(e).__name__}")
+            await self.bot.send_message(
+                chat_id, f"⚠️ 这个手机号无法登录（{type(e).__name__}），请检查后重试。",
+                buttons=[[Button.inline("📱 重新输入手机号", b"tg:phone"), Button.inline("📷 改用扫码登录", b"tg:qr")]])
             return
         self.login_phone = phone
+        self.login_phone_code_hash = getattr(sent, "phone_code_hash", None)
+        self.login_delivery = _describe_code_delivery(sent)
+        self.login_code_buf = ""
         self.login_step = "code"
-        await event.reply("验证码已发到你的 Telegram（或短信）。\n\n"
-                          "⚠️ 请把验证码<b>用空格隔开</b>发给我，例如 <code>1 2 3 4 5</code>。"
-                          "如果原样发送，Telegram 会认为验证码泄露并作废这次登录。", parse_mode="html")
+        await self._send_code_keypad(chat_id)
 
     async def _login_code(self, event, text: str) -> None:
         code = re.sub(r"\D", "", text)
         await self._delete_quietly(event)
         if not 4 <= len(code) <= 8:
-            await event.respond("请发送验证码数字，用空格隔开，例如 1 2 3 4 5")
+            await self._send_code_keypad(event.chat_id, notice="⚠️ 请输入 4-8 位数字验证码：")
             return
+        await self._submit_tg_code(event.chat_id, code)
+
+    async def _clear_code_keypad(self, chat_id: int, status_text: str, keypad_event=None) -> None:
+        if keypad_event is not None and hasattr(keypad_event, "edit"):
+            try:
+                await keypad_event.edit(status_text, buttons=None)
+                self.login_code_msg_id = None
+                return
+            except Exception:
+                pass
+        if self.login_code_msg_id:
+            try:
+                await self.bot.edit_message(chat_id, self.login_code_msg_id, status_text, buttons=None)
+            except Exception:
+                pass
+            self.login_code_msg_id = None
+
+    async def _submit_tg_code(self, chat_id: int, code: str, keypad_event=None) -> None:
+        sign_kw = {"phone": self.login_phone, "code": code}
+        if self.login_phone_code_hash:
+            sign_kw["phone_code_hash"] = self.login_phone_code_hash
         try:
-            await self.user.sign_in(phone=self.login_phone, code=code)
+            await self.user.sign_in(**sign_kw)
         except errors.SessionPasswordNeededError:
             self.login_step = "password"
-            await event.respond("这个账号开了两步验证，请发送密码（我读到后会立即删除这条消息）。")
+            self.login_code_buf = ""
+            await self._clear_code_keypad(chat_id, "✅ 验证码校验通过。", keypad_event=keypad_event)
+            await self.bot.send_message(
+                chat_id,
+                "🔐 <b>第 3 步：输入两步验证密码</b>\n请直接发送密码（我读取后会立即删除该消息）。",
+                parse_mode="html",
+                buttons=[[Button.inline("⬅️ 返回选择方式", b"tg:method")]])
             return
         except errors.PhoneCodeInvalidError:
-            await event.respond("验证码不对，请重新发送（用空格隔开）。")
+            self.login_code_buf = ""
+            notice = "⚠️ 验证码不正确，请重新输入："
+            if keypad_event is not None:
+                await self._refresh_code_keypad(keypad_event, notice=notice)
+            else:
+                await self._send_code_keypad(chat_id, notice=notice)
             return
         except (errors.PhoneCodeExpiredError, errors.SendCodeUnavailableError):
             self.login_step = "phone"
-            await event.respond("验证码已失效（可能是因为原样发送过）。请重新发送手机号获取新的验证码。")
+            self.login_code_buf = ""
+            msg = "⏱ 验证码已失效，请重新获取或更换手机号。"
+            btns = [[Button.inline("🔄 重发验证码", b"tg:resend"), Button.inline("📱 换手机号", b"tg:phone")],
+                    [Button.inline("📷 改用扫码登录", b"tg:qr")]]
+            if keypad_event is not None and hasattr(keypad_event, "edit"):
+                try:
+                    await keypad_event.edit(msg, buttons=btns)
+                    return
+                except Exception:
+                    pass
+            await self.bot.send_message(chat_id, msg, buttons=btns)
             return
-        await self._tg_login_done(event.chat_id)
+        await self._clear_code_keypad(chat_id, "✅ 验证码校验通过，正在完成登录…", keypad_event=keypad_event)
+        await self._tg_login_done(chat_id)
 
     async def _login_password(self, event, text: str) -> None:
         await self._delete_quietly(event)
         try:
             await self.user.sign_in(password=text)
         except errors.PasswordHashInvalidError:
-            await event.respond("两步验证密码不对，请重新发送。")
+            await event.respond(
+                "⚠️ 两步验证密码不正确，请重新发送密码：",
+                buttons=[[Button.inline("⬅️ 返回选择方式", b"tg:method")]])
             return
         await self._tg_login_done(event.chat_id)
 
@@ -201,13 +459,15 @@ class LoginMixin:
         me = await self.user.get_me()
         self.login_step = None
         self.pairing_code = None
+        self.login_code_buf = ""
+        self.login_code_msg_id = None
         name = utils.get_display_name(me)
         log.info("Telegram account logged in through the bot: %s", name)
-        text = f"✅ Telegram 已登录：{name}"
+        text = f"✅ <b>Telegram 已登录</b>：{html.escape(name)}\n\n接下来会自动发起微信登录（支持手机确认或扫码）。"
         if me.id != self.login_owner:
-            text += ("\n\n注意：登录的不是正在跟我对话的这个账号。之后我只听登录账号的命令，"
-                     "微信群和通知也都在那个账号里。")
-        await self.bot.send_message(chat_id, text)
+            text += ("\n\n⚠️ 注意：登录的不是当前对话账号。之后我只响应登录账号的命令，"
+                     "微信群聊与通知也都会在该账号中生成。")
+        await self.bot.send_message(chat_id, text, parse_mode="html", buttons=Button.clear())
         self.tg_ready.set()
 
     async def _clear_login_msgs(self, chat_id: int) -> None:
@@ -239,6 +499,42 @@ class LoginMixin:
             log.warning("Could not message you on Telegram (%s): %s", e, text)
             return None
 
+    def _wx_login_busy_hint(self) -> str:
+        if self._wx_login_phase == "awaiting_scan":
+            return "⏳ 正在等待扫码，请扫描上方发送的二维码。"
+        if self._wx_login_phase == "awaiting_approval":
+            return "⏳ 正在等待手机微信确认，请在手机上点「登录」。"
+        return "⏳ 正在发起微信登录，请稍候…"
+
+    @staticmethod
+    def _wx_login_buttons(*, include_qr: bool = False) -> list[list]:
+        row = [Button.inline("🔑 重新登录微信", b"wxlogin:auto")]
+        if include_qr:
+            row.append(Button.inline("📷 扫码登录", b"wxlogin:qr"))
+        return [row]
+
+    async def _on_wx_login_callback(self, event, mode: str) -> None:
+        if event.sender_id != self.owner_id:
+            await event.answer("只有桥接账号本人可以操作", alert=True)
+            return
+        if mode == "qr":
+            if self.wx_login_lock.locked():
+                if self._wx_login_phase == "awaiting_scan":
+                    await event.answer("已在扫码登录中，请扫描上方二维码")
+                    return
+                self._wx_force_qr_restart = True
+                self._wx_login_interrupt.set()
+                await event.answer("正在切换为扫码登录…")
+                return
+            await event.answer("正在获取登录二维码…")
+            self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=True))
+            return
+        if self.wx_login_lock.locked():
+            await event.answer(self._wx_login_busy_hint())
+            return
+        await event.answer("正在发起微信登录…")
+        self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=False))
+
     async def ensure_wechat(self) -> None:
         delay = 2.0
         while True:
@@ -262,72 +558,128 @@ class LoginMixin:
                         await self.wx.connect()
                     self.wx_ready, self.wx_state = True, "online"
                     return
-                await self.notify("需要登录微信，正在获取二维码…")
-                if await self.wechat_login():
+                await self.notify("🔐 微信尚未登录，正在发起登录（请在手机确认或扫码）…")
+                force_qr = self._wx_force_qr_next
+                self._wx_force_qr_next = False
+                if await self.wechat_login(force_qr=force_qr):
                     self.wx_ready, self.wx_state = True, "online"
                     return
             except (httpx.HTTPError, WeChatError) as e:
                 log.warning("WeChat login step failed: %s", e)
-                await self.notify(f"微信登录出错：{e}。发送 /wxlogin 重试。")
+                await self.notify(
+                    f"⚠️ 微信登录出错：{e}\n点击下方按钮或发送 /wxlogin 重试。",
+                    buttons=self._wx_login_buttons())
             self.wx_login_requested.clear()
             await self.wx_login_requested.wait()
 
     async def wechat_login(self, force_qr: bool = False) -> bool:
         if self.wx_login_lock.locked():
-            await self.notify("正在登录中，请扫描上面的二维码。")
+            await self.notify(self._wx_login_busy_hint())
             return False
         async with self.wx_login_lock:
-            loop = asyncio.get_running_loop()
-            op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=force_qr)
-            last_gen, qr_msg, approval_since, hinted = None, None, None, False
-            deadline = loop.time() + 660
-            try:
-                while loop.time() < deadline:
-                    state, res = op.get("state"), op.get("result") or {}
-                    if state == "succeeded":
-                        info = await self.wx.account_info()
-                        if info.get("connection") == "disconnected":
-                            await self.wx.connect()
-                        await self.notify("✅ 微信已登录。之后收到的微信消息会自动建群转发过来。")
-                        return True
-                    if state in LOGIN_DONE_STATES:
-                        reason = res.get("code") or res.get("reason") or state
-                        await self.notify(f"微信登录没有完成（{reason}）。发送 /wxlogin 重试。")
-                        return False
-                    gen = res.get("qrGeneration")
-                    if state == "awaiting_scan" and res.get("qrAvailable") and gen != last_gen:
-                        try:
-                            png = await self.wx.login_qr(op["id"], gen)
-                        except WeChatError:
-                            png = None
-                        if png:
-                            if qr_msg:
-                                await self._delete_owner_msg(qr_msg)
-                            f = io.BytesIO(png)
-                            f.name = "wechat-qr.png"
-                            qr_msg = await self.notify("📱 用手机微信「扫一扫」扫这个二维码，然后在手机上确认登录。"
-                                                       "二维码过期会自动换新的。", file=f)
-                            last_gen = gen
-                    if state == "awaiting_approval":
-                        if approval_since is None:
-                            approval_since = loop.time()
-                            await self.notify("已扫码，请在手机微信上点「登录」确认。")
-                        elif loop.time() - approval_since > 90 and not hinted:
-                            hinted = True
-                            await self.notify(
-                                "手机确认后一直没反应？有些登录确认需要手机直连服务器的 TCP 8050-8100 端口。"
-                                "可以在 VPS 防火墙/安全组里临时放行这些端口后再试，登录成功后再关掉。")
-                    await asyncio.sleep(self.login_poll_interval)
-                    op = await self.wx.operation(op["id"])
-                await self.notify("微信登录超时。发送 /wxlogin 重试。")
+            current_force_qr = force_qr
+            self._wx_force_qr_restart = False
+            self._wx_login_interrupt.clear()
+            while True:
+                loop = asyncio.get_running_loop()
+                self._wx_login_phase = "starting"
+                op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=current_force_qr)
+                last_gen, qr_msg, approval_since, hinted = None, None, None, False
+                switched_to_qr = False
+                deadline = loop.time() + 660
                 try:
-                    await self.wx.cancel_operation(op["id"])
-                except WeChatError:
-                    pass
-                return False
-            finally:
-                if qr_msg:
-                    await self._delete_owner_msg(qr_msg)
+                    while loop.time() < deadline:
+                        state, res = op.get("state"), op.get("result") or {}
+                        if state == "succeeded":
+                            info = await self.wx.account_info()
+                            if info.get("connection") == "disconnected":
+                                await self.wx.connect()
+                            await self.notify("✅ 微信已登录！之后收到的消息会自动建群并转发到这里。")
+                            return True
+                        if state in LOGIN_DONE_STATES:
+                            if self._wx_force_qr_restart:
+                                self._wx_force_qr_restart = False
+                                current_force_qr = True
+                                switched_to_qr = True
+                                break
+                            reason = res.get("code") or res.get("reason") or state
+                            friendly = {
+                                "cancelled": "已取消",
+                                "expired": "二维码或确认已过期",
+                                "rejected": "已在手机上取消登录",
+                                "timeout": "登录超时",
+                            }.get(str(reason), str(reason))
+                            await self.notify(
+                                f"⚠️ 微信登录未完成（{friendly}）。\n点击下方按钮或发送 /wxlogin 重试。",
+                                buttons=self._wx_login_buttons(include_qr=True))
+                            return False
+                        gen = res.get("qrGeneration")
+                        if state == "awaiting_scan":
+                            self._wx_login_phase = "awaiting_scan"
+                            if res.get("qrAvailable") and gen != last_gen:
+                                try:
+                                    png = await self.wx.login_qr(op["id"], gen)
+                                except WeChatError:
+                                    png = None
+                                if png:
+                                    if qr_msg:
+                                        await self._delete_owner_msg(qr_msg)
+                                    f = io.BytesIO(png)
+                                    f.name = "wechat-qr.png"
+                                    qr_msg = await self.notify(
+                                        "📱 请用手机微信「扫一扫」扫描此二维码登录（过期会自动刷新）。", file=f)
+                                    last_gen = gen
+                        if state == "awaiting_approval":
+                            self._wx_login_phase = "awaiting_approval"
+                            if approval_since is None:
+                                approval_since = loop.time()
+                                if last_gen is not None:
+                                    await self.notify("✅ 已扫码，请在手机微信上点「登录」确认。")
+                                else:
+                                    await self.notify(
+                                        "📱 已向手机微信发送登录确认请求，请在手机微信上点「登录」确认。",
+                                        buttons=[[Button.inline("📷 改用扫码登录", b"wxlogin:qr")]])
+                            elif loop.time() - approval_since > 90 and not hinted:
+                                hinted = True
+                                await self.notify(
+                                    "⏳ 手机确认后一直没反应？\n部分设备确认登录需要手机直连服务器的 TCP "
+                                    "<code>8050-8100</code> 端口，可在 VPS 安全组/防火墙临时放行后再试，"
+                                    "登录成功后再关闭。",
+                                    parse_mode="html")
+                        if self.login_poll_interval > 0:
+                            try:
+                                await asyncio.wait_for(
+                                    self._wx_login_interrupt.wait(), timeout=self.login_poll_interval)
+                            except asyncio.TimeoutError:
+                                pass
+                        else:
+                            await asyncio.sleep(0)
+                        self._wx_login_interrupt.clear()
+                        if self._wx_force_qr_restart:
+                            self._wx_force_qr_restart = False
+                            try:
+                                await self.wx.cancel_operation(op["id"])
+                            except WeChatError:
+                                pass
+                            await self.notify("🔄 正在切换为扫码登录…")
+                            current_force_qr = True
+                            switched_to_qr = True
+                            break
+                        op = await self.wx.operation(op["id"])
+                    if switched_to_qr:
+                        continue
+                    await self.notify(
+                        "⏱ 微信登录超时。\n点击下方按钮或发送 /wxlogin 重试。",
+                        buttons=self._wx_login_buttons(include_qr=True))
+                    try:
+                        await self.wx.cancel_operation(op["id"])
+                    except WeChatError:
+                        pass
+                    return False
+                finally:
+                    self._wx_login_phase = ""
+                    if qr_msg:
+                        await self._delete_owner_msg(qr_msg)
 
     async def _delete_owner_msg(self, msg) -> None:
         try:
@@ -335,19 +687,27 @@ class LoginMixin:
         except Exception:
             pass
 
-    async def request_wechat_login(self) -> None:
-        """/wxlogin: retry the initial login, or log in again after WeChat signed this device out."""
+    async def request_wechat_login(self, force_qr: bool = False) -> None:
+        """/wxlogin or login button: retry initial login or re-authenticate after WeChat signs out."""
         if self.wx_login_lock.locked():
-            await self.notify("正在登录中，请扫描上面的二维码。")
+            if force_qr and self._wx_login_phase != "awaiting_scan":
+                self._wx_force_qr_restart = True
+                self._wx_login_interrupt.set()
+                await self.notify("🔄 正在切换为扫码登录…")
+            else:
+                await self.notify(self._wx_login_busy_hint())
             return
         if not self.wx_ready:
+            self._wx_force_qr_next = force_qr
             self.wx_login_requested.set()
             return
         try:
-            if await self.wechat_login():
+            if await self.wechat_login(force_qr=force_qr):
                 self.wx_state = "online"
         except (httpx.HTTPError, WeChatError) as e:
-            await self.notify(f"微信登录出错：{e}")
+            await self.notify(
+                f"⚠️ 微信登录出错：{e}\n点击下方按钮或发送 /wxlogin 重试。",
+                buttons=self._wx_login_buttons())
 
     async def wechat_monitor(self, interval: float = 60.0) -> None:
         """Tell the owner when WeChat goes offline or gets signed out, and when it is back."""
@@ -366,7 +726,9 @@ class LoginMixin:
             if not auth:
                 if self.wx_state != "signed_out":
                     self.wx_state = "signed_out"
-                    await self.notify("⚠️ 微信已退出登录（可能在手机上被移除了这台设备）。发送 /wxlogin 重新扫码登录。")
+                    await self.notify(
+                        "⚠️ 微信已退出登录（可能在手机上移除了这台设备）。\n点击下方按钮或发送 /wxlogin 重新登录。",
+                        buttons=self._wx_login_buttons())
             elif conn == "disconnected":
                 try:
                     await self.wx.connect()

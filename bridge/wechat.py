@@ -136,6 +136,10 @@ class WeChatClient:
     async def thread(self, thread_id: str) -> dict:
         return await self._req("GET", self._a(f"threads/{_id(thread_id)}"))
 
+    async def list_threads(self, limit: int = 20) -> list[dict]:
+        data = await self._req("GET", self._a("threads"), params={"limit": limit})
+        return data.get("items", [])
+
     async def message(self, message_id: str) -> dict:
         return await self._req("GET", self._a(f"messages/{_id(message_id)}"))
 

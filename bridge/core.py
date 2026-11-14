@@ -50,58 +50,62 @@ async def wav_to_ogg(data: bytes) -> bytes | None:
 
 
 HELP = (
-    "<b>微信 ↔ Telegram 桥</b>\n\n"
-    "每个微信会话会自动对应一个 Telegram 群。在群里直接发消息就会发到对应的微信会话；"
-    "回复某条消息会变成微信里的引用回复。\n\n"
-    "私聊我可用的命令：\n"
-    "/find 关键词 — 搜索微信联系人和群\n"
-    "/open 微信ID — 为这个联系人/群建立 Telegram 群（主动发起聊天）\n"
-    "/chats [关键词] — 查看已连接的会话列表（别名 /list）\n"
-    "/link 微信ID TG群ID — 手动把现有 Telegram 群绑定到微信会话\n"
-    "/status — 查看桥的运行状态\n"
-    "/wxlogin — 重新扫码登录微信（掉线或被踢下线时用）\n"
-    "/help — 显示这份帮助\n\n"
-    "在桥接群里可用：\n"
-    "/wx — 查看这个群对应的微信会话\n"
-    "/members [关键词] — 查看微信群成员（可点按复制 @名字，别名 /at）\n"
-    "/recall — 回复某条消息发送以撤回微信消息\n"
-    "/avatar — 重新获取微信头像作为群头像\n"
-    "/rename — 同步最新微信备注/群名到当前群标题（别名 /title）\n"
-    "/unlink — 解除当前群与微信会话的绑定\n"
-    "/help — 显示群内命令帮助\n\n"
-    "在微信群对应的群里发 @成员名 或 @所有人 会触发微信里的 @ 提醒。\n"
-    "在群里删除你从 Telegram 发出的消息也会尝试自动撤回微信消息（2 分钟内有效）。\n"
-    "以 // 开头的消息只留在 Telegram，不会发到微信。"
+    "<b>微信 ↔ Telegram 桥接指南</b>\n\n"
+    "每个微信会话对应一个 Telegram 群：在群里发消息即发送到微信，<b>回复</b>消息即微信引用回复。\n\n"
+    "<b>私聊命令</b>\n"
+    "• <code>/find</code> [关键词] — 搜索微信联系人/群（不填显示最近会话，点按钮直接打开）\n"
+    "• <code>/open</code> [关键词] — 为微信联系人/群建群并主动发起聊天\n"
+    "• <code>/chats</code> [关键词] — 查看已连接的会话列表（别名 <code>/list</code>）\n"
+    "• <code>/link</code> [关键词] — 点选或搜索绑定现有 Telegram 群与微信会话（无需查 ID）\n"
+    "• <code>/status</code> — 查看运行状态与微信登录态\n"
+    "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
+    "• <code>/help</code> — 显示这份帮助\n\n"
+    "<b>群内命令</b>\n"
+    "• <code>/link</code> [关键词] — 在任意群内直接发，把当前群绑定到微信会话\n"
+    "• <code>/wx</code> — 查看当前群对应的微信会话\n"
+    "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
+    "• <code>/avatar</code> — 同步微信头像为群头像\n"
+    "• <code>/rename</code> — 同步微信备注/群名为群标题（别名 <code>/title</code>）\n"
+    "• <code>/unlink</code> — 解除当前群与微信会话的绑定\n"
+    "• <code>/help</code> — 显示群内帮助\n\n"
+    "<b>常用技巧</b>\n"
+    "• 群内发送 <code>@成员名</code> 或 <code>@所有人</code> 可触发微信 @ 提醒\n"
+    "• 删除已发消息或回复 <code>/recall</code> 可自动撤回微信消息（2 分钟内有效）\n"
+    "• 以 <code>//</code> 开头的内容仅留在 Telegram，不会发到微信\n"
+    "• 图片默认原图收发；发文件选原图也会按原图送达微信；支持贴纸与来电一键拒接"
 )
 
 GROUP_HELP = (
-    "<b>桥接群可用命令</b>\n"
-    "/wx — 查看这个群对应的微信会话\n"
-    "/members [关键词] — 查看微信群成员（可点按复制 @名字，别名 /at）\n"
-    "/recall — 回复某条消息发送以撤回微信消息\n"
-    "/avatar — 重新获取微信头像作为群头像\n"
-    "/rename — 同步最新微信备注/群名到当前群标题（别名 /title）\n"
-    "/unlink — 解除当前群与微信会话的绑定\n"
-    "/help — 显示群内命令帮助\n\n"
-    "提示：发 @成员名 或 @所有人 可触发微信 @ 提醒；删除已发消息或回复 /recall 可撤回（2 分钟内）；以 // 开头的内容只留在 Telegram。"
+    "<b>桥接群命令</b>\n"
+    "• <code>/wx</code> — 查看当前群对应的微信会话\n"
+    "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
+    "• <code>/avatar</code> — 同步微信头像为群头像\n"
+    "• <code>/rename</code> — 同步最新微信备注/群名为群标题（别名 <code>/title</code>）\n"
+    "• <code>/link</code> [关键词] — 重新绑定当前群到其他微信会话\n"
+    "• <code>/unlink</code> — 解除当前群与微信会话的绑定\n"
+    "• <code>/help</code> — 显示群内帮助\n\n"
+    "💡 发 <code>@成员名</code> / <code>@所有人</code> 可微信提醒；删消息或回复 <code>/recall</code> 可撤回；<code>//</code> 开头仅留在 Telegram。"
 )
 
 PRIVATE_BOT_COMMANDS = [
-    ("find", "搜索微信联系人和群"),
-    ("open", "为微信会话建立 Telegram 群"),
+    ("find", "搜索微信联系人或群（可一键建群）"),
+    ("open", "为微信会话建群发起聊天"),
     ("chats", "查看已连接的会话列表"),
-    ("link", "手动绑定微信ID与TG群ID"),
-    ("status", "查看桥的运行状态"),
-    ("wxlogin", "重新扫码登录微信"),
-    ("help", "查看使用帮助"),
+    ("link", "选择绑定微信会话与TG群"),
+    ("status", "查看运行与微信在线状态"),
+    ("wxlogin", "重新登录微信（手机确认或扫码）"),
+    ("help", "查看使用指南"),
 ]
 
 GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
-    ("members", "查看微信群成员（用于 @ 提醒）"),
-    ("recall", "回复某条消息以撤回微信消息"),
-    ("avatar", "重新同步微信头像到群头像"),
+    ("members", "查看群成员（点按复制 @名字）"),
+    ("recall", "回复消息以撤回微信消息"),
+    ("avatar", "同步微信头像到群头像"),
     ("rename", "同步最新微信名称到群标题"),
+    ("link", "绑定或切换当前群对应的微信会话"),
     ("unlink", "解除当前群与微信的绑定"),
     ("help", "查看群内命令帮助"),
 ]
@@ -412,6 +416,8 @@ class Bridge(LoginMixin):
         self._call_tokens: dict[str, str] = {}
         self._conf_invites: dict[str, dict] = {}
         self._calls_retry_sleep: float = 300.0
+        self._ui_tokens: dict[str, dict] = {}
+        self._link_wait: dict | None = None
 
     # ======================================================================
     # startup
@@ -461,6 +467,9 @@ class Bridge(LoginMixin):
 
         self.user.add_event_handler(self.on_tg_message, events.NewMessage(
             outgoing=True, func=lambda e: self.store.thread_for_chat(e.chat_id) is not None))
+        self.user.add_event_handler(self.on_tg_unlinked_command, events.NewMessage(
+            outgoing=True, func=lambda e: not e.is_private and self.store.thread_for_chat(e.chat_id) is None
+            and (e.raw_text or "").lstrip().startswith("/")))
         self.user.add_event_handler(self.on_tg_delete, events.MessageDeleted())
         self.user.add_event_handler(self.on_raw_update, events.Raw(types.UpdateNewMessage))
         self.user.add_event_handler(self.on_user_sees_bot_message, events.NewMessage(
@@ -481,8 +490,15 @@ class Bridge(LoginMixin):
             if not self.tg_ready.is_set():
                 await self.on_login_message(event)
             return
-        if event.sender_id == self.owner_id and (event.raw_text or "").startswith("/"):
+        if event.sender_id != self.owner_id:
+            return
+        raw = event.raw_text or ""
+        if raw.startswith("/"):
+            self._link_wait = None
             await self.on_bot_command(event)
+            return
+        if self._link_wait and raw.strip():
+            await self._on_link_search_input(event, raw.strip())
 
     async def on_bot_callback(self, event) -> None:
         if not self.tg_ready.is_set():
@@ -491,6 +507,12 @@ class Bridge(LoginMixin):
         data = event.data or b""
         if data.startswith(b"callrej:"):
             await self._on_call_reject_callback(event, data[8:].decode("utf-8", errors="ignore"))
+            return
+        if data.startswith(b"ui:"):
+            await self._on_ui_callback(event, data[3:].decode("utf-8", errors="ignore"))
+            return
+        if data.startswith(b"wxlogin:"):
+            await self._on_wx_login_callback(event, data[8:].decode("utf-8", errors="ignore"))
             return
         await event.answer()
 
@@ -783,7 +805,7 @@ class Bridge(LoginMixin):
         outgoing = msg.get("direction") == "outgoing"
         header = ""
         if outgoing:
-            header = "🙋 <b>我</b>（手机端）：\n"
+            header = "<b>我</b>（手机端）：\n"
         elif thread.get("kind") == "group" and msg.get("senderId"):
             header = f"<b>{_esc(await self._sender_name(msg))}</b>：\n"
 
@@ -1436,6 +1458,9 @@ class Bridge(LoginMixin):
                     f"已解除当前群与微信会话 <code>{_esc(thread_id)}</code> 的绑定。",
                     parse_mode="html", reply_to=msg.id)
                 return
+            if cmd_name == "/link":
+                await self._handle_group_link(event, arg.strip())
+                return
             if cmd_name == "/help":
                 await self.bot.send_message(chat_id, GROUP_HELP, parse_mode="html", reply_to=msg.id)
                 return
@@ -1694,6 +1719,338 @@ class Bridge(LoginMixin):
                 log.info("Telegram group %s was upgraded to supergroup %s", old, new)
 
     # ======================================================================
+    # interactive UI & bot commands (zero-ID /link, /find, /open)
+    # ======================================================================
+    def _make_ui_token(self, payload: dict) -> bytes:
+        if len(self._ui_tokens) >= 400:
+            for k in list(self._ui_tokens)[:200]:
+                self._ui_tokens.pop(k, None)
+        token = secrets.token_hex(6)
+        self._ui_tokens[token] = payload
+        return f"ui:{token}".encode()
+
+    async def _wx_search_candidates(self, query: str, limit: int = 10) -> list[dict]:
+        q = query.strip()
+        items: list[dict] = []
+        seen: set[str] = set()
+
+        def add(raw: dict, default_kind: str | None = None) -> None:
+            tid = str(raw.get("id") or "").strip()
+            if not tid or tid in seen:
+                return
+            seen.add(tid)
+            kind = raw.get("kind") or default_kind or ("group" if tid.endswith("@chatroom") else "direct")
+            name = (raw.get("displayName") or raw.get("remark") or raw.get("nickname") or tid).strip()
+            items.append({"id": tid, "name": name, "kind": kind})
+
+        if not q:
+            try:
+                for t in await self.wx.list_threads(limit=limit):
+                    add(t)
+            except WeChatError as e:
+                log.debug("list_threads failed: %s", e.code)
+            return items[:limit]
+
+        if " " not in q:
+            try:
+                add(await self.wx.thread(q))
+            except WeChatError:
+                pass
+        try:
+            for c in await self.wx.search_contacts(q, limit=limit):
+                add(c, "direct")
+        except WeChatError as e:
+            log.debug("search_contacts failed: %s", e.code)
+        try:
+            for g in await self.wx.search_groups(q, limit=limit):
+                add(g, "group")
+        except WeChatError as e:
+            log.debug("search_groups failed: %s", e.code)
+        if len(items) < limit:
+            ql = q.lower()
+            try:
+                for t in await self.wx.list_threads(limit=30):
+                    name = str(t.get("displayName") or "")
+                    tid = str(t.get("id") or "")
+                    if ql in name.lower() or ql in tid.lower():
+                        add(t)
+            except WeChatError:
+                pass
+        return items[:limit]
+
+    async def _list_tg_groups(self, limit: int = 12) -> list[tuple[int, str, str | None]]:
+        iter_dialogs = getattr(self.user, "iter_dialogs", None)
+        if not callable(iter_dialogs):
+            return []
+        unlinked: list[tuple[int, str, str | None]] = []
+        linked: list[tuple[int, str, str | None]] = []
+        try:
+            async for d in iter_dialogs(limit=80):
+                if not getattr(d, "is_group", False):
+                    continue
+                cid = d.id
+                title = (getattr(d, "title", None) or getattr(d, "name", None) or str(cid)).strip()
+                wx_id = self.store.thread_for_chat(cid)
+                entry = (cid, title, wx_id)
+                (linked if wx_id else unlinked).append(entry)
+        except Exception as e:
+            log.info("Could not list Telegram dialogs: %s", e)
+            return []
+        return (unlinked + linked)[:limit]
+
+    def _wx_picker_buttons(self, cands: list[dict], *, action: str, extra: dict | None = None,
+                           current_chat: int | None = None) -> list[list]:
+        rows: list[list] = []
+        for c in cands[:8]:
+            icon = "👥" if c["kind"] == "group" else "👤"
+            linked_chat = self.store.chat_for_thread(c["id"])
+            if current_chat is not None and linked_chat == current_chat:
+                suffix = "（当前）"
+            elif linked_chat is not None:
+                suffix = "（已绑）"
+            else:
+                suffix = ""
+            payload = {"action": action, "wx_id": c["id"], "wx_name": c["name"], "kind": c["kind"], **(extra or {})}
+            rows.append([Button.inline(f"{icon} {c['name'][:22]}{suffix}", self._make_ui_token(payload))])
+        rows.append([Button.inline("❌ 取消", self._make_ui_token({"action": "cancel"}))])
+        return rows
+
+    def _tg_picker_buttons(self, groups: list[tuple[int, str, str | None]], *, action: str,
+                           extra: dict | None = None) -> list[list]:
+        rows: list[list] = []
+        for cid, title, wx_id in groups[:10]:
+            prefix = "🔗" if wx_id else "💬"
+            suffix = "（已绑）" if wx_id else ""
+            payload = {"action": action, "tg_chat": cid, "tg_title": title, **(extra or {})}
+            rows.append([Button.inline(f"{prefix} {title[:22]}{suffix}", self._make_ui_token(payload))])
+        rows.append([Button.inline("❌ 取消", self._make_ui_token({"action": "cancel"}))])
+        return rows
+
+    async def _send_group_bot_message(self, chat_id: int, text: str, *, reply_to: int | None = None,
+                                      buttons=None, silent: bool = False):
+        try:
+            return await self.bot.send_message(
+                chat_id, text, parse_mode="html", reply_to=reply_to, buttons=buttons, silent=silent)
+        except Exception as e:
+            if not _dead_chat(e):
+                raise
+        try:
+            if chat_id < -1000000000000:
+                await self.user(functions.channels.InviteToChannelRequest(
+                    channel=await self.user.get_input_entity(chat_id), users=[self.bot_input]))
+            else:
+                await self.user(functions.messages.AddChatUserRequest(
+                    chat_id=utils.resolve_id(chat_id)[0], user_id=self.bot_input, fwd_limit=0))
+        except Exception as inv_err:
+            log.info("Could not invite bot to group %s: %s", chat_id, inv_err)
+            return None
+        try:
+            return await self.bot.send_message(
+                chat_id, text, parse_mode="html", reply_to=None, buttons=buttons, silent=silent)
+        except Exception as e2:
+            log.info("Bot still could not send to group %s after invite: %s", chat_id, e2)
+            return None
+
+    async def _send_group_notice(self, chat_id: int, reply_to: int | None, text: str, buttons=None) -> None:
+        sent = await self._send_group_bot_message(chat_id, text, reply_to=reply_to, buttons=buttons)
+        if sent is None and hasattr(self.user, "send_message"):
+            try:
+                await self.user.send_message(
+                    chat_id, f"⚠️ 请先把 @{self.bot_me.username} 拉进这个群，再发送 /link", reply_to=reply_to)
+            except Exception as e:
+                log.info("Fallback user notice in %s failed: %s", chat_id, e)
+
+    async def on_tg_unlinked_command(self, event) -> None:
+        msg = event.message
+        if not msg or msg.action or msg.via_bot_id:
+            return
+        text = (msg.message or "").strip()
+        cmd, _, arg = text.partition(" ")
+        cmd_name, _, at_bot = cmd.partition("@")
+        if at_bot and at_bot.lower() != self.bot_me.username.lower():
+            return
+        if cmd_name.lower() == "/link":
+            await self._handle_group_link(event, arg.strip())
+
+    async def _handle_group_link(self, event, arg: str) -> None:
+        chat_id = event.chat_id
+        msg_id = event.message.id
+        if not self.wx_ready:
+            await self._send_group_notice(chat_id, msg_id, "微信还没有登录，请先在私聊中扫码或发 /wxlogin。")
+            return
+        chat_obj = getattr(event, "chat", None)
+        if chat_obj is None and hasattr(event, "get_chat"):
+            try:
+                chat_obj = await event.get_chat()
+            except Exception:
+                chat_obj = None
+        tg_title = (getattr(chat_obj, "title", None) or str(chat_id)).strip()
+        cands = await self._wx_search_candidates(arg, limit=10)
+        if arg and " " not in arg:
+            exact = next((c for c in cands if c["id"] == arg), None)
+            if exact:
+                wx_title, _ = await self._complete_link(exact["id"], chat_id, exact["name"], notify_group=False)
+                await self._send_group_notice(
+                    chat_id, msg_id,
+                    f"✅ 已将当前群绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(exact['id'])}</code>")
+                return
+        if not cands:
+            hint = (f"没有找到匹配「{_esc(arg)}」的微信联系人或群。" if arg
+                    else "暂时没有获取到最近的微信会话，请发 <code>/link 关键词</code> 搜索。")
+            await self._send_group_notice(chat_id, msg_id, hint)
+            return
+        buttons = self._wx_picker_buttons(
+            cands, action="link_bind", extra={"tg_chat": chat_id, "tg_title": tg_title, "in_group": True},
+            current_chat=chat_id)
+        header = f"<b>搜索「{_esc(arg)}」的结果</b>" if arg else "<b>选择要绑定到此群的微信会话</b>"
+        tip = "点下方按钮即可绑定（也可发 <code>/link 关键词</code> 缩小范围）："
+        await self._send_group_notice(chat_id, msg_id, f"{header}\n{tip}", buttons=buttons)
+
+    async def _complete_link(self, wx_id: str, tg_chat: int, wx_name: str = "",
+                             *, notify_group: bool = False) -> tuple[str, bool]:
+        title = wx_name.strip()
+        if not title and self.wx_ready:
+            try:
+                title = (await self.wx.thread(wx_id)).get("displayName") or ""
+            except WeChatError:
+                if not wx_id.endswith("@chatroom"):
+                    try:
+                        title = (await self.wx.contact(wx_id)).get("displayName") or ""
+                    except WeChatError:
+                        pass
+        title = title or wx_id
+        self.store.link(wx_id, tg_chat, title)
+        bot_ok = True
+        if notify_group:
+            sent = await self._send_group_bot_message(
+                tg_chat,
+                f"🔗 已将此群绑定到微信会话：<b>{_esc(title)}</b>\n<code>{_esc(wx_id)}</code>",
+                silent=True)
+            bot_ok = sent is not None
+        return title, bot_ok
+
+    async def _edit_ui_msg(self, event, text: str, buttons=None) -> None:
+        if hasattr(event, "edit"):
+            try:
+                await event.edit(text, parse_mode="html", buttons=buttons)
+                return
+            except errors.MessageNotModifiedError:
+                return
+            except Exception:
+                pass
+        chat_id = getattr(event, "chat_id", None) or self.owner_id
+        if chat_id is not None:
+            await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons)
+
+    async def _on_link_search_input(self, event, query: str) -> None:
+        wait = self._link_wait
+        if not wait or wait.get("mode") != "search_wx":
+            return
+        if not self.wx_ready:
+            self._link_wait = None
+            await event.reply("微信还没有登录，请先扫描我发的二维码，或发 /wxlogin。")
+            return
+        cands = await self._wx_search_candidates(query, limit=10)
+        if not cands:
+            cancel_btn = [[Button.inline("❌ 取消", self._make_ui_token({"action": "cancel"}))]]
+            await event.reply(
+                f"没有找到匹配「{_esc(query)}」的微信联系人或群，请换个关键词重试：",
+                parse_mode="html", buttons=cancel_btn)
+            return
+        tg_chat, tg_title = wait["tg_chat"], wait["tg_title"]
+        buttons = self._wx_picker_buttons(
+            cands, action="link_bind", extra={"tg_chat": tg_chat, "tg_title": tg_title, "in_group": False},
+            current_chat=tg_chat)
+        await event.reply(
+            f"搜索「<b>{_esc(query)}</b>」的结果（将绑定到 <b>{_esc(tg_title)}</b>）：",
+            parse_mode="html", buttons=buttons)
+
+    async def _on_ui_callback(self, event, token: str) -> None:
+        if event.sender_id != self.owner_id:
+            await event.answer("只有桥接账号本人可以操作", alert=True)
+            return
+        payload = self._ui_tokens.get(token)
+        if not payload:
+            await event.answer("按钮已过期，请重新发送命令", alert=True)
+            return
+        action = payload.get("action")
+        if action == "cancel":
+            self._link_wait = None
+            await self._edit_ui_msg(event, "已取消操作。")
+            await event.answer("已取消")
+            return
+        if action == "open_wx":
+            if not self.wx_ready:
+                await event.answer("微信还没有登录，请先 /wxlogin", alert=True)
+                return
+            wx_id = payload["wx_id"]
+            existed = self.store.chat_for_thread(wx_id) is not None
+            try:
+                thread = await self.wx.thread(wx_id)
+            except WeChatError:
+                thread = {"id": wx_id, "kind": payload.get("kind", "direct"),
+                          "displayName": payload.get("name") or wx_id}
+            await self.ensure_chat(thread)
+            title = self._title(thread)
+            msg = (f"ℹ️ <b>{_esc(title)}</b> 已经有对应的 Telegram 群了" if existed
+                   else f"✅ 已建立 Telegram 群：<b>{_esc(title)}</b>")
+            await self._edit_ui_msg(event, msg)
+            await event.answer("已有群" if existed else "已建群")
+            return
+        if action == "link_pick_tg":
+            if not self.wx_ready:
+                await event.answer("微信还没有登录，请先 /wxlogin", alert=True)
+                return
+            tg_chat, tg_title = payload["tg_chat"], payload["tg_title"]
+            self._link_wait = {"mode": "search_wx", "tg_chat": tg_chat, "tg_title": tg_title}
+            cands = await self._wx_search_candidates("", limit=8)
+            buttons = self._wx_picker_buttons(
+                cands, action="link_bind", extra={"tg_chat": tg_chat, "tg_title": tg_title, "in_group": False},
+                current_chat=tg_chat)
+            prompt = (
+                f"已选 Telegram 群：<b>{_esc(tg_title)}</b>\n\n"
+                + ("请点选下方最近的微信会话，或<b>直接回复微信名称/关键词</b>搜索："
+                   if cands else "请<b>直接回复微信名称/关键词</b>搜索要绑定的会话：")
+            )
+            await self._edit_ui_msg(event, prompt, buttons=buttons)
+            await event.answer()
+            return
+        if action == "link_pick_wx":
+            wx_id, wx_name = payload["wx_id"], payload["wx_name"]
+            groups = await self._list_tg_groups(limit=12)
+            if not groups:
+                await self._edit_ui_msg(
+                    event,
+                    f"已选微信会话：<b>{_esc(wx_name)}</b>\n\n"
+                    f"未检测到可选择的 Telegram 群。请直接到目标 Telegram 群里发送 <code>/link {_esc(wx_id)}</code>。")
+                await event.answer()
+                return
+            buttons = self._tg_picker_buttons(
+                groups, action="link_bind", extra={"wx_id": wx_id, "wx_name": wx_name, "in_group": False})
+            await self._edit_ui_msg(
+                event, f"已选微信会话：<b>{_esc(wx_name)}</b>\n\n请点选要绑定的 Telegram 群：", buttons=buttons)
+            await event.answer()
+            return
+        if action == "link_bind":
+            self._link_wait = None
+            wx_id = payload["wx_id"]
+            wx_name = payload.get("wx_name") or ""
+            tg_chat = payload["tg_chat"]
+            tg_title = payload.get("tg_title") or str(tg_chat)
+            in_group = bool(payload.get("in_group"))
+            wx_title, bot_ok = await self._complete_link(wx_id, tg_chat, wx_name, notify_group=not in_group)
+            if in_group:
+                text = f"✅ 已将当前群绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>"
+            else:
+                text = f"✅ 已绑定：<b>{_esc(tg_title)}</b> ↔ <b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>"
+                if not bot_ok:
+                    text += f"\n\n⚠️ 机器人暂未进入该群，请把 @{_esc(self.bot_me.username)} 拉进「{_esc(tg_title)}」后再使用。"
+            await self._edit_ui_msg(event, text)
+            await event.answer("绑定成功")
+            return
+        await event.answer()
+
+    # ======================================================================
     # bot commands (private chat with the bot, from you only)
     # ======================================================================
     async def on_bot_command(self, event) -> None:
@@ -1724,52 +2081,129 @@ class Bridge(LoginMixin):
                 await event.reply("\n".join(lines) + suffix, parse_mode="html")
             elif cmd == "/link":
                 parts = arg.split()
-                if len(parts) != 2:
-                    return await event.reply("用法：/link 微信ID TG群ID")
-                wx_id, tg_raw = parts
-                try:
-                    tg_chat = int(tg_raw)
-                except ValueError:
-                    return await event.reply("TG群ID 必须是数字（例如 -1001234567890 或 -512345678）")
-                title = wx_id
-                if self.wx_ready:
+                if len(parts) == 2:
                     try:
-                        title = (await self.wx.thread(wx_id)).get("displayName") or wx_id
-                    except WeChatError:
-                        if not wx_id.endswith("@chatroom"):
-                            try:
-                                title = (await self.wx.contact(wx_id)).get("displayName") or wx_id
-                            except WeChatError:
-                                pass
-                self.store.link(wx_id, tg_chat, title)
+                        tg_chat = int(parts[1])
+                    except ValueError:
+                        tg_chat = None
+                    if tg_chat is not None:
+                        wx_id = parts[0]
+                        wx_title, _ = await self._complete_link(wx_id, tg_chat, notify_group=False)
+                        await event.reply(
+                            f"已绑定：<b>{_esc(wx_title)}</b> (<code>{_esc(wx_id)}</code> ↔ <code>{tg_chat}</code>)",
+                            parse_mode="html")
+                        return
+                if not self.wx_ready:
+                    return await event.reply(
+                        "🔐 微信尚未登录，请先在手机确认或扫码，也可点击下方按钮重新登录。",
+                        buttons=self._wx_login_buttons())
+                if arg:
+                    cands = await self._wx_search_candidates(arg, limit=10)
+                    if not cands:
+                        return await event.reply(
+                            f"没有找到匹配「{_esc(arg)}」的微信联系人或群。\n"
+                            "💡 也可以直接发送 <code>/link</code> 选择 Telegram 群，或到目标群里直接发送 <code>/link</code>。",
+                            parse_mode="html")
+                    buttons = self._wx_picker_buttons(cands, action="link_pick_wx")
+                    return await event.reply(
+                        f"<b>搜索「{_esc(arg)}」的结果</b>\n请先点选要绑定的微信会话：",
+                        parse_mode="html", buttons=buttons)
+                groups = await self._list_tg_groups(limit=12)
+                if not groups:
+                    return await event.reply(
+                        "没有检测到可选择的 Telegram 群。\n\n"
+                        "💡 <b>最简单的绑定方式</b>：直接到你要绑定的 Telegram 群里发送 <code>/link</code>。\n"
+                        "也可以先发送 <code>/link 微信名称</code> 搜索微信会话。",
+                        parse_mode="html")
+                buttons = self._tg_picker_buttons(groups, action="link_pick_tg")
                 await event.reply(
-                    f"已绑定：<b>{_esc(title)}</b> (<code>{_esc(wx_id)}</code> ↔ <code>{tg_chat}</code>)",
-                    parse_mode="html")
+                    "<b>绑定 Telegram 群与微信会话</b>\n\n"
+                    "💡 <b>最省事的方式</b>：直接在目标 Telegram 群里发 <code>/link</code>（无需查 ID）。\n\n"
+                    "也可以点选下方 Telegram 群（未绑定的群排在前面）：",
+                    parse_mode="html", buttons=buttons)
             elif cmd == "/wxlogin":
-                await self.request_wechat_login()
+                await self.request_wechat_login(force_qr=(arg.lower() in ("qr", "scan")))
             elif cmd in ("/find", "/open") and not self.wx_ready:
-                await event.reply("微信还没有登录。请先扫描我发的二维码，或发 /wxlogin。")
+                await event.reply(
+                    "🔐 微信尚未登录，请先在手机确认或扫码，也可点击下方按钮重新登录。",
+                    buttons=self._wx_login_buttons())
             elif cmd == "/find":
-                if not arg:
-                    return await event.reply("用法：/find 关键词")
-                contacts = await self.wx.search_contacts(arg)
-                groups = await self.wx.search_groups(arg)
-                lines = [f"👤 {_esc(c.get('displayName'))} — <code>{_esc(c['id'])}</code>" for c in contacts]
-                lines += [f"👥 {_esc(g.get('displayName'))} — <code>{_esc(g['id'])}</code>" for g in groups]
-                await event.reply("\n".join(lines[:40]) + "\n\n用 /open 微信ID 建群" if lines else "没有找到",
-                                  parse_mode="html")
+                cands = await self._wx_search_candidates(arg, limit=15 if arg else 10)
+                if not cands:
+                    return await event.reply("没有找到匹配的微信联系人或群" if arg else "暂时没有获取到最近的微信会话")
+                lines = []
+                for c in cands:
+                    icon = "👥" if c["kind"] == "group" else "👤"
+                    tag = "（已建群）" if self.store.chat_for_thread(c["id"]) is not None else ""
+                    lines.append(f"{icon} <b>{_esc(c['name'])}</b>{tag} — <code>{_esc(c['id'])}</code>")
+                buttons = []
+                for c in cands[:8]:
+                    has_chat = self.store.chat_for_thread(c["id"]) is not None
+                    lbl = f"{'💬 打开' if has_chat else '➕ 建群'}：{c['name'][:22]}"
+                    tok = self._make_ui_token(
+                        {"action": "open_wx", "wx_id": c["id"], "name": c["name"], "kind": c["kind"]})
+                    buttons.append([Button.inline(lbl, tok)])
+                header = (f"<b>搜索「{_esc(arg)}」的结果</b>（点按钮可直接建群）：\n\n" if arg
+                          else "<b>最近的微信会话</b>（点按钮可直接建群）：\n\n")
+                await event.reply(header + "\n".join(lines), parse_mode="html", buttons=buttons)
             elif cmd == "/open":
                 if not arg:
-                    return await event.reply("用法：/open 微信ID（先用 /find 查）")
-                try:
-                    thread = await self.wx.thread(arg)
-                except WeChatError:
-                    kind = "group" if arg.endswith("@chatroom") else "direct"
-                    name = (await self.wx.contact(arg)).get("displayName") if kind == "direct" else arg
-                    thread = {"id": arg, "kind": kind, "displayName": name or arg}
-                existed = self.store.chat_for_thread(arg) is not None
-                chat = await self.ensure_chat(thread)
-                await event.reply("这个会话已经有群了" if existed else f"已建群：{_esc(self._title(thread))}",
-                                  parse_mode="html")
+                    cands = await self._wx_search_candidates("", limit=10)
+                    if not cands:
+                        return await event.reply("暂时没有获取到最近的微信会话，请直接发 <code>/open 微信名称</code> 搜索。",
+                                                 parse_mode="html")
+                    buttons = [
+                        [Button.inline(
+                            f"{'💬' if self.store.chat_for_thread(c['id']) is not None else '➕'} {c['name'][:24]}",
+                            self._make_ui_token(
+                                {"action": "open_wx", "wx_id": c["id"], "name": c["name"], "kind": c["kind"]})
+                        )]
+                        for c in cands[:8]
+                    ]
+                    buttons.append([Button.inline("❌ 取消", self._make_ui_token({"action": "cancel"}))])
+                    return await event.reply("请点选要发起聊天的微信会话（也可直接发 <code>/open 关键词</code>）：",
+                                             parse_mode="html", buttons=buttons)
+                thread = None
+                if " " not in arg:
+                    try:
+                        thread = await self.wx.thread(arg)
+                    except WeChatError:
+                        pass
+                if thread is None:
+                    cands = await self._wx_search_candidates(arg, limit=10)
+                    if not cands and " " not in arg and arg.startswith(("wxid_", "gh_")):
+                        try:
+                            contact = await self.wx.contact(arg)
+                            cands = [{"id": arg, "name": contact.get("displayName") or arg, "kind": "direct"}]
+                        except WeChatError:
+                            pass
+                    if not cands:
+                        return await event.reply(f"没有找到与「{_esc(arg)}」匹配的微信联系人或群")
+                    exact = next((c for c in cands if c["id"] == arg), None)
+                    if exact or len(cands) == 1:
+                        chosen = exact or cands[0]
+                        try:
+                            thread = await self.wx.thread(chosen["id"])
+                        except WeChatError:
+                            thread = {"id": chosen["id"], "kind": chosen["kind"], "displayName": chosen["name"]}
+                    else:
+                        buttons = [
+                            [Button.inline(
+                                f"{'💬' if self.store.chat_for_thread(c['id']) is not None else '➕'} {c['name'][:24]}",
+                                self._make_ui_token(
+                                    {"action": "open_wx", "wx_id": c["id"], "name": c["name"], "kind": c["kind"]})
+                            )]
+                            for c in cands[:8]
+                        ]
+                        buttons.append([Button.inline("❌ 取消", self._make_ui_token({"action": "cancel"}))])
+                        return await event.reply(
+                            f"找到多个匹配「<b>{_esc(arg)}</b>」的会话，请点选：",
+                            parse_mode="html", buttons=buttons)
+                existed = self.store.chat_for_thread(thread["id"]) is not None
+                await self.ensure_chat(thread)
+                await event.reply(
+                    f"这个会话已经有群了：<b>{_esc(self._title(thread))}</b>" if existed
+                    else f"已建群：<b>{_esc(self._title(thread))}</b>",
+                    parse_mode="html")
         except WeChatError as e:
             await event.reply(f"出错：{e.code}")

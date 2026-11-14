@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-from telethon import functions, types
+from telethon import errors, functions, types
 
 from bridge.config import BridgeConfig, Config, TelegramConfig, WeChatConfig
 from bridge.core import Bridge
@@ -36,6 +36,7 @@ class FakeDaemon:
     def __init__(self):
         self.messages: dict[str, dict] = {}
         self.threads: dict[str, dict] = {}
+        self.contacts: dict[str, dict] = {}
         self.sends: list[tuple[dict, str]] = []
         self.uploads: list[tuple[str, bytes]] = []
         self.sticker_preparations: list[tuple[dict, str]] = []
@@ -59,6 +60,9 @@ class FakeDaemon:
     def add_thread(self, tid, name, kind="direct"):
         self.threads[tid] = {"id": tid, "accountId": ACC, "peerId": tid, "kind": kind, "displayName": name,
                              "unreadCount": 1, "readStateVersion": "v1"}
+
+    def add_contact(self, cid, name):
+        self.contacts[cid] = {"id": cid, "displayName": name}
 
     def add_message(self, mid, tid, body="hi", type_=1, direction="incoming", sender=None, server=None, **extra):
         self.messages[mid] = {"id": mid, "accountId": ACC, "threadId": tid, "serverId": server, "type": type_,
@@ -116,6 +120,9 @@ class FakeDaemon:
                 raw, ctype = self.media_bytes[rest[1]]
                 return httpx.Response(200, content=raw, headers={"content-type": ctype})
             return httpx.Response(200, content=b"\x89PNG", headers={"content-type": "image/png"})
+        if rest[0] == "threads" and len(rest) == 1:
+            limit = int(request.url.params.get("limit", "20"))
+            return httpx.Response(200, json={"items": list(self.threads.values())[:limit]})
         if rest[0] == "threads" and len(rest) == 2:
             t = self.threads.get(rest[1])
             return httpx.Response(200, json=t) if t else httpx.Response(404, json={"error": {"code": "not_found"}})
@@ -137,6 +144,11 @@ class FakeDaemon:
                     return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
                 return httpx.Response(200, content=AVATAR, headers={"content-type": "image/png"})
             return httpx.Response(404, json={"error": {"code": "avatar_unavailable"}})
+        if rest[0] == "groups" and len(rest) == 1:
+            q = (request.url.params.get("search") or "").lower()
+            items = [t for t in self.threads.values() if t.get("kind") == "group" and (
+                not q or q in (t.get("displayName") or "").lower() or q in t["id"].lower())]
+            return httpx.Response(200, json={"items": items})
         if rest[0] == "groups" and rest[2] == "members" and len(rest) == 3:
             members = self.group_members.get(rest[1], [])
             cur = request.url.params.get("cursor")
@@ -147,7 +159,14 @@ class FakeDaemon:
             return httpx.Response(200, json={"items": members, "nextCursor": None})
         if rest[0] == "groups" and rest[2] == "members":
             return httpx.Response(200, json={"state": "present", "member": {"displayName": "Alice in group"}})
+        if rest[0] == "contacts" and len(rest) == 1:
+            q = (request.url.params.get("search") or "").lower()
+            pool = {**{k: v for k, v in self.threads.items() if v.get("kind") != "group"}, **self.contacts}
+            items = [c for c in pool.values() if not q or q in (c.get("displayName") or "").lower() or q in c["id"].lower()]
+            return httpx.Response(200, json={"items": items})
         if rest[0] == "contacts":
+            if rest[1] in self.contacts:
+                return httpx.Response(200, json=self.contacts[rest[1]])
             return httpx.Response(200, json={"id": rest[1], "displayName": "Contact " + rest[1]})
         if rest[0] == "uploads" and m == "POST":
             self.uploads.append((request.headers["content-type"], request.content))
@@ -215,6 +234,7 @@ class FakeBot:
         self.sent: list[Sent] = []
         self.edited: list[tuple[int, int, str, dict]] = []
         self.commands: list = []
+        self.dead_chats: set[int] = set()
 
     async def __call__(self, request):
         if isinstance(request, functions.bots.SetBotCommandsRequest):
@@ -223,6 +243,8 @@ class FakeBot:
         raise AssertionError(f"unexpected bot request {request}")
 
     async def send_message(self, chat, text, **kw):
+        if chat in self.dead_chats:
+            raise ValueError("Could not find the input entity")
         s = Sent(chat, text=text, kwargs=kw)
         self.sent.append(s)
         return s
@@ -248,6 +270,18 @@ class FakeUser:
         self.created: list[str] = []
         self.photos: list = []
         self.titles: list = []
+        self.dialogs: list = []
+        self.invited: list[int] = []
+        self.sent_msgs: list[tuple[int, str]] = []
+        self.on_invite = None
+
+    async def iter_dialogs(self, limit=80):
+        for d in self.dialogs[:limit]:
+            yield d
+
+    async def send_message(self, chat, text, **kw):
+        self.sent_msgs.append((chat, text))
+        return Sent(chat, text=text, kwargs=kw)
 
     async def __call__(self, request):
         if isinstance(request, functions.messages.CreateChatRequest):
@@ -261,6 +295,16 @@ class FakeUser:
             return None
         if isinstance(request, functions.messages.EditChatTitleRequest):
             self.titles.append((request.chat_id, request.title))
+            return None
+        if isinstance(request, functions.messages.AddChatUserRequest):
+            self.invited.append(-request.chat_id)
+            if self.on_invite:
+                self.on_invite(-request.chat_id)
+            return None
+        if isinstance(request, functions.channels.InviteToChannelRequest):
+            self.invited.append(request.channel)
+            if self.on_invite:
+                self.on_invite(request.channel)
             return None
         raise AssertionError(f"unexpected request {request}")
 
@@ -574,7 +618,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.event("out1", "wxid_bob", direction="outgoing")
         s = self.b.bot.sent[-1]
         self.assertIn("from phone", s.text)
-        self.assertIn("我", s.text)
+        self.assertTrue(s.text.startswith("<b>我</b>（手机端）：\n"))
         self.assertTrue(s.kwargs["silent"])
 
     async def test_commands_and_double_slash_not_forwarded(self):
@@ -782,6 +826,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(types.BotCommandScopeChats, scopes)
         self.assertIn("chats", [c for c, _ in scopes[types.BotCommandScopeUsers]])
         self.assertIn("rename", [c for c, _ in scopes[types.BotCommandScopeChats]])
+        self.assertIn("link", [c for c, _ in scopes[types.BotCommandScopeChats]])
 
         replies = []
 
@@ -825,6 +870,153 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await private_cmd(f"/link wxid_alice {chat}")
         self.assertEqual(self.b.store.thread_for_chat(chat), "wxid_alice")
         self.assertIn("已绑定", replies[-1])
+
+    async def test_interactive_link_private_and_group(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 999
+        self.b.wx_ready = True
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_thread("123@chatroom", "Product Team", kind="group")
+        self.daemon.add_contact("wxid_charlie", "Charlie Zhang")
+
+        # Existing linked group + two unlinked Telegram groups
+        self.b.store.link("wxid_alice", -501, "Alice")
+        self.b.user.dialogs = [
+            SimpleNamespace(id=-501, title="Alice", is_group=True),
+            SimpleNamespace(id=-777, title="My Work Group", is_group=True),
+            SimpleNamespace(id=-888, title="Family Chat", is_group=True),
+            SimpleNamespace(id=12345, title="Private DM", is_group=False),
+        ]
+
+        def btn_data(btn):
+            return btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+
+        def make_private_ev(text):
+            sent_box = []
+            async def reply(msg, **kw):
+                sent_box.append((msg, kw))
+                return SimpleNamespace(text=msg, kwargs=kw)
+            return SimpleNamespace(sender_id=999, raw_text=text, reply=reply), sent_box
+
+        # 1) Private /link (no args): lists TG groups with unlinked first
+        ev, box = make_private_ev("/link")
+        await self.b.on_bot_private(ev)
+        text, kw = box[-1]
+        self.assertIn("点选下方 Telegram 群", text)
+        buttons = kw["buttons"]
+        self.assertEqual(buttons[0][0].text, "💬 My Work Group")
+        self.assertIn("（已绑）", buttons[2][0].text)
+
+        # Unauthorized callback click is rejected
+        unauth = _CallbackEvent(111, btn_data(buttons[0][0]))
+        await self.b.on_bot_callback(unauth)
+        self.assertEqual(unauth.answers, [("只有桥接账号本人可以操作", True)])
+
+        # Pick "My Work Group" -> enters WeChat search/recent picker
+        cb_tg = _CallbackEvent(999, btn_data(buttons[0][0]))
+        await self.b.on_bot_callback(cb_tg)
+        self.assertIn("My Work Group", cb_tg.edits[-1][0])
+        self.assertIsNotNone(self.b._link_wait)
+
+        # User types a WeChat name in private chat instead of picking from recent
+        ev_kw, box_kw = make_private_ev("Charlie")
+        await self.b.on_bot_private(ev_kw)
+        kw_text, kw_opts = box_kw[-1]
+        self.assertIn("Charlie", kw_text)
+        charlie_btn = kw_opts["buttons"][0][0]
+        self.assertIn("Charlie Zhang", charlie_btn.text)
+
+        # Click Charlie -> binds wxid_charlie <-> -777 and notifies the group
+        cb_bind = _CallbackEvent(999, btn_data(charlie_btn))
+        await self.b.on_bot_callback(cb_bind)
+        self.assertEqual(self.b.store.thread_for_chat(-777), "wxid_charlie")
+        self.assertIsNone(self.b._link_wait)
+        self.assertIn("Charlie Zhang", cb_bind.edits[-1][0])
+        self.assertEqual(self.b.bot.sent[-1].chat, -777)
+
+        # 2) Private /link <keyword>: search WeChat first, then pick TG group
+        ev2, box2 = make_private_ev("/link Product")
+        await self.b.on_bot_private(ev2)
+        wx_btn = box2[-1][1]["buttons"][0][0]
+        self.assertIn("Product Team", wx_btn.text)
+        cb_wx = _CallbackEvent(999, btn_data(wx_btn))
+        await self.b.on_bot_callback(cb_wx)
+        tg_btns = cb_wx.edits[-1][1]["buttons"]
+        family_btn = next(r[0] for r in tg_btns if "Family Chat" in r[0].text)
+        cb_bind2 = _CallbackEvent(999, btn_data(family_btn))
+        await self.b.on_bot_callback(cb_bind2)
+        self.assertEqual(self.b.store.thread_for_chat(-888), "123@chatroom")
+
+        # 3) Sending /link directly inside an UNLINKED group where bot is not yet a member
+        self.b.bot.dead_chats.add(-999)
+        self.b.user.on_invite = lambda cid: self.b.bot.dead_chats.discard(cid)
+        unlinked_other_cmd = tg_event(-999, 1, "/help")
+        unlinked_other_cmd.is_private = False
+        await self.b.on_tg_unlinked_command(unlinked_other_cmd)
+        self.assertEqual(self.b.user.invited, [])  # unrelated /commands in unlinked groups are ignored
+
+        unlinked_link = tg_event(-999, 2, "/link Alice")
+        unlinked_link.is_private = False
+        unlinked_link.chat = SimpleNamespace(title="New Manual Group")
+        await self.b.on_tg_unlinked_command(unlinked_link)
+        self.assertEqual(self.b.user.invited, [-999])
+        group_picker = self.b.bot.sent[-1]
+        self.assertEqual(group_picker.chat, -999)
+        alice_btn = group_picker.kwargs["buttons"][0][0]
+        cb_group_bind = _CallbackEvent(999, btn_data(alice_btn))
+        await self.b.on_bot_callback(cb_group_bind)
+        self.assertEqual(self.b.store.thread_for_chat(-999), "wxid_alice")
+        self.assertIn("已将当前群绑定到微信会话", cb_group_bind.edits[-1][0])
+
+        # 4) Sending /link inside an already-linked group switches its binding
+        await self.b.on_tg_message(tg_event(-999, 3, "/link Charlie"))
+        charlie_group_btn = self.b.bot.sent[-1].kwargs["buttons"][0][0]
+        cb_rebind = _CallbackEvent(999, btn_data(charlie_group_btn))
+        await self.b.on_bot_callback(cb_rebind)
+        self.assertEqual(self.b.store.thread_for_chat(-999), "wxid_charlie")
+
+    async def test_find_and_open_without_raw_ids(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 999
+        self.b.wx_ready = True
+        self.daemon.add_thread("wxid_alice", "Alice Wang")
+        self.daemon.add_thread("wxid_alan", "Alan Wu")
+        self.daemon.add_contact("wxid_david", "David Li")
+
+        def btn_data(btn):
+            return btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+
+        boxes = []
+        async def cmd(text):
+            ev = SimpleNamespace(sender_id=999, raw_text=text)
+            async def reply(msg, **kw):
+                boxes.append((msg, kw))
+                return SimpleNamespace(text=msg, kwargs=kw)
+            ev.reply = reply
+            await self.b.on_bot_private(ev)
+
+        # /find with no args shows recent threads with one-click buttons
+        await cmd("/find")
+        text, kw = boxes[-1]
+        self.assertIn("最近的微信会话", text)
+        self.assertIn("Alice Wang", text)
+        alice_btn = kw["buttons"][0][0]
+        cb_open = _CallbackEvent(999, btn_data(alice_btn))
+        await self.b.on_bot_callback(cb_open)
+        self.assertIsNotNone(self.b.store.chat_for_thread("wxid_alice"))
+        self.assertIn("已建立 Telegram 群", cb_open.edits[-1][0])
+
+        # /open with unambiguous keyword opens directly without needing wxid
+        await cmd("/open David")
+        self.assertIn("已建群：<b>David Li</b>", boxes[-1][0])
+        self.assertIsNotNone(self.b.store.chat_for_thread("wxid_david"))
+
+        # /open with no args or ambiguous keyword shows buttons
+        await cmd("/open")
+        self.assertIn("请点选要发起聊天的微信会话", boxes[-1][0])
+        await cmd("/open A")
+        self.assertIn("找到多个匹配", boxes[-1][0])
+        self.assertGreaterEqual(len(boxes[-1][1]["buttons"]), 3)  # Alice + Alan + Cancel
 
     async def test_wechat_topics_and_emojis_rendered(self):
         self.daemon.add_thread("wxid_alice", "Alice")
@@ -938,6 +1130,9 @@ class LoginDaemon:
                     {"state": "awaiting_scan", "result": {"qrGeneration": 2, "qrAvailable": True}},
                     {"state": "awaiting_approval", "result": {}},
                     {"state": "succeeded", "result": {}}]
+        self.ops_by_strategy: dict[str, list[dict]] = {}
+        self.login_strategies: list[str] = []
+        self.cancelled_ops: list[str] = []
         self.qr_fetches: list[str] = []
         self.connected = False
 
@@ -957,9 +1152,17 @@ class LoginDaemon:
             return httpx.Response(200, json={})
         if path == f"accounts/{ACC}/auth/login":
             assert request.headers["idempotency-key"]
+            strategy = json.loads(request.content).get("strategy", "auto")
+            self.login_strategies.append(strategy)
+            if strategy in self.ops_by_strategy:
+                self.ops = list(self.ops_by_strategy[strategy])
             return httpx.Response(202, json={"id": "op1", "kind": "login", **self.ops[0]})
+        if path == f"accounts/{ACC}/operations/op1" and m == "DELETE":
+            self.cancelled_ops.append("op1")
+            return httpx.Response(200, json={})
         if path == f"accounts/{ACC}/operations/op1":
-            self.ops.pop(0)
+            if len(self.ops) > 1:
+                self.ops.pop(0)
             if self.ops[0]["state"] == "succeeded":
                 self.authenticated = True
             return httpx.Response(200, json={"id": "op1", **self.ops[0]})
@@ -1062,6 +1265,326 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         await self.b.on_bot_private(ev(8, "+8613800000000"))  # a stranger cannot drive the login
         self.assertEqual(len(replies), n)
         self.assertEqual(self.b.login_step, "method")
+
+    async def test_phone_push_approval_copy_and_switch_to_qr(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        await self.b.wx.resolve_account()
+
+        # Phone push confirmation skips awaiting_scan completely -> must NOT say "已扫码"
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "awaiting_approval", "result": {}},
+            ],
+            "qr": [
+                {"state": "awaiting_scan", "result": {"qrGeneration": 1, "qrAvailable": True}},
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+        self.b.login_poll_interval = 0.05
+
+        def btn_data(btn):
+            return btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+
+        login_task = asyncio.create_task(self.b.request_wechat_login())
+        # Wait until the awaiting_approval phone push message is sent
+        for _ in range(50):
+            if any("登录确认请求" in (s.text or "") for s in self.b.bot.sent):
+                break
+            await asyncio.sleep(0.01)
+
+        push_msg = next(s for s in self.b.bot.sent if s.text and "登录确认请求" in s.text)
+        self.assertNotIn("已扫码", push_msg.text)
+        switch_btn = push_msg.kwargs["buttons"][0][0]
+        self.assertIn("扫码登录", switch_btn.text)
+
+        # Clicking "改用扫码登录" switches immediately to strategy="qr" and completes
+        cb = _CallbackEvent(42, btn_data(switch_btn))
+        await self.b.on_bot_callback(cb)
+        await login_task
+
+        self.assertEqual(self.daemon.login_strategies, ["auto", "qr"])
+        self.assertEqual(self.daemon.cancelled_ops, ["op1"])
+        self.assertEqual(self.b.wx_state, "online")
+        texts = [s.text for s in self.b.bot.sent if s.text]
+        self.assertTrue(any("✅ 已扫码" in t for t in texts))
+        self.assertIn("微信已登录", texts[-1])
+
+    async def test_signed_out_notification_has_login_button(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        await self.b.wx.resolve_account()
+
+        def btn_data(btn):
+            return btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        for _ in range(50):
+            if self.b.wx_state == "signed_out" and self.b.bot.sent:
+                break
+            await asyncio.sleep(0.01)
+        mon.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await mon
+
+        alert = self.b.bot.sent[-1]
+        self.assertIn("微信已退出登录", alert.text)
+        login_btn = alert.kwargs["buttons"][0][0]
+        self.assertIn("重新登录", login_btn.text)
+        self.assertEqual(btn_data(login_btn), b"wxlogin:auto")
+
+        # Stranger clicking the login button is rejected
+        unauth = _CallbackEvent(111, btn_data(login_btn))
+        await self.b.on_bot_callback(unauth)
+        self.assertEqual(unauth.answers, [("只有桥接账号本人可以操作", True)])
+        self.assertEqual(self.daemon.login_strategies, [])
+
+        # Owner clicking the login button launches WeChat login and restores online state
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+        auth_cb = _CallbackEvent(42, btn_data(login_btn))
+        await self.b.on_bot_callback(auth_cb)
+        self.assertIsNotNone(self.b._wx_login_task)
+        await self.b._wx_login_task
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertTrue(self.daemon.authenticated)
+
+    async def test_telegram_code_login_keypad_one_tap_phone_and_2fa(self):
+        from telethon import errors, types
+
+        deleted_events = []
+
+        class AuthUser(FakeUser):
+            def __init__(self):
+                super().__init__()
+                self.code_requests: list[str] = []
+                self.sign_ins: list[dict] = []
+                self.send_types = [
+                    SimpleNamespace(phone_code_hash="h1", type=types.auth.SentCodeTypeApp(length=5)),
+                    SimpleNamespace(phone_code_hash="h2", type=types.auth.SentCodeTypeSms(length=5)),
+                ]
+
+            async def send_code_request(self, phone):
+                self.code_requests.append(phone)
+                return self.send_types[len(self.code_requests) - 1]
+
+            async def sign_in(self, **kw):
+                self.sign_ins.append(kw)
+                if "password" in kw:
+                    if kw["password"] != "goodpass":
+                        raise errors.PasswordHashInvalidError(request=None)
+                    return
+                if kw["code"] == "99999":
+                    raise errors.PhoneCodeInvalidError(request=None)
+                if kw["code"] == "12345":
+                    raise errors.SessionPasswordNeededError(request=None)
+
+            async def get_me(self):
+                return SimpleNamespace(id=7, first_name="Owner", last_name=None, username="owner")
+
+        self.b.user = AuthUser()
+        self.b.start_pairing()
+        code = self.b.pairing_code
+
+        replies = []
+
+        def make_ev(sender, text="", *, contact=None):
+            async def reply(msg, **kw):
+                replies.append((sender, msg, kw))
+                return SimpleNamespace(text=msg, kwargs=kw)
+
+            async def delete():
+                deleted_events.append((sender, text, contact is not None))
+
+            return SimpleNamespace(
+                sender_id=sender, chat_id=sender, raw_text=text,
+                message=SimpleNamespace(contact=contact),
+                reply=reply, respond=reply, delete=delete,
+            )
+
+        # Pair -> method chooser
+        await self.b.on_bot_private(make_ev(7, f"/login {code}"))
+        self.assertEqual(self.b.login_step, "method")
+
+        # Stranger callback ignored
+        stranger_cb = _CallbackEvent(99, b"tg:phone")
+        await self.b.on_bot_callback(stranger_cb)
+        self.assertEqual(self.b.login_step, "method")
+        self.assertEqual(stranger_cb.answers, [(None, False)])
+
+        # Owner picks verification code login -> one-tap phone ReplyKeyboard
+        await self.b.on_bot_callback(_CallbackEvent(7, b"tg:phone"))
+        self.assertEqual(self.b.login_step, "phone")
+        phone_prompt = self.b.bot.sent[-1]
+        self.assertIn("一键使用当前手机号", phone_prompt.text)
+        self.assertIsInstance(phone_prompt.kwargs["buttons"][0][0].button.type, types.ButtonTypeRequestPhone)
+
+        # Invalid manual phone rejected
+        await self.b.on_bot_private(make_ev(7, "abc"))
+        self.assertIn("手机号格式不对", replies[-1][1])
+
+        # One-tap contact sharing deletes contact message and displays inline keypad
+        contact = SimpleNamespace(phone_number="8613800138000")
+        await self.b.on_bot_private(make_ev(7, "", contact=contact))
+        self.assertIn((7, "", True), deleted_events)
+        self.assertEqual(self.b.user.code_requests, ["+8613800138000"])
+        self.assertEqual(self.b.login_step, "code")
+        keypad_msg = self.b.bot.sent[-1]
+        self.assertIn("Telegram 客户端内", keypad_msg.text)
+        self.assertIn("<code>_ _ _ _ _</code>", keypad_msg.text)
+        self.assertEqual(keypad_msg.kwargs["buttons"][4][0].type.data, b"tg:k:noop")
+
+        # Tapping noop before 4 digits or back on empty buffer
+        noop_cb = _CallbackEvent(7, b"tg:k:noop")
+        await self.b.on_bot_callback(noop_cb)
+        self.assertIn("至少 4 位", noop_cb.answers[0][0])
+        back_empty_cb = _CallbackEvent(7, b"tg:k:back")
+        await self.b.on_bot_callback(back_empty_cb)
+        self.assertIn("没有已输入的数字", back_empty_cb.answers[0][0])
+
+        # Tapping digits + backspace updates keypad in place and unlocks confirm
+        for key in ("1", "2", "3", "back", "9", "4", "5"):
+            cb = _CallbackEvent(7, f"tg:k:{key}".encode())
+            await self.b.on_bot_callback(cb)
+        last_edit_text, last_edit_kw = cb.edits[-1]
+        self.assertIn("<code>1 2 9 4 5</code>", last_edit_text)
+        self.assertEqual(last_edit_kw["buttons"][4][0].type.data, b"tg:k:submit")
+
+        # Clear empties buffer
+        clear_cb = _CallbackEvent(7, b"tg:k:clear")
+        await self.b.on_bot_callback(clear_cb)
+        self.assertIn("<code>_ _ _ _ _</code>", clear_cb.edits[-1][0])
+
+        # Wrong code via keypad resets buffer with error notice
+        for key in ("9", "9", "9", "9", "9", "submit"):
+            err_cb = _CallbackEvent(7, f"tg:k:{key}".encode())
+            await self.b.on_bot_callback(err_cb)
+        self.assertIn("验证码不正确", err_cb.edits[-1][0])
+        self.assertIn("<code>_ _ _ _ _</code>", err_cb.edits[-1][0])
+
+        # Resend code uses new delivery channel label (SMS)
+        await self.b.on_bot_callback(_CallbackEvent(7, b"tg:resend"))
+        self.assertEqual(self.b.user.code_requests, ["+8613800138000", "+8613800138000"])
+        self.assertIn("手机短信", self.b.bot.sent[-1].text)
+
+        # Valid code triggering 2FA clears keypad and enters password step
+        for key in ("1", "2", "3", "4", "5", "submit"):
+            ok_cb = _CallbackEvent(7, f"tg:k:{key}".encode())
+            await self.b.on_bot_callback(ok_cb)
+        self.assertEqual(self.b.user.sign_ins[-1], {"phone": "+8613800138000", "code": "12345", "phone_code_hash": "h2"})
+        self.assertIsNone(ok_cb.edits[-1][1]["buttons"])
+        self.assertEqual(self.b.login_step, "password")
+        self.assertIn("两步验证密码", self.b.bot.sent[-1].text)
+
+        # Wrong password -> deleted and prompts retry; right password -> completes login
+        await self.b.on_bot_private(make_ev(7, "badpass"))
+        self.assertIn((7, "badpass", False), deleted_events)
+        self.assertIn("密码不正确", replies[-1][1])
+        await self.b.on_bot_private(make_ev(7, "goodpass"))
+        self.assertIn((7, "goodpass", False), deleted_events)
+        self.assertTrue(self.b.tg_ready.is_set())
+        self.assertIsNone(self.b.login_step)
+        self.assertIn("Telegram 已登录", self.b.bot.sent[-1].text)
+        self.assertIsInstance(self.b.bot.sent[-1].kwargs["buttons"], types.ReplyKeyboardHide)
+
+    async def test_telegram_login_method_switching_and_text_code_fallback(self):
+        from datetime import datetime, timedelta, timezone
+        from telethon import types
+
+        qr_wait_started = asyncio.Event()
+        qr_cancelled = False
+
+        class FakeQR:
+            url = "tg://login?token=abc"
+            expires = datetime.now(timezone.utc) + timedelta(minutes=2)
+
+            async def wait(self, timeout=None):
+                nonlocal qr_cancelled
+                qr_wait_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    qr_cancelled = True
+                    raise
+
+            async def recreate(self):
+                pass
+
+        class AuthUser(FakeUser):
+            def __init__(self):
+                super().__init__()
+                self.sign_ins: list[dict] = []
+
+            async def qr_login(self):
+                return FakeQR()
+
+            async def send_code_request(self, phone):
+                return SimpleNamespace(phone_code_hash="h9", type=types.auth.SentCodeTypeApp(length=5))
+
+            async def sign_in(self, **kw):
+                self.sign_ins.append(kw)
+
+            async def get_me(self):
+                return SimpleNamespace(id=7, first_name="Owner", last_name=None, username="owner")
+
+        self.b.user = AuthUser()
+        self.b.start_pairing()
+        deleted = []
+
+        def make_ev(sender, text):
+            async def reply(msg, **kw):
+                return SimpleNamespace(text=msg, kwargs=kw)
+
+            async def delete():
+                deleted.append(text)
+
+            return SimpleNamespace(
+                sender_id=sender, chat_id=sender, raw_text=text,
+                message=SimpleNamespace(contact=None), reply=reply, respond=reply, delete=delete,
+            )
+
+        await self.b.on_bot_private(make_ev(7, f"/login {self.b.pairing_code}"))
+        await self.b.on_bot_callback(_CallbackEvent(7, b"tg:phone"))
+        self.assertEqual(self.b.login_step, "phone")
+
+        # Switch from phone ReplyKeyboard button to QR login
+        await self.b.on_bot_private(make_ev(7, "📷 改用扫码登录"))
+        await asyncio.wait_for(qr_wait_started.wait(), timeout=1.0)
+        self.assertEqual(self.b.login_step, "qr")
+        qr_msg = next(s for s in self.b.bot.sent if s.file is not None)
+        self.assertEqual(qr_msg.kwargs["buttons"][0][0].type.data, b"tg:phone")
+
+        # Switch back from QR inline button to verification code login -> cancels QR task & clears QR msg
+        await self.b.on_bot_callback(_CallbackEvent(7, b"tg:phone"))
+        await asyncio.sleep(0)
+        self.assertTrue(qr_cancelled)
+        self.assertIn(qr_msg.id, self.b.bot.deleted)
+        self.assertEqual(self.b.login_step, "phone")
+
+        # Manual phone + spaced text verification code fallback still works and clears keypad buttons
+        await self.b.on_bot_private(make_ev(7, "+8613900001111"))
+        self.assertEqual(self.b.login_step, "code")
+        keypad_id = self.b.login_code_msg_id
+        await self.b.on_bot_private(make_ev(7, " 1 2 3 4 5 "))
+        self.assertIn(" 1 2 3 4 5 ", deleted)
+        self.assertEqual(self.b.user.sign_ins[-1], {"phone": "+8613900001111", "code": "12345", "phone_code_hash": "h9"})
+        self.assertTrue(any(cid == 7 and mid == keypad_id and kw.get("buttons") is None
+                            for cid, mid, _, kw in self.b.bot.edited))
+        self.assertTrue(self.b.tg_ready.is_set())
 
 
 if __name__ == "__main__":
@@ -1332,13 +1855,18 @@ class _FakeCallsSocket:
 
 
 class _CallbackEvent:
-    def __init__(self, sender_id: int, data: bytes):
+    def __init__(self, sender_id: int, data: bytes, chat_id: int | None = None):
         self.sender_id = sender_id
+        self.chat_id = sender_id if chat_id is None else chat_id
         self.data = data
         self.answers: list[tuple[str | None, bool]] = []
+        self.edits: list[tuple[str, dict]] = []
 
     async def answer(self, message: str | None = None, *, alert: bool = False) -> None:
         self.answers.append((message, alert))
+
+    async def edit(self, text: str, **kw) -> None:
+        self.edits.append((text, kw))
 
 
 class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
