@@ -1224,6 +1224,88 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(alert5.kwargs["reply_to"], 555)
         self.assertEqual(alert5.text, "⚠️ 发送「hello」到微信失败：ReadTimeout")
 
+    async def test_location_single_venue_message_and_fallback(self):
+        from unittest import mock
+
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_thread("123@chatroom", "饭局群", kind="group")
+        self.daemon.add_contact("wxid_amir", "Amir")
+        self.b.store.link("wxid_alice", -1001, "Alice")
+        self.b.store.link("123@chatroom", -1002, "饭局群")
+
+        # 1) Direct chat location -> single InputMediaVenue message
+        self.daemon.add_message(
+            "loc1", "wxid_alice", "", type_=48,
+            location={"name": "新粤新疆菜", "address": "体育西路191号佳兆业广场F3-301",
+                      "latitude": 23.133, "longitude": 113.321},
+        )
+        before = len(self.b.bot.sent)
+        await self.event("loc1", "wxid_alice")
+        self.assertEqual(len(self.b.bot.sent) - before, 1)
+        m1 = self.b.bot.sent[-1]
+        self.assertIsInstance(m1.file, types.InputMediaVenue)
+        self.assertEqual(m1.file.title, "新粤新疆菜")
+        self.assertEqual(m1.file.address, "体育西路191号佳兆业广场F3-301")
+        self.assertEqual((m1.file.geo_point.lat, m1.file.geo_point.long), (23.133, 113.321))
+
+        # 2) Group chat location -> sender included in venue title, still single message
+        self.daemon.add_message(
+            "loc2", "123@chatroom", "", type_=48, sender="wxid_amir",
+            location={"name": "新粤新疆菜", "address": "体育西路191号佳兆业广场F3-301",
+                      "latitude": 23.133, "longitude": 113.321},
+        )
+        before = len(self.b.bot.sent)
+        await self.event("loc2", "123@chatroom")
+        self.assertEqual(len(self.b.bot.sent) - before, 1)
+        m2 = self.b.bot.sent[-1]
+        self.assertIsInstance(m2.file, types.InputMediaVenue)
+        self.assertEqual(m2.file.title, "Alice in group：新粤新疆菜")
+        self.assertEqual(m2.file.address, "体育西路191号佳兆业广场F3-301")
+
+        # 3) Outgoing from phone -> "我（手机端）" prefix in venue title
+        self.daemon.add_message(
+            "loc3", "wxid_alice", "", type_=48, direction="outgoing",
+            location={"name": "广州塔", "address": "", "latitude": 23.1064, "longitude": 113.3245},
+        )
+        before = len(self.b.bot.sent)
+        await self.event("loc3", "wxid_alice")
+        self.assertEqual(len(self.b.bot.sent) - before, 1)
+        m3 = self.b.bot.sent[-1]
+        self.assertIsInstance(m3.file, types.InputMediaVenue)
+        self.assertEqual(m3.file.title, "我（手机端）：广州塔")
+        self.assertEqual(m3.file.address, "23.106400, 113.324500")
+
+        # 4) Missing name with address only -> non-empty title & address
+        self.daemon.add_message(
+            "loc4", "123@chatroom", "", type_=48, sender="wxid_amir",
+            location={"name": "", "address": "体育西路191号", "latitude": 23.133, "longitude": 113.321},
+        )
+        before = len(self.b.bot.sent)
+        await self.event("loc4", "123@chatroom")
+        self.assertEqual(len(self.b.bot.sent) - before, 1)
+        m4 = self.b.bot.sent[-1]
+        self.assertIsInstance(m4.file, types.InputMediaVenue)
+        self.assertEqual(m4.file.title, "Alice in group：位置")
+        self.assertEqual(m4.file.address, "体育西路191号")
+
+        # 5) Venue rejected by Telegram -> falls back to text + InputMediaGeoPoint
+        orig_send_file = self.b.bot.send_file
+        async def reject_venue(chat, file, **kw):
+            if isinstance(file, types.InputMediaVenue):
+                raise errors.MediaInvalidError(None)
+            return await orig_send_file(chat, file, **kw)
+
+        self.daemon.add_message(
+            "loc5", "wxid_alice", "", type_=48,
+            location={"name": "备选地点", "address": "备选地址", "latitude": 23.1, "longitude": 113.3},
+        )
+        before = len(self.b.bot.sent)
+        with mock.patch.object(self.b.bot, "send_file", side_effect=reject_venue):
+            await self.event("loc5", "wxid_alice")
+        self.assertEqual(len(self.b.bot.sent) - before, 2)
+        self.assertEqual(self.b.bot.sent[-2].text, "📍 备选地点 备选地址")
+        self.assertIsInstance(self.b.bot.sent[-1].file, types.InputMediaGeoPoint)
+
 
 
 
@@ -2842,4 +2924,5 @@ class LinkCardTests(unittest.IsolatedAsyncioTestCase):
         s3 = self.b.bot.sent[-1]
         self.assertIn(f'<a href="{xhs_url}"><b>文本按钮降级测试</b></a>', s3.text)
         self.assertNotIn("buttons", s3.kwargs)
+
 

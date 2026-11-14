@@ -232,6 +232,33 @@ def _link_body(link: dict, app_type: int | None = None, *, inline_url: bool = Fa
     return "\n".join(parts)
 
 
+def _plain_sender(header: str) -> str:
+    """Extract plain sender label from an HTML bridge header for non-HTML Telegram fields."""
+    if not header:
+        return ""
+    s = re.sub(r"<[^>]+>", "", header).rstrip("\n")
+    if s.endswith(("：", ":")):
+        s = s[:-1]
+    return html.unescape(s).strip()
+
+
+def _location_venue(loc: dict, body: str = "", sender: str = "") -> tuple[str, str]:
+    """Build (title, address) for Telegram InputMediaVenue from a WeChat location payload."""
+    name = " ".join((loc.get("name") or "").split())
+    address = " ".join((loc.get("address") or "").split())
+    fallback_body = " ".join((body or "").split())
+    coord = f"{loc['latitude']:.6f}, {loc['longitude']:.6f}"
+    base_title = name or ("位置" if address else (fallback_body or "位置"))
+    title = f"{sender}：{base_title}" if sender else base_title
+    if address and address != base_title:
+        venue_address = address
+    elif fallback_body and fallback_body != base_title:
+        venue_address = fallback_body
+    else:
+        venue_address = coord
+    return title, venue_address
+
+
 # agent-wechat reason codes for attachments it could not fetch
 MEDIA_REASONS = {
     "unsupported_sticker_source": "这个表情没有可下载的地址（比如自定义/加密表情），agent-wechat 拿不到",
@@ -1106,6 +1133,29 @@ class Bridge(LoginMixin):
                     kwargs.update(force_document=True, voice_note=False, supports_streaming=False)
                     out.append(await self.bot.send_file(chat_id, f, **kwargs))
                 return out
+            if (
+                t == LOCATION
+                and not prefix
+                and (loc := msg.get("location"))
+                and loc.get("latitude") is not None
+                and loc.get("longitude") is not None
+            ):
+                title, address = _location_venue(loc, msg.get("body") or "", _plain_sender(header))
+                venue = types.InputMediaVenue(
+                    geo_point=types.InputGeoPoint(lat=loc["latitude"], long=loc["longitude"]),
+                    title=title,
+                    address=address,
+                    provider="",
+                    venue_id="",
+                    venue_type="",
+                )
+                try:
+                    out.append(await self.bot.send_file(chat_id, venue, reply_to=reply, silent=silent))
+                    return out
+                except errors.RPCError as e:
+                    if _dead_chat(e):
+                        raise
+                    log.info("Telegram refused venue (%s); falling back to text + geo point", e)
             if isinstance(send_media, str):
                 label = {IMAGE: "图片", VIDEO: "视频", VOICE: "语音", STICKER: "表情"}.get(t, "文件")
                 text = header + prefix + f"[{label}，无法获取：{_esc(MEDIA_REASONS.get(send_media, send_media))}]"
@@ -1137,7 +1187,12 @@ class Bridge(LoginMixin):
                         reply_to=reply if i == 0 else None,
                         link_preview=False,
                     ))
-            if t == LOCATION and (loc := msg.get("location")):
+            if (
+                t == LOCATION
+                and (loc := msg.get("location"))
+                and loc.get("latitude") is not None
+                and loc.get("longitude") is not None
+            ):
                 geo = types.InputMediaGeoPoint(types.InputGeoPoint(lat=loc["latitude"], long=loc["longitude"]))
                 out.append(await self.bot.send_file(chat_id, geo, silent=silent))
             return out
