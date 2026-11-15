@@ -8,7 +8,9 @@ import json
 import logging
 import os
 import struct
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 from urllib.parse import quote, urlsplit
@@ -28,6 +30,9 @@ SEND_DONE = {"accepted", "completed", "succeeded", "available", "failed", "needs
 SEND_OK = {"accepted", "completed", "succeeded", "available"}
 JOB_DONE = {"accepted", "completed", "succeeded", "available", "failed", "partial", "cancelled",
             "expired", "needs_review", "unsupported"}
+STICKER_PREP_TTL_SECONDS = 20 * 3600
+STICKER_PREP_MAX_ENTRIES = 512
+_EXPIRED_PREP_CODES = {"sticker_preparation_expired", "sticker_preparation_not_found"}
 
 
 class WeChatError(Exception):
@@ -68,6 +73,7 @@ class WeChatClient:
         self._token = token
         self.account = account
         self._supports_stickers: bool | None = None
+        self._sticker_preps: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._read_retry_delays = read_retry_delays
         # trust_env=False: never route the local daemon (and its token) through a system HTTP proxy
         self.http = httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}, trust_env=False,
@@ -326,17 +332,67 @@ class WeChatClient:
         job = await self._req("POST", self._a("sticker-preparations"),
                               json={"sourceId": source["id"], "fit": fit, "trim": None},
                               headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
-        return await self._wait(job, lambda j: f"sticker-preparations/{_id(j['id'])}", JOB_DONE, 300)
+        return await self._wait(job, lambda j: f"sticker-preparations/{_id(j['id'])}", JOB_DONE, 300, max_delay=0.8)
+
+    def _get_cached_prep(self, cache_key: tuple[str, str]) -> str | None:
+        entry = self._sticker_preps.get(cache_key)
+        if not entry:
+            return None
+        prep_id, expires_at = entry
+        if time.monotonic() >= expires_at:
+            self._sticker_preps.pop(cache_key, None)
+            return None
+        self._sticker_preps.move_to_end(cache_key)
+        return prep_id
+
+    def _put_cached_prep(self, cache_key: tuple[str, str], prep_id: str) -> None:
+        self._sticker_preps[cache_key] = (prep_id, time.monotonic() + STICKER_PREP_TTL_SECONDS)
+        self._sticker_preps.move_to_end(cache_key)
+        while len(self._sticker_preps) > STICKER_PREP_MAX_ENTRIES:
+            self._sticker_preps.popitem(last=False)
 
     async def send_sticker(self, thread_id: str, media: Media, key: str) -> dict:
-        prep = await self.prepare_sticker(media, f"{key}-prep", fit=True)
-        if prep.get("state") != "available":
-            return prep
-        body = {"kind": "sticker", "threadId": thread_id,
-                "source": {"kind": "prepared", "preparationId": prep["id"]}}
-        job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
-                              timeout=_SEND_TIMEOUT)
-        return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
+        cache_key = (self.account or "", hashlib.sha256(media.data).hexdigest())
+        prep_id = self._get_cached_prep(cache_key)
+        used_cached = prep_id is not None
+        if not prep_id:
+            prep = await self.prepare_sticker(media, f"{key}-prep", fit=True)
+            if prep.get("state") != "available":
+                return prep
+            prep_id = prep["id"]
+            self._put_cached_prep(cache_key, prep_id)
+
+        send_key = key
+        for attempt in range(2):
+            body = {"kind": "sticker", "threadId": thread_id,
+                    "source": {"kind": "prepared", "preparationId": prep_id}}
+            stale = False
+            res: dict = {}
+            try:
+                job = await self._req("POST", self._a("sends"), json=body,
+                                      headers={"Idempotency-Key": send_key}, timeout=_SEND_TIMEOUT)
+                res = await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600, max_delay=0.8)
+                reason = res.get("reason") or (res.get("error") or {}).get("code")
+                if res.get("state") == "failed" and reason in _EXPIRED_PREP_CODES:
+                    stale = True
+                else:
+                    return res
+            except WeChatError as e:
+                if used_cached and attempt == 0 and e.code in _EXPIRED_PREP_CODES:
+                    stale = True
+                else:
+                    raise
+            if not (stale and used_cached and attempt == 0):
+                return res
+            self._sticker_preps.pop(cache_key, None)
+            prep = await self.prepare_sticker(media, f"{key}-reprep", fit=True)
+            if prep.get("state") != "available":
+                return prep
+            prep_id = prep["id"]
+            self._put_cached_prep(cache_key, prep_id)
+            used_cached = False
+            send_key = f"{key}-retry"
+        return {}
 
     async def send_media(self, thread_id: str, kind: str, media: Media, key: str) -> dict:
         files = {"file": (media.filename, media.data, media.mime)}
@@ -367,12 +423,12 @@ class WeChatClient:
             op = await self._wait(op, lambda o: f"operations/{_id(o['id'])}", done, 30)
         return op if isinstance(op, dict) else {}
 
-    async def _wait(self, item: dict, path, done: set[str], timeout: float) -> dict:
+    async def _wait(self, item: dict, path, done: set[str], timeout: float, *, max_delay: float = 2.0) -> dict:
         loop = asyncio.get_running_loop()
         deadline, delay = loop.time() + timeout, 0.3
         while item.get("state") not in done and loop.time() < deadline:
             await asyncio.sleep(delay)
-            delay = min(delay * 1.5, 2.0)
+            delay = min(delay * 1.5, max_delay)
             item = await self._req("GET", self._a(path(item)))
         return item
 

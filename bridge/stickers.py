@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import bisect
 import gzip
+import hashlib
 import io
 import logging
 import math
@@ -25,8 +26,10 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
+from pathlib import Path
 
-from PIL import Image, ImageSequence
+from PIL import Image, ImageChops, ImageSequence, ImageStat
 
 log = logging.getLogger("stickers")
 
@@ -34,30 +37,34 @@ SIZE = 384          # legacy MP4 output size
 MIN_SECONDS = 3.0   # legacy MP4 repeat target
 MAX_LOOPS = 4
 
+STICKER_CACHE_VERSION = 2
+STICKER_CACHE_MAX_BYTES = 100 * 1024 * 1024
+
 WX_STICKER_SIZE = 240
 WX_STICKER_MAX_BYTES = 1024 * 1024
-# agent-wechat uploads stickers to WeChat in 8 KB sequential chunks, so staying compact keeps sends fast.
-WX_STICKER_FAST_BYTES = 450 * 1024
+# agent-wechat uploads stickers to WeChat in 8 KB sequential chunks; ~320 KB keeps first send under ~30 s.
+WX_STICKER_FAST_BYTES = 320 * 1024
 WX_STICKER_MAX_FRAMES = 200
 WX_STICKER_MAX_SECONDS = 9.5
 
+# Prioritize crisp 240px edges and exact 10ms-aligned GIF cadence before reducing colors or dimensions.
 _WX_GIF_ATTEMPTS = (
-    (WX_STICKER_SIZE, 20.0, 256, "full", "none"),
-    (WX_STICKER_SIZE, 1000.0 / 60.0, 256, "full", "none"),
-    (WX_STICKER_SIZE, 12.5, 256, "full", "none"),
-    (WX_STICKER_SIZE, 12.5, 160, "full", "bayer:bayer_scale=4"),
-    (WX_STICKER_SIZE, 10.0, 128, "full", "bayer:bayer_scale=4"),
-    (192, 12.5, 128, "full", "bayer:bayer_scale=4"),
-    (160, 10.0, 64, "full", "bayer:bayer_scale=3"),
+    (WX_STICKER_SIZE, 1000.0 / 60.0, 256, "diff", "bayer:bayer_scale=5"),
+    (WX_STICKER_SIZE, 12.5, 256, "diff", "bayer:bayer_scale=5"),
+    (WX_STICKER_SIZE, 10.0, 256, "diff", "bayer:bayer_scale=4"),
+    (WX_STICKER_SIZE, 10.0, 192, "diff", "bayer:bayer_scale=4"),
+    (WX_STICKER_SIZE, 1000.0 / 120.0, 128, "diff", "bayer:bayer_scale=3"),
+    (208, 10.0, 128, "diff", "bayer:bayer_scale=3"),
+    (176, 1000.0 / 120.0, 96, "diff", "bayer:bayer_scale=3"),
 )
 
 _WX_VIDEO_GIF_ATTEMPTS = (
-    (WX_STICKER_SIZE, 15.0, 256, "full", "bayer:bayer_scale=4"),
-    (WX_STICKER_SIZE, 12.5, 256, "full", "bayer:bayer_scale=4"),
-    (WX_STICKER_SIZE, 12.5, 160, "full", "bayer:bayer_scale=4"),
-    (WX_STICKER_SIZE, 10.0, 128, "full", "bayer:bayer_scale=4"),
-    (192, 12.5, 128, "full", "bayer:bayer_scale=4"),
-    (160, 10.0, 64, "full", "bayer:bayer_scale=3"),
+    (WX_STICKER_SIZE, 12.5, 256, "diff", "bayer:bayer_scale=5"),
+    (WX_STICKER_SIZE, 10.0, 256, "diff", "bayer:bayer_scale=5"),
+    (WX_STICKER_SIZE, 1000.0 / 120.0, 192, "diff", "bayer:bayer_scale=4"),
+    (WX_STICKER_SIZE, 1000.0 / 120.0, 128, "diff", "bayer:bayer_scale=4"),
+    (208, 10.0, 128, "diff", "bayer:bayer_scale=3"),
+    (176, 1000.0 / 120.0, 96, "diff", "bayer:bayer_scale=3"),
 )
 
 TG_STICKER_SIZE = 512
@@ -230,6 +237,121 @@ def _rgba_to_transparent_gif_pillow(frames: list[tuple[Image.Image, int]], max_e
     return out.getvalue()
 
 
+_ALPHA_KEEP_LUT = [0 if a < 128 else 255 for a in range(256)]
+_OPAQUE_ALPHA_TABLE = bytes(range(128, 256))
+_GIFSICLE_FAST_SKIP_BYTES = 96 * 1024
+
+
+def _clean_rgba_alpha(im: Image.Image) -> Image.Image:
+    """Zero RGB on sub-128 alpha pixels so faint edge halos and invisible jitter vanish cleanly."""
+    rgba = im.convert("RGBA")
+    lo, _ = rgba.getchannel("A").getextrema()
+    if lo >= 128:
+        return rgba
+    clean = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    clean.paste(rgba, mask=rgba.getchannel("A").point(_ALPHA_KEEP_LUT))
+    return clean
+
+
+def _rgba_frames_have_alpha(frames: list[bytes]) -> bool:
+    for frame in frames:
+        if len(frame) >= 4 and frame[3::4].translate(None, _OPAQUE_ALPHA_TABLE):
+            return True
+    return False
+
+
+def _dedup_sampled_frames(
+    indices: list[int],
+    total_cs: int,
+    width: int,
+    height: int,
+    get_pil: Callable[[int, int, int], Image.Image],
+    get_raw: Callable[[int, int, int], bytes],
+    *,
+    max_diff_thresh: int,
+    rms_thresh: float,
+) -> tuple[list[int], list[Image.Image], list[bytes], list[int]]:
+    """Collapse consecutive identical or visually still sampled frames and accumulate their durations."""
+    n_out = len(indices)
+    kept_indices: list[int] = []
+    kept_pils: list[Image.Image] = []
+    kept_raws: list[bytes] = []
+    kept_cs: list[int] = []
+
+    for i, idx in enumerate(indices):
+        dur_cs = max(2, round((i + 1) * total_cs / n_out) - round(i * total_cs / n_out))
+        if kept_indices and idx == kept_indices[-1]:
+            kept_cs[-1] = min(65535, kept_cs[-1] + dur_cs)
+            continue
+        im = get_pil(idx, width, height)
+        raw = get_raw(idx, width, height)
+        if kept_raws:
+            same = raw == kept_raws[-1]
+            if not same and max_diff_thresh > 0:
+                diff = ImageChops.difference(im, kept_pils[-1])
+                max_diff = max(hi for _, hi in diff.getextrema())
+                if max_diff <= max_diff_thresh and max(ImageStat.Stat(diff).rms) <= rms_thresh:
+                    same = True
+            if same and kept_cs[-1] + dur_cs <= 65535:
+                kept_cs[-1] += dur_cs
+                continue
+        kept_indices.append(idx)
+        kept_pils.append(im)
+        kept_raws.append(raw)
+        kept_cs.append(dur_cs)
+    return kept_indices, kept_pils, kept_raws, kept_cs
+
+
+def _skip_gif_subblocks(buf: bytearray, pos: int) -> int:
+    while pos < len(buf):
+        size = buf[pos]
+        pos += 1
+        if size == 0:
+            return pos
+        pos += size
+    return pos
+
+
+def _set_gif_frame_delays(gif_bytes: bytes, delays_cs: list[int]) -> bytes:
+    """Patch GIF Graphic Control Extension per-frame centisecond delays without re-encoding pixels."""
+    if len(delays_cs) <= 1 or len(gif_bytes) < 14 or gif_bytes[:6] not in (b"GIF87a", b"GIF89a"):
+        return gif_bytes
+    out = bytearray(gif_bytes)
+    pos = 13
+    packed = out[10]
+    if packed & 0x80:
+        pos += 3 * (1 << ((packed & 0x07) + 1))
+    offsets: list[int] = []
+    while pos < len(out):
+        tag = out[pos]
+        if tag == 0x3B:
+            break
+        if tag == 0x21:
+            if pos + 7 < len(out) and out[pos + 1] == 0xF9 and out[pos + 2] == 4:
+                offsets.append(pos + 4)
+                pos += 8
+            else:
+                pos = _skip_gif_subblocks(out, pos + 2)
+        elif tag == 0x2C:
+            if pos + 10 >= len(out):
+                return gif_bytes
+            ipacked = out[pos + 9]
+            pos += 10
+            if ipacked & 0x80:
+                pos += 3 * (1 << ((ipacked & 0x07) + 1))
+            pos += 1
+            pos = _skip_gif_subblocks(out, pos)
+        else:
+            return gif_bytes
+    if len(offsets) != len(delays_cs):
+        return gif_bytes
+    for off, delay in zip(offsets, delays_cs):
+        cs = max(2, min(65535, delay))
+        out[off] = cs & 0xFF
+        out[off + 1] = (cs >> 8) & 0xFF
+    return bytes(out)
+
+
 def _gif_palette_vf(max_colors: int, stats_mode: str, dither: str, *, transparent: bool = True) -> str:
     use_opts = f"dither={dither}" + (":alpha_threshold=128" if transparent else "")
     if stats_mode == "single":
@@ -244,7 +366,8 @@ def _gif_palette_vf(max_colors: int, stats_mode: str, dither: str, *, transparen
 def _ffmpeg_rgba_to_gif(frames: list[bytes], width: int, height: int, fps: float, ffmpeg: str,
                         *, max_colors: int = 256, stats_mode: str = "full",
                         dither: str = "none") -> bytes:
-    vf = _gif_palette_vf(max_colors, stats_mode, dither)
+    transparent = _rgba_frames_have_alpha(frames)
+    vf = _gif_palette_vf(max_colors, stats_mode, dither, transparent=transparent)
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "out.gif")
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
@@ -258,7 +381,7 @@ def _ffmpeg_rgba_to_gif(frames: list[bytes], width: int, height: int, fps: float
 
 
 def _optimize_gif(data: bytes, target_bytes: int, gifsicle: str | None) -> bytes:
-    if not gifsicle:
+    if not gifsicle or (len(data) <= _GIFSICLE_FAST_SKIP_BYTES and len(data) <= target_bytes):
         return data
     best = data
     with tempfile.TemporaryDirectory() as tmp:
@@ -266,19 +389,12 @@ def _optimize_gif(data: bytes, target_bytes: int, gifsicle: str | None) -> bytes
         out = os.path.join(tmp, "out.gif")
         with open(src, "wb") as f:
             f.write(data)
-        res = subprocess.run([gifsicle, "-O3", src, "-o", out], capture_output=True, timeout=60)
-        if res.returncode == 0 and os.path.exists(out):
-            with open(out, "rb") as f:
-                opt = f.read()
-            if 0 < len(opt) < len(best):
-                best = opt
-        if len(best) <= target_bytes:
-            return best
-        for lossy in (20, 35):
-            if lossy > 20 and len(best) <= WX_STICKER_MAX_BYTES:
+        for flags in (("-O2",), ("-O2", "--lossy=15"), ("-O2", "--lossy=35")):
+            if flags[-1].startswith("--lossy=") and len(best) <= target_bytes:
                 break
-            res = subprocess.run([gifsicle, "-O3", f"--lossy={lossy}", src, "-o", out],
-                                 capture_output=True, timeout=60)
+            if flags[-1] == "--lossy=35" and len(best) <= WX_STICKER_MAX_BYTES:
+                break
+            res = subprocess.run([gifsicle, *flags, src, "-o", out], capture_output=True, timeout=60)
             if res.returncode == 0 and os.path.exists(out):
                 with open(out, "rb") as f:
                     opt = f.read()
@@ -295,6 +411,75 @@ def _gif_attempts(duration: float) -> tuple[tuple[int, float, int, str, str], ..
     if duration > 4.5:
         return _WX_GIF_ATTEMPTS[1:]
     return _WX_GIF_ATTEMPTS
+
+
+def _encode_rgba_attempts_to_gif(
+    attempts: tuple[tuple[int, float, int, str, str], ...],
+    duration: float,
+    src_fps: float,
+    size_for_edge: Callable[[int], tuple[int, int]],
+    sample_indices: Callable[[int], list[int]],
+    load_frame: Callable[[int, int, int], Image.Image],
+    ffmpeg: str | None,
+    gifsicle: str | None,
+    *,
+    max_diff_thresh: int = 4,
+    rms_thresh: float = 0.6,
+) -> bytes:
+    """Encode an RGBA animation using 240px-first quality preservation, still-frame merging, and fast convergence."""
+    pil_cache: dict[tuple[int, int, int], Image.Image] = {}
+    raw_cache: dict[tuple[int, int, int], bytes] = {}
+    seen: set[tuple] = set()
+    best: bytes | None = None
+    best_is_hq = False
+    total_cs = max(2, round(duration * 100))
+
+    def get_pil(idx: int, w: int, h: int) -> Image.Image:
+        key = (w, h, idx)
+        if key not in pil_cache:
+            pil_cache[key] = _clean_rgba_alpha(load_frame(idx, w, h))
+        return pil_cache[key]
+
+    def get_raw(idx: int, w: int, h: int) -> bytes:
+        key = (w, h, idx)
+        if key not in raw_cache:
+            raw_cache[key] = get_pil(idx, w, h).tobytes()
+        return raw_cache[key]
+
+    for edge, max_fps, colors, stats_mode, dither in attempts:
+        is_hq = edge == WX_STICKER_SIZE and colors == 256
+        if best is not None and best_is_hq and not is_hq:
+            return best
+        w, h = size_for_edge(edge)
+        target_fps = min(max_fps, src_fps, 180.0 / max(duration, 0.1))
+        n_out = max(1, min(180, round(duration * target_fps)))
+        indices = sample_indices(n_out)
+        kept_indices, kept_pils, kept_raws, kept_cs = _dedup_sampled_frames(
+            indices, total_cs, w, h, get_pil, get_raw,
+            max_diff_thresh=max_diff_thresh, rms_thresh=rms_thresh,
+        )
+        spec = (w, h, tuple(kept_indices), tuple(kept_cs), colors, stats_mode, dither)
+        if spec in seen:
+            continue
+        seen.add(spec)
+        if ffmpeg:
+            actual_fps = max(1.0, len(kept_raws) / max(duration, 0.05))
+            out = _ffmpeg_rgba_to_gif(kept_raws, w, h, actual_fps, ffmpeg, max_colors=colors,
+                                      stats_mode=stats_mode, dither=dither)
+            if len(kept_cs) < len(indices) or len(set(kept_cs)) > 1:
+                out = _set_gif_frame_delays(out, kept_cs)
+        else:
+            pil_frames = [(im, cs * 10) for im, cs in zip(kept_pils, kept_cs)]
+            out = _rgba_to_transparent_gif_pillow(pil_frames, max_edge=edge, max_colors=min(255, colors))
+        out = _optimize_gif(out, WX_STICKER_FAST_BYTES, gifsicle)
+        if len(out) <= WX_STICKER_MAX_BYTES:
+            if best is None or len(out) < len(best):
+                best, best_is_hq = out, is_hq
+            if len(best) <= WX_STICKER_FAST_BYTES or not is_hq:
+                return best
+    if best is not None:
+        return best
+    raise ValueError("sticker_output_size_limit")
 
 
 def webp_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
@@ -325,57 +510,19 @@ def webp_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
     duration = max(0.05, acc / 1000.0)
     src_fps = len(src_frames) / duration
     orig_w, orig_h = im.size
-    raw_cache: dict[tuple[int, int, int], bytes] = {}
-    pil_cache: dict[tuple[int, int, int], Image.Image] = {}
-    seen: set[tuple] = set()
-    best: bytes | None = None
-    best_is_hq = False
-
-    def get_pil(idx: int, w: int, h: int) -> Image.Image:
-        key = (w, h, idx)
-        if key not in pil_cache:
-            pil_cache[key] = _resize_rgba(src_frames[idx], w, h)
-        return pil_cache[key]
-
-    def get_raw(idx: int, w: int, h: int) -> bytes:
-        key = (w, h, idx)
-        if key not in raw_cache:
-            raw_cache[key] = get_pil(idx, w, h).tobytes()
-        return raw_cache[key]
-
-    for edge, max_fps, colors, stats_mode, dither in _gif_attempts(duration):
-        is_hq = edge == WX_STICKER_SIZE and colors == 256
-        if best is not None and best_is_hq and not is_hq:
-            return best
-        w, h = _fit_size(orig_w, orig_h, edge)
-        target_fps = min(max_fps, src_fps, 180.0 / max(duration, 0.1))
-        n_out = max(1, min(180, round(duration * target_fps)))
-        actual_fps = max(1.0, n_out / duration)
-        indices = [
+    return _encode_rgba_attempts_to_gif(
+        _gif_attempts(duration),
+        duration,
+        src_fps,
+        lambda edge: _fit_size(orig_w, orig_h, edge),
+        lambda n_out: [
             min(len(src_frames) - 1, bisect.bisect_right(ends_ms, (i + 0.5) * acc / n_out))
             for i in range(n_out)
-        ]
-        spec = (w, h, tuple(indices), colors, stats_mode, dither)
-        if spec in seen:
-            continue
-        seen.add(spec)
-        if ffmpeg:
-            raw = [get_raw(idx, w, h) for idx in indices]
-            out = _ffmpeg_rgba_to_gif(raw, w, h, actual_fps, ffmpeg, max_colors=colors,
-                                      stats_mode=stats_mode, dither=dither)
-        else:
-            delay_ms = max(20, round(1000.0 / actual_fps))
-            pil_frames = [(get_pil(idx, w, h), delay_ms) for idx in indices]
-            out = _rgba_to_transparent_gif_pillow(pil_frames, max_edge=edge, max_colors=min(255, colors))
-        out = _optimize_gif(out, WX_STICKER_FAST_BYTES, gifsicle)
-        if len(out) <= WX_STICKER_MAX_BYTES:
-            if best is None or len(out) < len(best):
-                best, best_is_hq = out, is_hq
-            if len(best) <= WX_STICKER_FAST_BYTES or not is_hq:
-                return best
-    if best is not None:
-        return best
-    raise ValueError("sticker_output_size_limit")
+        ],
+        lambda idx, w, h: _resize_rgba(src_frames[idx], w, h),
+        ffmpeg,
+        gifsicle,
+    )
 
 
 def tgs_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
@@ -386,60 +533,78 @@ def tgs_to_wechat_gif(data: bytes, ffmpeg: str | None) -> bytes:
     src_fps = anim.lottie_animation_get_framerate() or 30
     if total == 1:
         w, h = _tgs_size(anim, WX_STICKER_SIZE)
-        frame = _render_tgs_rgba(anim, 0, w, h)
+        frame = _clean_rgba_alpha(_render_tgs_rgba(anim, 0, w, h))
         return _optimize_gif(_rgba_to_transparent_gif_pillow([(frame, 0)], max_edge=WX_STICKER_SIZE),
                              WX_STICKER_FAST_BYTES, gifsicle)
 
     duration = min(WX_STICKER_MAX_SECONDS, total / src_fps)
     usable_src_frames = max(1, min(total, round(duration * src_fps)))
-    pil_cache: dict[tuple[int, int, int], Image.Image] = {}
-    raw_cache: dict[tuple[int, int, int], bytes] = {}
-    seen: set[tuple] = set()
-    best: bytes | None = None
-    best_is_hq = False
+    return _encode_rgba_attempts_to_gif(
+        _gif_attempts(duration),
+        duration,
+        src_fps,
+        lambda edge: _tgs_size(anim, edge),
+        lambda n_out: [min(usable_src_frames - 1, int(i * usable_src_frames / n_out)) for i in range(n_out)],
+        lambda idx, w, h: _render_tgs_rgba(anim, idx, w, h),
+        ffmpeg,
+        gifsicle,
+    )
 
-    def get_pil(idx: int, w: int, h: int) -> Image.Image:
-        key = (w, h, idx)
-        if key not in pil_cache:
-            pil_cache[key] = _render_tgs_rgba(anim, idx, w, h)
-        return pil_cache[key]
 
-    def get_raw(idx: int, w: int, h: int) -> bytes:
-        key = (w, h, idx)
-        if key not in raw_cache:
-            raw_cache[key] = get_pil(idx, w, h).tobytes()
-        return raw_cache[key]
+def _decode_pam_rgba_frames(buf: bytes) -> tuple[list[Image.Image], int, int]:
+    frames: list[Image.Image] = []
+    pos, width, height = 0, 0, 0
+    while pos < len(buf):
+        end = buf.find(b"ENDHDR\n", pos)
+        if end == -1:
+            break
+        hdr = buf[pos:end].decode("ascii", errors="replace")
+        meta = dict(line.split(None, 1) for line in hdr.splitlines() if " " in line)
+        w = int(meta["WIDTH"])
+        h = int(meta["HEIGHT"])
+        depth = int(meta["DEPTH"])
+        pos = end + 7
+        size = w * h * depth
+        if pos + size > len(buf):
+            break
+        px = buf[pos:pos + size]
+        pos += size
+        mode = "RGBA" if depth == 4 else "RGB"
+        im = Image.frombytes(mode, (w, h), px)
+        if mode != "RGBA":
+            im = im.convert("RGBA")
+        width, height = w, h
+        frames.append(im)
+    if not frames:
+        raise ValueError("empty_video_stream")
+    return frames, width, height
 
-    for edge, max_fps, colors, stats_mode, dither in _gif_attempts(duration):
-        is_hq = edge == WX_STICKER_SIZE and colors == 256
-        if best is not None and best_is_hq and not is_hq:
-            return best
-        w, h = _tgs_size(anim, edge)
-        target_fps = min(max_fps, src_fps, 180.0 / max(duration, 0.1))
-        n_out = max(1, min(180, round(duration * target_fps)))
-        actual_fps = max(1.0, n_out / max(duration, 0.05))
-        indices = [min(usable_src_frames - 1, int(i * usable_src_frames / n_out)) for i in range(n_out)]
-        spec = (w, h, tuple(indices), colors, stats_mode, dither)
-        if spec in seen:
-            continue
-        seen.add(spec)
-        if ffmpeg:
-            raw = [get_raw(idx, w, h) for idx in indices]
-            out = _ffmpeg_rgba_to_gif(raw, w, h, actual_fps, ffmpeg, max_colors=colors,
-                                      stats_mode=stats_mode, dither=dither)
-        else:
-            delay_ms = max(20, round(1000.0 / actual_fps))
-            pil_frames = [(get_pil(idx, w, h), delay_ms) for idx in indices]
-            out = _rgba_to_transparent_gif_pillow(pil_frames, max_edge=edge, max_colors=min(255, colors))
-        out = _optimize_gif(out, WX_STICKER_FAST_BYTES, gifsicle)
-        if len(out) <= WX_STICKER_MAX_BYTES:
-            if best is None or len(out) < len(best):
-                best, best_is_hq = out, is_hq
-            if len(best) <= WX_STICKER_FAST_BYTES or not is_hq:
-                return best
-    if best is not None:
-        return best
-    raise ValueError("sticker_output_size_limit")
+
+def _decode_video_rgba_frames(
+    data: bytes,
+    ffmpeg: str,
+    *,
+    ext: str,
+    input_args: tuple[str, ...],
+    preserve_alpha: bool,
+    max_edge: int,
+    base_fps: float,
+) -> tuple[list[Image.Image], int, int]:
+    """Decode and scale video frames once into RGBA images so re-attempts avoid repeating video decode."""
+    scale = f"scale={max_edge}:{max_edge}:force_original_aspect_ratio=decrease:flags=lanczos"
+    if preserve_alpha:
+        vf = f"fps={base_fps:g},format=rgba,premultiply=inplace=1,{scale},unpremultiply=inplace=1"
+    else:
+        vf = f"fps={base_fps:g},{scale},format=rgba"
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, f"in{ext}")
+        with open(src, "wb") as f:
+            f.write(data)
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               *input_args, "-i", src, "-t", f"{WX_STICKER_MAX_SECONDS:g}",
+               "-vf", vf, "-c:v", "pam", "-f", "image2pipe", "pipe:1"]
+        res = subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+        return _decode_pam_rgba_frames(res.stdout)
 
 
 def _transcode_video_to_wechat_gif(
@@ -452,38 +617,25 @@ def _transcode_video_to_wechat_gif(
     attempts: tuple[tuple[int, float, int, str, str], ...] = _WX_GIF_ATTEMPTS,
 ) -> bytes:
     gifsicle = find_gifsicle()
-    with tempfile.TemporaryDirectory() as tmp:
-        src, out_path = os.path.join(tmp, f"in{ext}"), os.path.join(tmp, "out.gif")
-        with open(src, "wb") as f:
-            f.write(data)
-        best: bytes | None = None
-        best_is_hq = False
-        for edge, fps, colors, stats_mode, dither in attempts:
-            is_hq = edge == WX_STICKER_SIZE and colors == 256
-            if best is not None and best_is_hq and not is_hq:
-                return best
-            scale = f"scale={edge}:{edge}:force_original_aspect_ratio=decrease:flags=lanczos"
-            if preserve_alpha:
-                vf = (f"fps={fps:g},format=rgba,premultiply=inplace=1,{scale},"
-                      f"unpremultiply=inplace=1,"
-                      + _gif_palette_vf(colors, stats_mode, dither, transparent=True))
-            else:
-                vf = f"fps={fps:g},{scale}," + _gif_palette_vf(colors, stats_mode, dither, transparent=False)
-            cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                   *input_args, "-i", src, "-t", f"{WX_STICKER_MAX_SECONDS:g}",
-                   "-vf", vf, "-loop", "0", out_path]
-            subprocess.run(cmd, check=True, capture_output=True, timeout=120)
-            with open(out_path, "rb") as f:
-                out = f.read()
-            out = _optimize_gif(out, WX_STICKER_FAST_BYTES, gifsicle)
-            if len(out) <= WX_STICKER_MAX_BYTES:
-                if best is None or len(out) < len(best):
-                    best, best_is_hq = out, is_hq
-                if len(best) <= WX_STICKER_FAST_BYTES or not is_hq:
-                    return best
-        if best is not None:
-            return best
-    raise ValueError("sticker_output_size_limit")
+    base_fps = attempts[0][1]
+    base_edge = attempts[0][0]
+    src_frames, orig_w, orig_h = _decode_video_rgba_frames(
+        data, ffmpeg, ext=ext, input_args=input_args,
+        preserve_alpha=preserve_alpha, max_edge=base_edge, base_fps=base_fps,
+    )
+    duration = max(0.05, len(src_frames) / base_fps)
+    return _encode_rgba_attempts_to_gif(
+        attempts,
+        duration,
+        base_fps,
+        lambda edge: _fit_size(orig_w, orig_h, edge),
+        lambda n_out: [min(len(src_frames) - 1, int(i * len(src_frames) / n_out)) for i in range(n_out)],
+        lambda idx, w, h: _resize_rgba(src_frames[idx], w, h),
+        ffmpeg,
+        gifsicle,
+        max_diff_thresh=8,
+        rms_thresh=1.2,
+    )
 
 
 def webm_to_wechat_gif(data: bytes, ffmpeg: str) -> bytes:
@@ -500,16 +652,19 @@ def gif_media_to_wechat_gif(data: bytes, mime: str, ffmpeg: str | None) -> bytes
         if n_frames <= 1:
             return webp_to_wechat_gif(data, ffmpeg)
         total_ms = sum(max(20, int(f.info.get("duration") or 50)) for f in ImageSequence.Iterator(im))
-        if (
+        compliant = (
             max(im.size) <= WX_STICKER_SIZE
             and len(data) <= WX_STICKER_MAX_BYTES
             and n_frames <= WX_STICKER_MAX_FRAMES
             and total_ms <= int(WX_STICKER_MAX_SECONDS * 1000)
-        ):
+        )
+        if compliant and len(data) <= WX_STICKER_FAST_BYTES:
             return data
         if ffmpeg:
-            return _transcode_video_to_wechat_gif(data, ffmpeg, ext=".gif", preserve_alpha=True)
-        return webp_to_wechat_gif(data, None)
+            out = _transcode_video_to_wechat_gif(data, ffmpeg, ext=".gif", preserve_alpha=True)
+        else:
+            out = webp_to_wechat_gif(data, None)
+        return data if compliant and len(data) <= len(out) else out
     if not ffmpeg:
         raise ValueError("ffmpeg_missing")
     if mime == "video/webm":
@@ -519,14 +674,104 @@ def gif_media_to_wechat_gif(data: bytes, mime: str, ffmpeg: str | None) -> bytes
     )
 
 
-async def _run_wechat_sticker_convert(label: str, mime: str, src_len: int, fn) -> tuple[str, bytes] | str:
+class StickerDiskCache:
+    """Bounded on-disk LRU cache mapping Telegram media digests to converted WeChat sticker GIFs."""
+
+    def __init__(self, root: str | os.PathLike[str], max_bytes: int = STICKER_CACHE_MAX_BYTES):
+        self.root = Path(root)
+        self.max_bytes = max(0, max_bytes)
+
+    def _path_for(self, key: str) -> Path:
+        digest = hashlib.sha256(f"v{STICKER_CACHE_VERSION}:{key}".encode("utf-8")).hexdigest()[:32]
+        return self.root / f"v{STICKER_CACHE_VERSION}_{digest}.gif"
+
+    def get(self, key: str) -> bytes | None:
+        if self.max_bytes <= 0:
+            return None
+        path = self._path_for(key)
+        try:
+            st = path.stat()
+            if not (0 < st.st_size <= WX_STICKER_MAX_BYTES):
+                return None
+            data = path.read_bytes()
+            os.utime(path, None)
+            return data
+        except OSError:
+            return None
+
+    def put(self, key: str, data: bytes) -> None:
+        if self.max_bytes <= 0 or not (0 < len(data) <= WX_STICKER_MAX_BYTES):
+            return
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            dst = self._path_for(key)
+            fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".gif", dir=self.root)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                os.replace(tmp_name, dst)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+            self._prune()
+        except OSError as e:
+            log.debug("Sticker disk cache write failed: %s", e)
+
+    def _prune(self) -> None:
+        try:
+            entries: list[tuple[int, int, Path]] = []
+            total = 0
+            for p in self.root.iterdir():
+                if not p.is_file() or p.suffix != ".gif" or p.name.startswith(".tmp-"):
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                total += st.st_size
+                entries.append((st.st_mtime_ns, st.st_size, p))
+            if total <= self.max_bytes:
+                return
+            entries.sort(key=lambda item: item[0])
+            for _, size, p in entries:
+                if total <= self.max_bytes:
+                    break
+                try:
+                    p.unlink()
+                    total -= size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+async def _run_wechat_sticker_convert(
+    label: str,
+    mime: str,
+    data: bytes,
+    fn: Callable[[], bytes],
+    *,
+    cache: StickerDiskCache | None = None,
+    cache_key: str | None = None,
+) -> tuple[str, bytes] | str:
+    key = cache_key or f"{label}:{mime}:{hashlib.sha256(data).hexdigest()}"
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            log.debug("Sticker cache hit for %s %s (%d B)", mime, label, len(cached))
+            return "sticker", cached
     t0 = time.monotonic()
     try:
         out = await asyncio.to_thread(fn)
+        if cache is not None:
+            cache.put(key, out)
         try:
             gim = Image.open(io.BytesIO(out))
             log.info("Converted %s %s (%d B) -> %dx%d GIF (%d frames, %d B) in %.2fs",
-                     mime, label, src_len, gim.size[0], gim.size[1], getattr(gim, "n_frames", 1),
+                     mime, label, len(data), gim.size[0], gim.size[1], getattr(gim, "n_frames", 1),
                      len(out), time.monotonic() - t0)
         except Exception:
             pass
@@ -536,28 +781,50 @@ async def _run_wechat_sticker_convert(label: str, mime: str, src_len: int, fn) -
         return f"贴纸转换失败：{type(e).__name__}"
 
 
-async def to_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes] | str:
+async def to_wechat_sticker(
+    data: bytes,
+    mime: str,
+    *,
+    cache: StickerDiskCache | None = None,
+    cache_key: str | None = None,
+) -> tuple[str, bytes] | str:
     """Convert a Telegram sticker (.webp / .tgs / .webm) to a <=240px <=1MB transparent GIF for WeChat."""
     ffmpeg = find_ffmpeg()
     if mime == "image/webp":
-        return await _run_wechat_sticker_convert("sticker", mime, len(data), lambda: webp_to_wechat_gif(data, ffmpeg))
+        return await _run_wechat_sticker_convert(
+            "sticker", mime, data, lambda: webp_to_wechat_gif(data, ffmpeg),
+            cache=cache, cache_key=cache_key,
+        )
     if mime == "application/x-tgsticker":
-        return await _run_wechat_sticker_convert("sticker", mime, len(data), lambda: tgs_to_wechat_gif(data, ffmpeg))
+        return await _run_wechat_sticker_convert(
+            "sticker", mime, data, lambda: tgs_to_wechat_gif(data, ffmpeg),
+            cache=cache, cache_key=cache_key,
+        )
     if mime == "video/webm":
         if not ffmpeg:
             return "需要 ffmpeg 才能转换视频贴纸"
-        return await _run_wechat_sticker_convert("sticker", mime, len(data), lambda: webm_to_wechat_gif(data, ffmpeg))
+        return await _run_wechat_sticker_convert(
+            "sticker", mime, data, lambda: webm_to_wechat_gif(data, ffmpeg),
+            cache=cache, cache_key=cache_key,
+        )
     return f"不支持的贴纸格式 {mime}"
 
 
-async def gif_to_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes] | str:
+async def gif_to_wechat_sticker(
+    data: bytes,
+    mime: str,
+    *,
+    cache: StickerDiskCache | None = None,
+    cache_key: str | None = None,
+) -> tuple[str, bytes] | str:
     """Convert a Telegram GIF (MP4/GIF/WebM) to a <=240px <=1MB GIF for WeChat."""
     ffmpeg = find_ffmpeg()
     is_gif_bytes = mime == "image/gif" or data[:6] in (b"GIF87a", b"GIF89a")
     if not is_gif_bytes and not ffmpeg:
         return "需要 ffmpeg 才能转换动态表情"
     return await _run_wechat_sticker_convert(
-        "GIF", mime, len(data), lambda: gif_media_to_wechat_gif(data, mime, ffmpeg),
+        "GIF", mime, data, lambda: gif_media_to_wechat_gif(data, mime, ffmpeg),
+        cache=cache, cache_key=cache_key,
     )
 
 
