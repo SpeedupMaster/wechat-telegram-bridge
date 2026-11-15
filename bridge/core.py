@@ -2144,11 +2144,20 @@ class Bridge(LoginMixin):
         if msg.photo:
             return "image", Media(data, "image/jpeg", "photo.jpg")
         cache = getattr(self, "sticker_cache", None)
+        wx = getattr(self, "wx", None)
+        if native_stickers and (msg.sticker or (msg.gif and self.cfg.bridge.gif_as_sticker)):
+            max_edge, static_max_edge = await wx.sticker_edge_limits() if wx else (
+                stickers.WX_STICKER_SIZE, stickers.WX_STICKER_STATIC_SIZE,
+            )
+        else:
+            max_edge, static_max_edge = stickers.WX_STICKER_SIZE, stickers.WX_STICKER_STATIC_SIZE
         if msg.sticker:
             if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/", "application/x-tgsticker")):
                 mime = {".webp": "image/webp", ".tgs": "application/x-tgsticker", ".webm": "video/webm"}.get(ext, mime)
             if native_stickers:
-                converted = await stickers.to_wechat_sticker(data, mime, cache=cache)
+                converted = await stickers.to_wechat_sticker(
+                    data, mime, cache=cache, max_edge=max_edge, static_max_edge=static_max_edge,
+                )
                 if isinstance(converted, str):
                     return None, converted
                 _, out = converted
@@ -2165,7 +2174,9 @@ class Bridge(LoginMixin):
         if msg.gif and native_stickers and self.cfg.bridge.gif_as_sticker:
             if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/")):
                 mime = {".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm"}.get(ext, mime)
-            converted = await stickers.gif_to_wechat_sticker(data, mime, cache=cache)
+            converted = await stickers.gif_to_wechat_sticker(
+                data, mime, cache=cache, max_edge=max_edge, static_max_edge=static_max_edge,
+            )
             if not isinstance(converted, str):
                 _, out = converted
                 return "sticker", Media(out, "image/gif", "sticker.gif")

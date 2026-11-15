@@ -42,6 +42,7 @@ class FakeDaemon:
         self.sticker_preparations: list[tuple[dict, str]] = []
         self.expired_sticker_preps: set[str] = set()
         self.stickers_supported = True
+        self.daemon_version = "2.5.0"
         self.sse_body = ""
         self.marked_read: list[str] = []
         self.avatar_refreshed: list[str] = []
@@ -76,11 +77,13 @@ class FakeDaemon:
         assert request.headers["authorization"] == "Bearer secret-token"
         path = request.url.path.removeprefix("/v1/")
         parts = path.split("/")
+        m = request.method
+        if path == "status" and m == "GET":
+            return httpx.Response(200, json={"state": "ready", "version": {"version": self.daemon_version}})
         if path == "accounts":
             return httpx.Response(200, json={"items": [{"id": ACC, "alias": "me"}]})
         assert parts[:2] == ["accounts", ACC], path
         rest = parts[2:]
-        m = request.method
         if rest[0] == "capabilities" and m == "GET":
             return httpx.Response(200, json={"nativeRuntime": True, "stickers": self.stickers_supported})
         if rest[0] == "messages" and len(rest) == 2:
@@ -692,6 +695,55 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         m_conv.assert_not_called()
         self.assertEqual(len(self.daemon.sticker_preparations), preps_before)
         self.assertEqual(self.daemon.sends[-1][0]["kind"], "video")
+
+    async def test_telegram_stickers_adapt_resolution_to_daemon_version(self):
+        import io
+        import re
+        from PIL import Image
+
+        def extract_gif(content_type: str, body: bytes) -> Image.Image:
+            m = re.search(r"boundary=([^\s;]+)", content_type)
+            assert m, content_type
+            boundary = m.group(1).encode()
+            for part in body.split(b"--" + boundary):
+                if b"\r\n\r\n" in part:
+                    _, payload = part.split(b"\r\n\r\n", 1)
+                    payload = payload.rstrip(b"\r\n")
+                    if payload.startswith(b"GIF8"):
+                        return Image.open(io.BytesIO(payload))
+            raise AssertionError("GIF payload not found in multipart upload")
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1003, "Bob")
+        chat = -1003
+
+        webp = StickerTests.webp()
+        tgs = StickerTests.tgs()
+
+        def make_ev(mid: int, payload: bytes, mime: str, ext: str):
+            async def dl(file=None):
+                return payload
+            return SimpleNamespace(chat_id=chat, message=SimpleNamespace(
+                id=mid, message="", action=None, via_bot_id=None, reply_to=None,
+                photo=None, sticker=True, voice=None, video=None, video_note=None, gif=None,
+                file=SimpleNamespace(size=len(payload), mime_type=mime, name=f"s{ext}", ext=ext),
+                media=types.MessageMediaDocument(), download_media=dl))
+
+        # 1) agent-wechat >= 2.5.0 -> 512px static WebP, 384px animated TGS
+        self.daemon.daemon_version = "2.5.0"
+        self.b.wx._daemon_version = None
+        await self.b.on_tg_message(make_ev(8201, webp, "image/webp", ".webp"))
+        self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (512, 512))
+        await self.b.on_tg_message(make_ev(8202, tgs, "application/x-tgsticker", ".tgs"))
+        self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (384, 384))
+
+        # 2) agent-wechat < 2.5.0 -> safely stays at 240px for both
+        self.daemon.daemon_version = "2.4.2"
+        self.b.wx._daemon_version = None
+        await self.b.on_tg_message(make_ev(8203, webp, "image/webp", ".webp"))
+        self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (240, 240))
+        await self.b.on_tg_message(make_ev(8204, tgs, "application/x-tgsticker", ".tgs"))
+        self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (240, 240))
 
     async def test_sticker_that_cannot_be_downloaded_says_why(self):
         self.daemon.add_thread("wxid_bob", "Bob")
@@ -2486,17 +2538,17 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         from unittest import mock
         from PIL import Image
 
-        # Static WebP -> <=240px transparent GIF
+        # Static WebP -> <=512px transparent GIF (keeps native 512x512 Telegram resolution)
         kind, gif = await self.stickers.to_wechat_sticker(self.webp(), "image/webp")
         self.assertEqual(kind, "sticker")
         self.assertLessEqual(len(gif), self.stickers.WX_STICKER_MAX_BYTES)
         im = Image.open(io.BytesIO(gif))
-        self.assertEqual((im.format, im.size), ("GIF", (240, 240)))
+        self.assertEqual((im.format, im.size), ("GIF", (512, 512)))
         rgba = im.convert("RGBA")
         self.assertEqual(rgba.getpixel((5, 5))[3], 0)
-        self.assertColor(rgba.getpixel((120, 120))[:3], (255, 0, 0))
+        self.assertColor(rgba.getpixel((256, 256))[:3], (255, 0, 0))
 
-        # Animated .tgs -> multi-frame transparent GIF (both with and without ffmpeg)
+        # Animated .tgs -> <=384px multi-frame transparent GIF (both with and without ffmpeg)
         for use_ffmpeg in (True, False):
             if use_ffmpeg and not self.ffmpeg:
                 continue
@@ -2508,11 +2560,11 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             gim = Image.open(io.BytesIO(tgs_gif))
             self.assertGreater(gim.n_frames, 1)
             self.assertLessEqual(gim.n_frames, self.stickers.WX_STICKER_MAX_FRAMES)
-            self.assertEqual(gim.size, (240, 240))
+            self.assertEqual(gim.size, (384, 384))
             self.assertEqual(gim.convert("RGBA").getpixel((5, 5))[3], 0)
-            self.assertColor(gim.convert("RGBA").getpixel((120, 120))[:3], (255, 0, 0))
+            self.assertColor(gim.convert("RGBA").getpixel((192, 192))[:3], (255, 0, 0))
 
-        # Video .webm (VP9 with alpha) -> multi-frame transparent GIF
+        # Video .webm (VP9 with alpha) -> <=384px multi-frame transparent GIF
         if self.ffmpeg:
             import subprocess
             webm = Path(self.tmp.name, "in_wx.webm")
@@ -2526,9 +2578,9 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(webm_gif), self.stickers.WX_STICKER_MAX_BYTES)
             wim = Image.open(io.BytesIO(webm_gif))
             self.assertGreater(wim.n_frames, 1)
-            self.assertEqual(wim.size, (240, 240))
+            self.assertEqual(wim.size, (384, 384))
             self.assertEqual(wim.convert("RGBA").getpixel((5, 5))[3], 0)
-            self.assertColor(wim.convert("RGBA").getpixel((100, 100))[:3], (0, 200, 0))
+            self.assertColor(wim.convert("RGBA").getpixel((150, 150))[:3], (0, 200, 0))
 
     async def test_tgs_unpremultiplied_alpha_and_aspect_ratio(self):
         import gzip
@@ -2552,21 +2604,22 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         kind, gif = await self.stickers.to_wechat_sticker(tgs_bytes, "application/x-tgsticker")
         self.assertEqual(kind, "sticker")
         gim = Image.open(io.BytesIO(gif))
-        self.assertEqual(gim.size, (240, 120))
+        # All frames are identical -> collapses to 1 static frame at 512px preserving 2:1 aspect ratio.
+        self.assertEqual(gim.size, (512, 256))
         rgba = gim.convert("RGBA")
         self.assertEqual(rgba.getpixel((5, 5))[3], 0)
-        self.assertColor(rgba.getpixel((120, 60))[:3], (255, 255, 255))
+        self.assertColor(rgba.getpixel((256, 128))[:3], (255, 255, 255))
 
-    async def test_animated_webp_resamples_fps_and_preserves_240px_quality(self):
+    async def test_animated_webp_resamples_fps_and_preserves_384px_quality(self):
         import io
         from unittest import mock
         from PIL import Image
 
-        # Build a 25fps (40ms/frame) 1s animated WebP
+        # Build a 25fps (40ms/frame) 1s animated WebP at 512x512
         src_frames = []
         for i in range(25):
-            im = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
-            im.paste((255, (i * 10) % 256, 40, 255), (40 + i * 2, 60, 220 + i * 2, 240))
+            im = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+            im.paste((255, (i * 10) % 256, 40, 255), (60 + i * 3, 90, 320 + i * 3, 350))
             src_frames.append(im)
         webp_buf = io.BytesIO()
         src_frames[0].save(webp_buf, "WEBP", save_all=True, append_images=src_frames[1:], duration=40, loop=0)
@@ -2576,20 +2629,18 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
 
         def fake_ffmpeg(frames, w, h, fps, ffmpeg, *, max_colors=256, stats_mode="full", dither="none"):
             seen_calls.append((w, h, len(frames), max_colors, dither))
-            # 20fps (20 frames) is > FAST_BYTES (450KB) but <= MAX_BYTES (1MB);
-            # 16.67fps (17 frames) is also > FAST_BYTES; 12.5fps (12/13 frames) is STILL 600KB;
-            # then 160-color attempt must NOT run because we already have a 240px/256-color GIF <= 1MB!
-            return b"GIF89a" + (b"x" * (600 * 1024))
+            # All 256-color attempts return 700KB (> 550KB fast budget, <= 1MB max):
+            # must try lower FPS at 384px/256-colors, then stop BEFORE dropping to 192 colors.
+            return b"GIF89a" + (b"x" * (700 * 1024))
 
         with mock.patch.object(self.stickers, "find_ffmpeg", return_value="ffmpeg"), \
              mock.patch.object(self.stickers, "find_gifsicle", return_value=None), \
              mock.patch.object(self.stickers, "_ffmpeg_rgba_to_gif", side_effect=fake_ffmpeg):
             out = self.stickers.webp_to_wechat_gif(webp_data, "ffmpeg")
 
-        self.assertEqual(len(out), 6 + 600 * 1024)
+        self.assertEqual(len(out), 6 + 700 * 1024)
         self.assertEqual(len(seen_calls), 3)
-        self.assertTrue(all(w == 240 and h == 240 and colors == 256 for w, h, _, colors, _ in seen_calls))
-        # Verify FPS actually decreased across the three 240px attempts
+        self.assertTrue(all(w == 384 and h == 384 and colors == 256 for w, h, _, colors, _ in seen_calls))
         self.assertGreater(seen_calls[0][2], seen_calls[1][2])
         self.assertGreater(seen_calls[1][2], seen_calls[2][2])
 
@@ -2680,26 +2731,26 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         import io
         from PIL import Image
 
-        # 1) Already-compliant <=240px GIF passes through directly
-        small_frames = [Image.new("RGBA", (100, 80), (i * 80, 180, 40, 255)) for i in range(3)]
+        # 1) Already-compliant <=384px GIF passes through directly
+        small_frames = [Image.new("RGBA", (320, 240), (i * 80, 180, 40, 255)) for i in range(3)]
         sbuf = io.BytesIO()
         small_frames[0].save(sbuf, "GIF", save_all=True, append_images=small_frames[1:], duration=80, loop=0)
         small_gif = sbuf.getvalue()
         kind1, out1 = await self.stickers.gif_to_wechat_sticker(small_gif, "image/gif")
         self.assertEqual((kind1, out1), ("sticker", small_gif))
 
-        # 2) Oversized >240px animated GIF is resized to <=240px and <=1MB
-        big_frames = [Image.new("RGBA", (400, 300), (i * 70, 50, 200, 255)) for i in range(4)]
+        # 2) Oversized >384px animated GIF is resized to <=384px and <=1MB
+        big_frames = [Image.new("RGBA", (600, 450), (i * 70, 50, 200, 255)) for i in range(4)]
         bbuf = io.BytesIO()
         big_frames[0].save(bbuf, "GIF", save_all=True, append_images=big_frames[1:], duration=80, loop=0)
         kind2, out2 = await self.stickers.gif_to_wechat_sticker(bbuf.getvalue(), "image/gif")
         self.assertEqual(kind2, "sticker")
         self.assertLessEqual(len(out2), self.stickers.WX_STICKER_MAX_BYTES)
         im2 = Image.open(io.BytesIO(out2))
-        self.assertEqual(im2.size, (240, 180))
+        self.assertEqual(im2.size, (384, 288))
         self.assertGreater(im2.n_frames, 1)
 
-        # 3) MP4 Telegram GIF is transcoded to <=240px <=1MB animated GIF via ffmpeg
+        # 3) MP4 Telegram GIF is transcoded to <=384px <=1MB animated GIF via ffmpeg
         if self.ffmpeg:
             import subprocess
             mp4 = Path(self.tmp.name, "tg_gif.mp4")
@@ -2710,7 +2761,7 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kind3, "sticker")
             self.assertLessEqual(len(out3), self.stickers.WX_STICKER_MAX_BYTES)
             im3 = Image.open(io.BytesIO(out3))
-            self.assertEqual(im3.size, (240, 135))
+            self.assertEqual(im3.size, (384, 216))
             self.assertGreater(im3.n_frames, 1)
             self.assertLessEqual(im3.n_frames, self.stickers.WX_STICKER_MAX_FRAMES)
 
@@ -2722,9 +2773,9 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         # 1) Animated WebP with 10 identical leading frames (600ms) + 5 moving frames (300ms) = 900ms
         webp_frames = []
         for i in range(15):
-            im = Image.new("RGBA", (240, 240), (0, 0, 0, 0))
-            x = 20 if i < 10 else 20 + (i - 9) * 25
-            ImageDraw.Draw(im).rectangle((x, 60, x + 60, 140), fill=(255, 40, 40, 255))
+            im = Image.new("RGBA", (384, 384), (0, 0, 0, 0))
+            x = 30 if i < 10 else 30 + (i - 9) * 35
+            ImageDraw.Draw(im).rectangle((x, 90, x + 90, 210), fill=(255, 40, 40, 255))
             webp_frames.append(im)
         wbuf = io.BytesIO()
         webp_frames[0].save(wbuf, "WEBP", save_all=True, append_images=webp_frames[1:], duration=60, loop=0)
@@ -2732,12 +2783,31 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kind_w, "sticker")
         wim = Image.open(io.BytesIO(out_w))
         wdurs = [fr.info.get("duration") or 0 for fr in ImageSequence.Iterator(wim)]
-        self.assertEqual(wim.size, (240, 240))
+        self.assertEqual(wim.size, (384, 384))
         self.assertLess(wim.n_frames, 10)
         self.assertGreater(wim.n_frames, 1)
         self.assertAlmostEqual(sum(wdurs), 900, delta=80)
         self.assertGreaterEqual(wdurs[0], 450)
         self.assertEqual(wim.convert("RGBA").getpixel((5, 5))[3], 0)
+
+        # 1) Static 1-frame .tgs -> 512px transparent GIF
+        still = lambda v: {"a": 0, "k": v}
+        one_frame_tgs = gzip.compress(json.dumps({
+            "v": "5.5.2", "fr": 30, "ip": 0, "op": 1, "w": 512, "h": 512, "layers": [{
+                "ty": 4, "ip": 0, "op": 1, "st": 0,
+                "ks": {"o": still(100), "p": still([256, 256, 0]), "a": still([0, 0, 0]),
+                       "s": still([100, 100, 100]), "r": still(0)},
+                "shapes": [{"ty": "gr", "it": [
+                    {"ty": "rc", "p": still([0, 0]), "s": still([200, 200]), "r": still(0)},
+                    {"ty": "fl", "c": still([0, 0.8, 0.2, 1]), "o": still(100)},
+                    {"ty": "tr", "p": still([0, 0]), "a": still([0, 0]), "s": still([100, 100]), "r": still(0),
+                     "o": still(100)},
+                ]}],
+            }],
+        }).encode())
+        kind_s, static_tgs_gif = await self.stickers.to_wechat_sticker(one_frame_tgs, "application/x-tgsticker")
+        self.assertEqual(kind_s, "sticker")
+        self.assertEqual(Image.open(io.BytesIO(static_tgs_gif)).size, (512, 512))
 
         # 2) Animated .tgs with static first half (0..14) + moving second half (15..23) at 24fps (1000ms)
         still = lambda v: {"a": 0, "k": v}
@@ -2755,7 +2825,7 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kind_t, "sticker")
         tim = Image.open(io.BytesIO(out_t))
         tdurs = [fr.info.get("duration") or 0 for fr in ImageSequence.Iterator(tim)]
-        self.assertEqual(tim.size, (240, 240))
+        self.assertEqual(tim.size, (384, 384))
         self.assertLess(tim.n_frames, 14)
         self.assertGreater(tim.n_frames, 1)
         self.assertAlmostEqual(sum(tdurs), 1000, delta=100)
@@ -2778,54 +2848,79 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kind_m, "sticker")
             mim = Image.open(io.BytesIO(out_m))
             mdurs = [fr.info.get("duration") or 0 for fr in ImageSequence.Iterator(mim)]
-            self.assertEqual(mim.size, (240, 180))
+            self.assertEqual(mim.size, (320, 240))
             self.assertLess(mim.n_frames, 12)
             self.assertGreaterEqual(sum(mdurs), 1300)
             self.assertGreaterEqual(mdurs[-1], 600)
 
-    async def test_240px_preserved_when_192_colors_fits_within_1mb(self):
+    async def test_384px_preserved_when_192_colors_fits_within_1mb_and_steps_to_320_before_240(self):
         import io
         from unittest import mock
         from PIL import Image
 
         src_frames = []
         for i in range(12):
-            im = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
-            im.paste((255, (i * 20) % 256, 60, 255), (20 + i * 5, 40, 200 + i * 5, 220))
+            im = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+            im.paste((255, (i * 20) % 256, 60, 255), (40 + i * 8, 60, 320 + i * 8, 340))
             src_frames.append(im)
         wbuf = io.BytesIO()
         src_frames[0].save(wbuf, "WEBP", save_all=True, append_images=src_frames[1:], duration=80, loop=0)
 
         seen_calls: list[tuple[int, int]] = []
 
-        def fake_ffmpeg(frames, w, h, fps, ffmpeg, *, max_colors=256, stats_mode="full", dither="none"):
+        def fake_ffmpeg_192(frames, w, h, fps, ffmpeg, *, max_colors=256, stats_mode="full", dither="none"):
             seen_calls.append((w, max_colors))
-            # All 256-color attempts exceed 1 MB; 192-color at 240px fits under 1 MB.
+            # All 256-color attempts exceed 1 MB; 192-color at 384px fits under 1 MB.
             size = 1100 * 1024 if max_colors >= 256 else 400 * 1024
             return b"GIF89a" + (b"x" * size)
 
         with mock.patch.object(self.stickers, "find_ffmpeg", return_value="ffmpeg"), \
              mock.patch.object(self.stickers, "find_gifsicle", return_value=None), \
-             mock.patch.object(self.stickers, "_ffmpeg_rgba_to_gif", side_effect=fake_ffmpeg):
+             mock.patch.object(self.stickers, "_ffmpeg_rgba_to_gif", side_effect=fake_ffmpeg_192):
             out = self.stickers.webp_to_wechat_gif(wbuf.getvalue(), "ffmpeg")
 
         self.assertEqual(len(out), 6 + 400 * 1024)
-        self.assertTrue(all(edge == 240 for edge, _ in seen_calls))
-        self.assertEqual(seen_calls[-1], (240, 192))
+        self.assertTrue(all(edge == 384 for edge, _ in seen_calls))
+        self.assertEqual(seen_calls[-1], (384, 192))
 
-    async def test_sticker_disk_cache_hits_and_lru_eviction(self):
+        # When all 384px attempts exceed 1 MB, fallback steps through 320px before 240px
+        seen_fallback: list[tuple[int, int]] = []
+
+        def fake_ffmpeg_320(frames, w, h, fps, ffmpeg, *, max_colors=256, stats_mode="full", dither="none"):
+            seen_fallback.append((w, max_colors))
+            size = 1100 * 1024 if w >= 384 else 400 * 1024
+            return b"GIF89a" + (b"x" * size)
+
+        with mock.patch.object(self.stickers, "find_ffmpeg", return_value="ffmpeg"), \
+             mock.patch.object(self.stickers, "find_gifsicle", return_value=None), \
+             mock.patch.object(self.stickers, "_ffmpeg_rgba_to_gif", side_effect=fake_ffmpeg_320):
+            out2 = self.stickers.webp_to_wechat_gif(wbuf.getvalue(), "ffmpeg")
+
+        self.assertEqual(len(out2), 6 + 400 * 1024)
+        self.assertEqual(seen_fallback[-1], (320, 192))
+
+    async def test_sticker_disk_cache_hits_isolates_edges_and_lru_eviction(self):
+        import io
         import os
         import time
         from unittest import mock
+        from PIL import Image
 
         cache_dir = Path(self.tmp.name, "scache")
-        # 1) Disk cache hits skip re-converting identical sticker and GIF inputs
+        # 1) Disk cache hits skip re-converting identical sticker inputs and isolate by edge limit
         cache = self.stickers.StickerDiskCache(cache_dir, max_bytes=10 * 1024 * 1024)
         webp = self.webp()
         k1, out1 = await self.stickers.to_wechat_sticker(webp, "image/webp", cache=cache)
+        self.assertEqual(Image.open(io.BytesIO(out1)).size, (512, 512))
         with mock.patch.object(self.stickers, "webp_to_wechat_gif", side_effect=AssertionError("cache miss")):
             k2, out2 = await self.stickers.to_wechat_sticker(webp, "image/webp", cache=cache)
         self.assertEqual((k1, out1), (k2, out2))
+
+        k_legacy, out_legacy = await self.stickers.to_wechat_sticker(
+            webp, "image/webp", cache=cache, max_edge=240, static_max_edge=240,
+        )
+        self.assertEqual(k_legacy, "sticker")
+        self.assertEqual(Image.open(io.BytesIO(out_legacy)).size, (240, 240))
 
         # 2) LRU eviction keeps newest entries within max_bytes budget
         small_cache = self.stickers.StickerDiskCache(Path(self.tmp.name, "slru"), max_bytes=220)
@@ -3368,6 +3463,42 @@ class WeChatClientTimeoutAndRetryTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await wx.supports_stickers())
             self.assertTrue(await wx.supports_stickers())
             self.assertEqual(calls, 2)
+        finally:
+            await wx.close()
+
+    async def test_sticker_edge_limits_detects_daemon_version_and_retries_transient_failure(self):
+        calls = 0
+        ver = "2.5.0"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            assert request.url.path == "/v1/status"
+            calls += 1
+            if calls == 1:
+                return httpx.Response(503, json={"error": {"code": "starting", "retryable": False}})
+            return httpx.Response(200, json={"state": "ready", "version": {"version": ver}})
+
+        wx = WeChatClient("http://localhost:6174", "secret-token", ACC, read_retry_delays=())
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                    headers={"Authorization": "Bearer secret-token"},
+                                    timeout=wx.http.timeout)
+        try:
+            # Transient failure returns safe legacy 240px limits without caching failure
+            self.assertEqual(await wx.sticker_edge_limits(), (240, 240))
+            # 2.5.0 unlocks 384px animated / 512px static and caches result
+            self.assertEqual(await wx.sticker_edge_limits(), (384, 512))
+            self.assertEqual(await wx.sticker_edge_limits(), (384, 512))
+            self.assertEqual(calls, 2)
+
+            # < 2.5.0 stays at 240px
+            ver = "2.4.2"
+            wx._daemon_version = None
+            self.assertEqual(await wx.sticker_edge_limits(), (240, 240))
+
+            # Pre-release / v-prefixed 2.5+ versions also unlock high-res limits
+            ver = "v2.5.1-rc.1"
+            wx._daemon_version = None
+            self.assertEqual(await wx.sticker_edge_limits(), (384, 512))
         finally:
             await wx.close()
 

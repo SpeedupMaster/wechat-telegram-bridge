@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import struct
 import time
 import uuid
@@ -16,6 +17,8 @@ from typing import Any, AsyncIterator
 from urllib.parse import quote, urlsplit
 
 import httpx
+
+from .stickers import WX_STICKER_LEGACY_SIZE, WX_STICKER_SIZE, WX_STICKER_STATIC_SIZE
 
 log = logging.getLogger("wechat")
 
@@ -66,6 +69,13 @@ def _id(value: str) -> str:
     return quote(value, safe="")
 
 
+def _parse_semver(raw: Any) -> tuple[int, int, int] | None:
+    if not isinstance(raw, str):
+        return None
+    m = re.match(r"^\s*v?(\d+)\.(\d+)\.(\d+)", raw)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
 class WeChatClient:
     def __init__(self, base_url: str, token: str, account: str = "",
                  *, read_retry_delays: tuple[float, ...] = (1.0, 2.0)):
@@ -73,6 +83,7 @@ class WeChatClient:
         self._token = token
         self.account = account
         self._supports_stickers: bool | None = None
+        self._daemon_version: tuple[int, int, int] | None = None
         self._sticker_preps: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._read_retry_delays = read_retry_delays
         # trust_env=False: never route the local daemon (and its token) through a system HTTP proxy
@@ -325,6 +336,26 @@ class WeChatClient:
         except (WeChatError, httpx.HTTPError):
             return False
         return self._supports_stickers
+
+    async def daemon_version(self) -> tuple[int, int, int] | None:
+        if self._daemon_version is not None:
+            return self._daemon_version
+        try:
+            st = await self._req("GET", "status")
+        except (WeChatError, httpx.HTTPError):
+            return None
+        vinfo = st.get("version") if isinstance(st, dict) else None
+        ver = _parse_semver(vinfo.get("version") if isinstance(vinfo, dict) else None)
+        if ver is not None:
+            self._daemon_version = ver
+        return ver
+
+    async def sticker_edge_limits(self) -> tuple[int, int]:
+        """Return (animated_edge, static_edge): 384/512 on agent-wechat >= 2.5.0, else 240/240."""
+        ver = await self.daemon_version()
+        if ver is not None and ver >= (2, 5, 0):
+            return WX_STICKER_SIZE, WX_STICKER_STATIC_SIZE
+        return WX_STICKER_LEGACY_SIZE, WX_STICKER_LEGACY_SIZE
 
     async def prepare_sticker(self, media: Media, key: str, *, fit: bool = True) -> dict:
         files = {"file": (media.filename, media.data, media.mime)}
