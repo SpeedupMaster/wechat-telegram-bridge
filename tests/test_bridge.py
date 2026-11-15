@@ -730,6 +730,158 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.b.bot.sent), n_sent, "echo of our own send must not be forwarded")
         self.assertEqual(self.b.store.wx_for_tg(chat, 9001), ("echo", "902"))
 
+    async def test_wechat_quote_of_tg_sent_messages_basic_group(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m0", "wxid_bob", "hi", server="700")
+        await self.event("m0", "wxid_bob")
+        chat = self.b.store.chat_for_thread("wxid_bob")
+
+        # 1) Bot sees sticker before on_tg_message finishes -> bot-side ID is persisted for native TG reply
+        sticker_user = SimpleNamespace(
+            id=8201, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, voice=None, video_note=None, gif=None, video=None, sticker=True,
+            media=SimpleNamespace(document=SimpleNamespace(id=7101)),
+            file=SimpleNamespace(size=100, mime_type="image/webp", ext=".webp", name=None),
+            download_media=lambda file=None: asyncio.sleep(0, result=StickerTests.webp()),
+        )
+        sticker_bot = SimpleNamespace(id=8821, message="", media=SimpleNamespace(document=SimpleNamespace(id=7101)))
+        await self.b.on_bot_sees_user_message(SimpleNamespace(chat_id=chat, message=sticker_bot))
+        await self.b.on_tg_message(SimpleNamespace(chat_id=chat, message=sticker_user))
+        st_server = self.b.store.wx_for_tg(chat, 8201)[1]
+        self.assertEqual(self.b.store.tg_for_wx("wxid_bob", None, st_server), (chat, 8821))
+
+        self.daemon.add_message(
+            "wx_q1", "wxid_bob", "虎子快点把手手放进去", type_=49, appMessageType=57, server="701",
+            quote={"senderName": "我", "serverId": st_server, "messageId": "committed-st-1"},
+        )
+        await self.event("wx_q1", "wxid_bob")
+        q1_sent = self.b.bot.sent[-1]
+        self.assertEqual(q1_sent.kwargs["reply_to"], 8821)
+        self.assertEqual(q1_sent.text, "虎子快点把手手放进去")
+
+        # 2) Text sent from TG, then bot update arrives *after* _record_send -> still pairs & enables native reply
+        await self.b.on_tg_message(tg_event(chat, 8202, "first from tg"))
+        txt_bot = SimpleNamespace(id=8822, message="first from tg", media=None)
+        await self.b.on_bot_sees_user_message(SimpleNamespace(chat_id=chat, message=txt_bot))
+        txt_server = self.b.store.wx_for_tg(chat, 8202)[1]
+        self.daemon.add_message(
+            "wx_q2", "wxid_bob", "got your text", type_=49, appMessageType=57, server="702",
+            quote={"senderName": "我", "serverId": txt_server},
+        )
+        await self.event("wx_q2", "wxid_bob")
+        q2_sent = self.b.bot.sent[-1]
+        self.assertEqual(q2_sent.kwargs["reply_to"], 8822)
+        self.assertEqual(q2_sent.text, "got your text")
+
+        # 3) Basic group without bot pairing -> never uses user-side ID; resolves quoted content for fallback
+        await self.b.on_tg_message(tg_event(chat, 8203, "unpaired tg text"))
+        unpaired_server = self.b.store.wx_for_tg(chat, 8203)[1]
+        self.daemon.add_message("wx_unpaired", "wxid_bob", "unpaired tg text", direction="outgoing", server=unpaired_server)
+        self.daemon.add_message(
+            "wx_q3", "wxid_bob", "reply to unpaired", type_=49, appMessageType=57, server="703",
+            quote={"senderName": "我", "serverId": unpaired_server},
+        )
+        await self.event("wx_q3", "wxid_bob")
+        q3_sent = self.b.bot.sent[-1]
+        self.assertIsNone(q3_sent.kwargs["reply_to"])
+        self.assertEqual(q3_sent.text, "<blockquote>我：unpaired tg text</blockquote>reply to unpaired")
+
+    async def test_wechat_quote_in_supergroup_and_legacy_user_only_row(self):
+        sg = -1001234567890
+        self.daemon.add_thread("wxid_sg", "SGTeam", kind="group")
+        self.b.store.link("wxid_sg", sg, "SGTeam")
+
+        sticker_user = SimpleNamespace(
+            id=3001, message="", action=None, via_bot_id=None, reply_to=None,
+            photo=None, voice=None, video_note=None, gif=None, video=None, sticker=True,
+            media=SimpleNamespace(document=SimpleNamespace(id=7201)),
+            file=SimpleNamespace(size=100, mime_type="image/webp", ext=".webp", name=None),
+            download_media=lambda file=None: asyncio.sleep(0, result=StickerTests.webp()),
+        )
+        await self.b.on_tg_message(SimpleNamespace(chat_id=sg, message=sticker_user))
+        st_server = self.b.store.wx_for_tg(sg, 3001)[1]
+
+        self.daemon.add_message(
+            "sg_q1", "wxid_sg", "nice sticker", type_=49, appMessageType=57, sender="wxid_alice", server="710",
+            quote={"senderName": "我", "serverId": st_server},
+        )
+        await self.event("sg_q1", "wxid_sg")
+        s1 = self.b.bot.sent[-1]
+        self.assertEqual(s1.kwargs["reply_to"], 3001)
+        self.assertNotIn("<blockquote>", s1.text)
+
+        # Legacy DB row written before bot-side mapping existed (only side='user' in supergroup)
+        self.b.store.map_message(sg, "user", 3002, "wxid_sg", "wx-legacy", "711")
+        self.daemon.add_message(
+            "sg_q2", "wxid_sg", "reply legacy", type_=49, appMessageType=57, sender="wxid_alice", server="712",
+            quote={"senderName": "我", "serverId": "711"},
+        )
+        await self.event("sg_q2", "wxid_sg")
+        s2 = self.b.bot.sent[-1]
+        self.assertEqual(s2.kwargs["reply_to"], 3002)
+        self.assertNotIn("<blockquote>", s2.text)
+
+    async def test_wechat_quote_of_bridged_wx_msg_by_message_id(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m1", "wxid_bob", "local only id", server=None)
+        await self.event("m1", "wxid_bob")
+        m1_bot_id = self.b.bot.sent[-1].id
+
+        # Same messageId in another thread must not collide
+        self.daemon.add_thread("wxid_other", "Other")
+        self.daemon.add_message("m1", "wxid_other", "other chat msg", server=None)
+        await self.event("m1", "wxid_other")
+
+        self.daemon.add_message(
+            "m2", "wxid_bob", "quoting m1 by messageId", type_=49, appMessageType=57, server="720",
+            quote={"senderName": "Bob", "messageId": "m1"},
+        )
+        await self.event("m2", "wxid_bob")
+        sent = self.b.bot.sent[-1]
+        self.assertEqual(sent.kwargs["reply_to"], m1_bot_id)
+        self.assertEqual(sent.text, "quoting m1 by messageId")
+
+    async def test_wechat_quote_fallback_renders_meaningful_label_instead_of_ellipsis(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m0", "wxid_bob", "hi", server="730")
+        await self.event("m0", "wxid_bob")
+
+        cases = [
+            ("q_st", {"senderName": "Bob", "type": 47}, "[表情]"),
+            ("q_im", {"senderName": "Bob", "type": 3}, "[图片]"),
+            ("q_vo", {"senderName": "Bob", "type": 34}, "[语音]"),
+            ("q_vi", {"senderName": "Bob", "type": 43}, "[视频]"),
+            ("q_fi", {"senderName": "Bob", "type": 49, "appMessageType": 6}, "[文件]"),
+        ]
+        for mid, quote, expected in cases:
+            self.daemon.add_message(mid, "wxid_bob", "ok", type_=49, appMessageType=57, server=f"s-{mid}", quote=quote)
+            await self.event(mid, "wxid_bob")
+            self.assertEqual(self.b.bot.sent[-1].text, f"<blockquote>Bob：{expected}</blockquote>ok")
+
+        # Minimal quote (only senderName + serverId), resolved from daemon history rather than rendering '…'
+        self.daemon.add_message("orig_hist", "wxid_bob", "历史消息内容", server="739")
+        self.daemon.add_message(
+            "q_hist", "wxid_bob", "agree", type_=49, appMessageType=57, server="740",
+            quote={"senderName": "Bob", "serverId": "739"},
+        )
+        await self.event("q_hist", "wxid_bob")
+        self.assertEqual(self.b.bot.sent[-1].text, "<blockquote>Bob：历史消息内容</blockquote>agree")
+
+    async def test_telegram_reply_to_own_pending_echo_text_resolves_wx_msg(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m0", "wxid_bob", "hi", server="750")
+        await self.event("m0", "wxid_bob")
+        chat = self.b.store.chat_for_thread("wxid_bob")
+
+        await self.b.on_tg_message(tg_event(chat, 9100, "first"))
+        first_server = self.b.store.wx_for_tg(chat, 9100)[1]
+        # Before echo event runs, wx_msg is None; thread_messages has committed wx msg
+        self.daemon.add_message("wx-committed-first", "wxid_bob", "first", direction="outgoing", server=first_server)
+
+        await self.b.on_tg_message(tg_event(chat, 9101, "second", reply_to=9100))
+        body, _ = self.daemon.sends[-1]
+        self.assertEqual(body.get("quote"), {"messageId": "wx-committed-first", "serverId": first_server})
+
     async def test_phone_outgoing_is_forwarded_silently(self):
         self.daemon.add_thread("wxid_bob", "Bob")
         self.daemon.add_message("out1", "wxid_bob", "from phone", direction="outgoing", server="555")

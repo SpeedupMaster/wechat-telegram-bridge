@@ -965,8 +965,8 @@ class Bridge(LoginMixin):
             return "[表情]"
         return _fmt_wx_text(body) or _unsupported_label(t, msg.get("appMessageType"))
 
-    def _quote_prefix(self, msg: dict) -> str:
-        q = msg.get("quote") or {}
+    @staticmethod
+    def _quote_inline_text(q: dict) -> str:
         el = q.get("embeddedLink") or {}
         el_title = el.get("title") or ""
         if _is_channels_placeholder(el_title) or (
@@ -978,8 +978,83 @@ class Bridge(LoginMixin):
             if emb_text.startswith(pfx):
                 emb_text = "🎬 " + emb_text[len(pfx):]
                 break
-        text = emb_text or ("[图片]" if q.get("embeddedImage") else "[表情]" if q.get("embeddedSticker")
-                             else el_title or "…")
+        if emb_text:
+            return emb_text
+        if q.get("embeddedImage"):
+            return "[图片]"
+        if q.get("embeddedSticker"):
+            return "[表情]"
+        if q.get("embeddedVideo"):
+            return "[视频]"
+        if q.get("embeddedVoice"):
+            return "[语音]"
+        if ef := q.get("embeddedFile"):
+            name = (ef.get("filename") or ef.get("title") or "") if isinstance(ef, dict) else ""
+            return f"[文件] {name}" if name else "[文件]"
+        if eloc := q.get("embeddedLocation"):
+            label = " ".join(x for x in (eloc.get("name"), eloc.get("address")) if x) if isinstance(eloc, dict) else ""
+            return f"📍 {label}" if label else "[位置]"
+        if el_title:
+            return el_title
+        for key in ("text", "body", "content", "title"):
+            val = q.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        qt, qsub = q.get("type"), q.get("appMessageType")
+        if qt == APP:
+            return {APP_FILE: "[文件]", 19: "[聊天记录]", APP_CHANNELS: "[视频号]", APP_QUOTE: "[引用消息]"}.get(qsub, "")
+        return {IMAGE: "[图片]", VOICE: "[语音]", VIDEO: "[视频]", STICKER: "[表情]", LOCATION: "[位置]"}.get(qt, "")
+
+    @staticmethod
+    def _quote_msg_summary(orig: dict) -> str:
+        t, sub, body = orig.get("type"), orig.get("appMessageType"), (orig.get("body") or "").strip()
+        if t == TEXT:
+            return body
+        if t in (IMAGE, VOICE, VIDEO, STICKER):
+            return {IMAGE: "[图片]", VOICE: "[语音]", VIDEO: "[视频]", STICKER: "[表情]"}[t]
+        if t == LOCATION:
+            loc = orig.get("location") or {}
+            label = " ".join(x for x in (loc.get("name"), loc.get("address")) if x) or body
+            return f"📍 {label}" if label else "[位置]"
+        if t == APP:
+            link = orig.get("link") or {}
+            if sub == APP_FILE:
+                name = (link.get("title") or "").strip()
+                return f"[文件] {name}" if name else "[文件]"
+            if sub == APP_CHANNELS:
+                title = (link.get("description") or link.get("title") or "").strip()
+                if title and not _is_channels_placeholder(title):
+                    return f"🎬 {title}"
+                return f"🎬 视频号 · {link['sourceName']}" if link.get("sourceName") else "[视频号]"
+            if sub == 19:
+                return f"📜 聊天记录 {body}".strip() if body else "[聊天记录]"
+            if link:
+                return (link.get("title") or link.get("description") or link.get("url") or "").strip()
+        return body
+
+    async def _lookup_wx_message(self, thread_id: str, wx_msg: str | None, wx_server: str | None) -> dict | None:
+        wx_msg = Store._norm_id(wx_msg)
+        wx_server = Store._norm_id(wx_server)
+        if wx_msg:
+            try:
+                if m := await self.wx.message(wx_msg):
+                    return m
+            except Exception as e:
+                log.debug("Could not fetch quoted WeChat message %s: %s", wx_msg, e)
+        if wx_msg or wx_server:
+            try:
+                for m in await self.wx.thread_messages(thread_id, limit=30):
+                    if (wx_msg and Store._norm_id(m.get("id")) == wx_msg) or (
+                        wx_server and Store._norm_id(m.get("serverId")) == wx_server
+                    ):
+                        return m
+            except Exception as e:
+                log.debug("Could not scan thread %s for message (%s/%s): %s", thread_id, wx_msg, wx_server, e)
+        return None
+
+    def _quote_prefix(self, msg: dict, orig: dict | None = None) -> str:
+        q = msg.get("quote") or {}
+        text = self._quote_inline_text(q) or (self._quote_msg_summary(orig) if orig else "") or "…"
         who = q.get("senderName") or ""
         return f"<blockquote>{_esc(who + '：' if who else '')}{_fmt_wx_text(text[:200])}</blockquote>"
 
@@ -995,11 +1070,22 @@ class Bridge(LoginMixin):
         reply_to = None
         prefix = ""
         if msg.get("type") == APP and msg.get("appMessageType") == APP_QUOTE and msg.get("quote"):
-            hit = self.store.tg_for_wx(msg["threadId"], None, msg["quote"].get("serverId"))
+            q = msg["quote"]
+            q_msg_id = Store._norm_id(q.get("messageId") or q.get("referencedMessageId") or q.get("targetMessageId"))
+            q_server = Store._norm_id(q.get("serverId") or q.get("serverMessageId"))
+            hit = self.store.tg_for_wx(msg["threadId"], q_msg_id, q_server)
+            orig = None
+            if not (hit and hit[0] == chat) and (q_msg_id or q_server):
+                if not self._quote_inline_text(q):
+                    orig = await self._lookup_wx_message(msg["threadId"], q_msg_id, q_server)
+                    if orig:
+                        hit2 = self.store.tg_for_wx(msg["threadId"], orig.get("id"), orig.get("serverId"))
+                        if hit2 and hit2[0] == chat:
+                            hit = hit2
             if hit and hit[0] == chat:
                 reply_to = hit[1]
             else:
-                prefix = self._quote_prefix(msg)
+                prefix = self._quote_prefix(msg, orig)
 
         media: Media | str | None = None
         channels_video_err = ""
@@ -1048,6 +1134,8 @@ class Bridge(LoginMixin):
         )
         for m in sent:
             self.store.map_message(chat, "bot", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
+            if chat < -1000000000000:
+                self.store.map_message(chat, "user", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
             self._pair(chat, _fingerprint(m), bot=(msg["threadId"], msg["id"], msg.get("serverId")))
         self.forwarded += 1
 
@@ -1079,6 +1167,10 @@ class Bridge(LoginMixin):
             for k in list(self._user_to_bot_msg)[:1000]:
                 self._user_to_bot_msg.pop(k, None)
         self._user_to_bot_msg[key] = bot_id
+        # If this user message was recorded before the bot update arrived, persist its bot-side id too.
+        if self.store.wx_for_tg(chat_id, bot_id, side="bot") is None:
+            if entry := self.store.wx_entry_for_tg(chat_id, user_id, side="user"):
+                self.store.map_message(chat_id, "bot", bot_id, *entry)
         if ev := self._bot_pair_events.get(key):
             ev.set()
 
@@ -1873,9 +1965,14 @@ class Bridge(LoginMixin):
 
         quote_ref = None
         if msg.reply_to and msg.reply_to.reply_to_msg_id:
-            hit = self.store.wx_for_tg(chat_id, msg.reply_to.reply_to_msg_id)
-            if hit and hit[0] and hit[1]:
-                quote_ref = {"messageId": hit[0], "serverId": hit[1]}
+            reply_id = msg.reply_to.reply_to_msg_id
+            if entry := self.store.wx_entry_for_tg(chat_id, reply_id):
+                r_thread, r_wx_msg, r_server = entry
+                if r_thread == thread_id and r_server:
+                    if not r_wx_msg:
+                        r_wx_msg = await self._resolve_wx_msg_id(chat_id, reply_id, r_thread, r_wx_msg, r_server)
+                    if r_wx_msg:
+                        quote_ref = {"messageId": r_wx_msg, "serverId": r_server}
 
         mentions = await self._resolve_mentions(thread_id, text) if text else None
 
@@ -2005,18 +2102,33 @@ class Bridge(LoginMixin):
         for i, part in enumerate(pages):
             await self.bot.send_message(chat_id, part, parse_mode="html", reply_to=reply_to if i == 0 else None)
 
+    def _map_tg_wx(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,
+                   wx_server: str | None) -> None:
+        self.store.map_message(chat_id, "user", tg_msg, thread_id, wx_msg, wx_server)
+        bot_msg = tg_msg if chat_id < -1000000000000 else self._user_to_bot_msg.get((chat_id, tg_msg))
+        if bot_msg is not None:
+            self.store.map_message(chat_id, "bot", bot_msg, thread_id, wx_msg, wx_server)
+
     def _record_send(self, chat_id: int, tg_msg: int, thread_id: str, result: dict, media: bool = False) -> None:
         res = result.get("result") if isinstance(result.get("result"), dict) else {}
-        server = (result.get("serverMessageId") or res.get("serverMessageId")) if media else result.get("serverId")
+        server = Store._norm_id(
+            result.get("serverMessageId") or res.get("serverMessageId")
+            or result.get("serverId") or res.get("serverId")
+        )
         local = result.get("localMessageId")
         if media and res:
             ids = res.get("messageIds") or []
             local = ids[0] if ids else res.get("messageId") or local
+        local = Store._norm_id(local)
         if server:
             self.store.add_sent(thread_id, server)
         # One Telegram message may become two WeChat sends (media + caption); quotes point at the first.
-        if (server or local) and self.store.wx_for_tg(chat_id, tg_msg) is None:
-            self.store.map_message(chat_id, "user", tg_msg, thread_id, local, server)
+        if server or local:
+            if self.store.wx_for_tg(chat_id, tg_msg) is None:
+                self.store.map_message(chat_id, "user", tg_msg, thread_id, local, server)
+            bot_msg = tg_msg if chat_id < -1000000000000 else self._user_to_bot_msg.get((chat_id, tg_msg))
+            if bot_msg is not None and self.store.wx_for_tg(chat_id, bot_msg, side="bot") is None:
+                self.store.map_message(chat_id, "bot", bot_msg, thread_id, local, server)
 
     async def _tg_media(self, msg, *, native_stickers: bool = True) -> tuple[str | None, Media | str]:
         f = msg.file
@@ -2073,18 +2185,20 @@ class Bridge(LoginMixin):
             return "已超过微信 2 分钟撤回时限，微信端未撤回（仅从 Telegram 删除）"
         return "已超过微信 2 分钟撤回时限，无法从微信撤回"
 
+    async def _resolve_wx_msg_id(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,
+                                   wx_server: str | None) -> str | None:
+        if wx_msg or not wx_server:
+            return wx_msg
+        if m := await self._lookup_wx_message(thread_id, None, wx_server):
+            resolved = Store._norm_id(m.get("id"))
+            if resolved:
+                self._map_tg_wx(chat_id, tg_msg, thread_id, resolved, wx_server)
+                return resolved
+        return None
+
     async def _recall_tg_msg(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,
                                wx_server: str | None, key_prefix: str) -> tuple[bool, str]:
-        if not wx_msg and wx_server:
-            try:
-                for m in await self.wx.thread_messages(thread_id, limit=30):
-                    if str(m.get("serverId") or "") == str(wx_server):
-                        wx_msg = m.get("id")
-                        if wx_msg:
-                            self.store.map_message(chat_id, "user", tg_msg, thread_id, wx_msg, wx_server)
-                        break
-            except Exception as e:
-                log.info("Could not resolve wx message id for recall (%s): %s", wx_server, e)
+        wx_msg = await self._resolve_wx_msg_id(chat_id, tg_msg, thread_id, wx_msg, wx_server)
         if not wx_msg or not wx_server:
             return False, "这条消息还没有可用的微信消息 ID，暂时无法撤回"
         tag = (thread_id, str(wx_server))

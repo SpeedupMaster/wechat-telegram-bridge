@@ -84,38 +84,66 @@ class Store:
         self.db.execute("UPDATE threads SET title=? WHERE wx_thread=?", (title, wx_thread))
 
     # --- messages ---------------------------------------------------------
+    @staticmethod
+    def _norm_id(value: str | int | None) -> str | None:
+        if value is None:
+            return None
+        s = str(value).strip()
+        return None if s in ("", "0") else s
+
     def map_message(self, tg_chat: int, side: str, tg_msg: int, wx_thread: str, wx_msg: str | None,
                     wx_server: str | None) -> None:
+        wx_msg = self._norm_id(wx_msg)
+        wx_server = self._norm_id(wx_server)
         self.db.execute(
             "INSERT INTO msgmap(tg_chat,side,tg_msg,wx_thread,wx_msg,wx_server) VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(tg_chat,side,tg_msg) DO UPDATE SET wx_msg=COALESCE(excluded.wx_msg,wx_msg), "
             "wx_server=COALESCE(excluded.wx_server,wx_server)",
             (tg_chat, side, tg_msg, wx_thread, wx_msg, wx_server))
 
+    def wx_entry_for_tg(self, tg_chat: int, tg_msg: int, side: str = "user") -> tuple[str, str | None, str | None] | None:
+        sides = ("user", "bot") if side == "user" and tg_chat < -1000000000000 else (side,)
+        for s in sides:
+            row = self.db.execute(
+                "SELECT wx_thread, wx_msg, wx_server FROM msgmap WHERE tg_chat=? AND side=? AND tg_msg=?",
+                (tg_chat, s, tg_msg)).fetchone()
+            if row:
+                return row[0], row[1], row[2]
+        return None
+
     def wx_for_tg(self, tg_chat: int, tg_msg: int, side: str = "user") -> tuple[str | None, str | None] | None:
-        row = self.db.execute("SELECT wx_msg, wx_server FROM msgmap WHERE tg_chat=? AND side=? AND tg_msg=?",
-                              (tg_chat, side, tg_msg)).fetchone()
-        return (row[0], row[1]) if row else None
+        entry = self.wx_entry_for_tg(tg_chat, tg_msg, side)
+        return (entry[1], entry[2]) if entry else None
 
     def tg_for_wx(self, wx_thread: str, wx_msg: str | None, wx_server: str | None,
                   side: str = "bot") -> tuple[int, int] | None:
-        if wx_msg:
-            row = self.db.execute("SELECT tg_chat, tg_msg FROM msgmap WHERE wx_msg=? AND side=? ORDER BY tg_msg LIMIT 1",
-                                  (wx_msg, side)).fetchone()
-            if row:
-                return row[0], row[1]
-        if wx_server:
+        for col, val in (("wx_msg", self._norm_id(wx_msg)), ("wx_server", self._norm_id(wx_server))):
+            if not val:
+                continue
             row = self.db.execute(
-                "SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND wx_server=? AND side=? ORDER BY tg_msg LIMIT 1",
-                (wx_thread, wx_server, side)).fetchone()
+                f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side=? ORDER BY tg_msg LIMIT 1",
+                (wx_thread, val, side)).fetchone()
             if row:
                 return row[0], row[1]
+            # Supergroups share one message-ID space across user and bot sessions; also match legacy user-only rows.
+            if side == "bot":
+                row = self.db.execute(
+                    f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side='user' AND tg_chat < -1000000000000 ORDER BY tg_msg LIMIT 1",
+                    (wx_thread, val)).fetchone()
+                if row:
+                    return row[0], row[1]
         return None
 
     def add_sent(self, wx_thread: str, wx_server: str) -> None:
+        wx_server = self._norm_id(wx_server)
+        if not wx_server:
+            return
         self.db.execute("INSERT OR IGNORE INTO sent(wx_thread,wx_server) VALUES(?,?)", (wx_thread, wx_server))
 
     def is_sent(self, wx_thread: str, wx_server: str) -> bool:
+        wx_server = self._norm_id(wx_server)
+        if not wx_server:
+            return False
         return self.db.execute("SELECT 1 FROM sent WHERE wx_thread=? AND wx_server=?",
                                (wx_thread, wx_server)).fetchone() is not None
 
@@ -133,6 +161,9 @@ class Store:
 
     def claim_echo(self, wx_thread: str, wx_server: str, wx_msg: str) -> bool:
         """True if this outgoing WeChat message is one we sent from Telegram (and links its saved id)."""
+        wx_server = self._norm_id(wx_server)
+        if not wx_server:
+            return False
         if not self.db.execute("SELECT 1 FROM sent WHERE wx_thread=? AND wx_server=?",
                                (wx_thread, wx_server)).fetchone():
             return False
