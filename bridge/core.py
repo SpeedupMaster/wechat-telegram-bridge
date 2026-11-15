@@ -176,11 +176,25 @@ def _is_channels_placeholder(text: str) -> bool:
     return text.startswith(_CHANNELS_PLACEHOLDER_TITLE) or text.startswith(f"[Link] {_CHANNELS_PLACEHOLDER_TITLE}")
 
 
+def _format_duration(seconds: int | float | None) -> str:
+    if seconds is None or isinstance(seconds, bool):
+        return ""
+    sec = int(seconds)
+    if sec <= 0:
+        return ""
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def _channels_body(link: dict | None, body: str = "") -> str:
     """Render WeChat Channels (type 49/51) without WeChat's legacy upgrade placeholder."""
     if link:
         source = (link.get("sourceName") or "").strip()
+        dur = _format_duration(link.get("durationSeconds"))
         header = f"🎬 <b>视频号 · {_esc(source)}</b>" if source else "🎬 <b>视频号</b>"
+        if dur:
+            header += f" ({dur})"
         title = (link.get("title") or "").strip()
         desc = (link.get("description") or "").strip()
         url = (link.get("url") or "").strip()
@@ -189,9 +203,28 @@ def _channels_body(link: dict | None, body: str = "") -> str:
         if _CHANNELS_PLACEHOLDER_URL in url:
             url = ""
         return "\n".join(p for p in (header, _fmt_wx_text(title), _fmt_wx_text(desc), _esc(url)) if p)
-    lines = [ln for ln in (body or "").splitlines()
-             if ln.strip() and not _is_channels_placeholder(ln.strip()) and _CHANNELS_PLACEHOLDER_URL not in ln]
+    lines = []
+    for raw_ln in (body or "").splitlines():
+        ln = raw_ln.strip()
+        if not ln or _is_channels_placeholder(ln) or _CHANNELS_PLACEHOLDER_URL in ln:
+            continue
+        for prefix in ("[Channels video] ", "[Channels] "):
+            if ln.startswith(prefix):
+                ln = ln[len(prefix):].strip()
+                break
+        if ln:
+            lines.append(ln)
     return "\n".join(["🎬 <b>视频号</b>", *(_fmt_wx_text(ln) for ln in lines)])
+
+
+def _guess_image_media(data: bytes, stem: str) -> Media:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return Media(data, "image/png", f"{stem}.png")
+    if data.startswith(b"GIF8"):
+        return Media(data, "image/gif", f"{stem}.gif")
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return Media(data, "image/webp", f"{stem}.webp")
+    return Media(data, "image/jpeg", f"{stem}.jpg")
 
 
 def _is_link_card(msg: dict) -> bool:
@@ -268,6 +301,28 @@ MEDIA_REASONS = {
     "media_expired": "已过期",
     "unsupported_media": "不支持",
     "unsupported_media_transport": "不支持",
+    "unsupported_attachment_transport": "上游暂不支持该附件类型",
+    "media_integrity_failed": "文件校验失败",
+    "video_representation_mismatch": "视频版本校验不一致",
+    "cdn_download_failed": "微信 CDN 下载失败",
+    "media_source_changed": "源文件已变更",
+    "media_identity_unavailable": "媒体标识不可用",
+    "auth_required": "微信登录鉴权已失效，请重新登录",
+    "transport_unavailable": "传输服务暂不可用",
+    "media_service_rejected": "微信媒体服务拒绝请求",
+    "channels_post_unavailable": "该视频号内容已删除、过期或设为私密",
+    "channels_unsupported_media": "暂不支持该类型的视频号内容",
+    "channels_route_unsupported": "当前通道不支持获取该视频号视频",
+    "channels_rejected": "微信拒绝获取该视频号内容",
+    "channels_media_too_large": "视频号视频超过大小限制",
+    "channels_download_failed": "视频号视频下载失败",
+    "channels_integrity_failed": "视频号视频校验失败",
+    "channels_ticket_failed": "获取视频号凭证失败",
+    "channels_page_failed": "获取视频号页面失败",
+    "channels_detail_failed": "获取视频号详情失败",
+    "channels_ticket_unreadable": "解析视频号凭证失败",
+    "channels_page_unreadable": "解析视频号页面失败",
+    "channels_detail_unreadable": "解析视频号详情失败",
 }
 
 WX_TYPE_NAMES = {
@@ -911,10 +966,17 @@ class Bridge(LoginMixin):
         q = msg.get("quote") or {}
         el = q.get("embeddedLink") or {}
         el_title = el.get("title") or ""
-        if _is_channels_placeholder(el_title):
+        if _is_channels_placeholder(el_title) or (
+            not el_title and (el.get("description") or el.get("sourceName") or el.get("durationSeconds") is not None)
+        ):
             el_title = el.get("description") or (f"视频号 · {el['sourceName']}" if el.get("sourceName") else "视频号")
-        text = q.get("embeddedText") or ("[图片]" if q.get("embeddedImage") else "[表情]" if q.get("embeddedSticker")
-                                         else el_title or "…")
+        emb_text = q.get("embeddedText") or ""
+        for pfx in ("[Channels video] ", "[Channels] "):
+            if emb_text.startswith(pfx):
+                emb_text = "🎬 " + emb_text[len(pfx):]
+                break
+        text = emb_text or ("[图片]" if q.get("embeddedImage") else "[表情]" if q.get("embeddedSticker")
+                             else el_title or "…")
         who = q.get("senderName") or ""
         return f"<blockquote>{_esc(who + '：' if who else '')}{_fmt_wx_text(text[:200])}</blockquote>"
 
@@ -937,7 +999,9 @@ class Bridge(LoginMixin):
                 prefix = self._quote_prefix(msg)
 
         media: Media | str | None = None
+        channels_video_err = ""
         t = msg.get("type")
+        is_channels = t == APP and msg.get("appMessageType") == APP_CHANNELS
         if t in (IMAGE, VIDEO, VOICE, STICKER) or (t == APP and msg.get("appMessageType") == APP_FILE):
             try:
                 media = await self.wx.download_media(msg, self.max_media)
@@ -948,6 +1012,17 @@ class Bridge(LoginMixin):
             if isinstance(media, Media) and t == VOICE and media.mime == "audio/wav":
                 if ogg := await wav_to_ogg(media.data):
                     media = Media(ogg, "audio/ogg", "voice.ogg")
+        elif is_channels:
+            try:
+                media = await self.wx.download_channels_video(msg, self.max_media)
+            except WeChatError as e:
+                media = e.code
+            if isinstance(media, str):
+                channels_video_err = media
+                log.info("Could not download Channels video of WeChat message %s: %s", msg["id"], media)
+                media = None
+            if media is None and (cover := await self.wx.download_link_thumbnail(msg)):
+                media = _guess_image_media(cover, "channels-cover")
         elif _is_link_card(msg) and self.cfg.bridge.link_card_images:
             link = msg["link"]
             thumb_bytes = await self.wx.download_link_thumbnail(msg)
@@ -964,7 +1039,10 @@ class Bridge(LoginMixin):
                 media = Media(card_png, "image/png", "link-card.png")
 
         silent = outgoing and self.cfg.bridge.outgoing_silent
-        sent = await self._send_tg(chat, thread, header, prefix, msg, media, reply_to, silent)
+        sent = await self._send_tg(
+            chat, thread, header, prefix, msg, media, reply_to, silent,
+            channels_video_err=channels_video_err,
+        )
         for m in sent:
             self.store.map_message(chat, "bot", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
             self._pair(chat, _fingerprint(m), bot=(msg["threadId"], msg["id"], msg.get("serverId")))
@@ -1037,13 +1115,19 @@ class Bridge(LoginMixin):
             self._bot_pair_events.pop(key, None)
         return self._user_to_bot_msg.get(key)
 
-    async def _send_tg(self, chat, thread, header, prefix, msg, media, reply_to, silent) -> list:
+    async def _send_tg(self, chat, thread, header, prefix, msg, media, reply_to, silent,
+                       *, channels_video_err: str = "") -> list:
         async def go(chat_id: int) -> list:
             out = []
             reply = reply_to
             t = msg.get("type")
+            is_channels = t == APP and msg.get("appMessageType") == APP_CHANNELS
             is_link = _is_link_card(msg)
             send_media = media
+            channels_err_note = (
+                f"\n<i>（视频无法获取：{_esc(MEDIA_REASONS.get(channels_video_err, channels_video_err))}）</i>"
+                if is_channels and channels_video_err else ""
+            )
             if isinstance(send_media, Media) and is_link:
                 f = io.BytesIO(send_media.data)
                 f.name = send_media.filename
@@ -1077,8 +1161,11 @@ class Bridge(LoginMixin):
                     send_media = None
 
             if isinstance(send_media, Media):
-                caption = header + prefix + (self._body(msg) if t == APP and msg.get("appMessageType") != APP_FILE
-                                             else "")
+                caption = (
+                    header + prefix
+                    + (self._body(msg) if t == APP and msg.get("appMessageType") != APP_FILE else "")
+                    + channels_err_note
+                )
                 if t == STICKER:
                     converted = await asyncio.to_thread(stickers.from_wechat_sticker, send_media.data, send_media.mime)
                     if converted is not None:
@@ -1119,10 +1206,14 @@ class Bridge(LoginMixin):
                 f = io.BytesIO(send_media.data)
                 f.name = send_media.filename
                 is_voice = t == VOICE and send_media.mime in ("audio/ogg", "audio/opus")
-                kwargs = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
-                              silent=silent, voice_note=is_voice, supports_streaming=t == VIDEO,
-                              force_document=t == APP or (t == VOICE and not send_media.mime.startswith("audio/")))
-                if t == VIDEO:
+                is_video = t == VIDEO or (is_channels and send_media.mime.startswith("video/"))
+                kwargs = dict(
+                    caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
+                    silent=silent, voice_note=is_voice, supports_streaming=is_video,
+                    force_document=(t == APP and msg.get("appMessageType") == APP_FILE) or (
+                        t == VOICE and not send_media.mime.startswith("audio/")),
+                )
+                if is_video:
                     if send_media.mime.startswith("video/"):
                         kwargs["mime_type"] = send_media.mime
                     kwargs["nosound_video"] = True
@@ -1184,7 +1275,7 @@ class Bridge(LoginMixin):
                 text = header + prefix + _link_body(msg["link"], msg.get("appMessageType"), inline_url=not buttons)
             else:
                 buttons = None
-                text = header + prefix + self._body(msg)
+                text = header + prefix + self._body(msg) + channels_err_note
             parts = _chunks(text)
             try:
                 for i, part in enumerate(parts):

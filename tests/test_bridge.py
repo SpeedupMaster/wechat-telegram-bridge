@@ -50,6 +50,7 @@ class FakeDaemon:
         self.media_bytes: dict[str, tuple[bytes, str]] = {}  # asset id -> (bytes, content_type)
         self.media_transfers: list[tuple[str, dict]] = []
         self.transfer_fail_variants: set[str] = set()
+        self.transfer_fail_reasons: dict[str, str] = {}
         self.transfer_jobs: dict[str, dict] = {}
         self.reject_image_quality = False
         self.group_members: dict[str, list[dict]] = {}
@@ -96,8 +97,10 @@ class FakeDaemon:
             self.media_transfers.append((mid, body))
             jid = f"dljob{len(self.media_transfers)}"
             q = body.get("quality")
-            if q in self.transfer_fail_variants:
-                self.transfer_jobs[jid] = {"id": jid, "state": "failed", "reason": "cdn_failed"}
+            if q in self.transfer_fail_variants or q in self.transfer_fail_reasons:
+                self.transfer_jobs[jid] = {
+                    "id": jid, "state": "failed", "reason": self.transfer_fail_reasons.get(q, "cdn_failed"),
+                }
             else:
                 for a in self.media.get(mid, []):
                     if (body.get("assetId") and a.get("id") == body["assetId"]) or (
@@ -924,6 +927,121 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         btn0 = lk1_sent.kwargs["buttons"][0][0]
         self.assertEqual(btn0.type.url if hasattr(btn0, "type") else btn0.url, "https://example.com")
         self.assertEqual(q1_sent.text, "<blockquote>Bob：引用的视频文案</blockquote>好看")
+
+    async def test_channels_v2_4_2_video_cover_and_quotes(self):
+        from unittest.mock import patch
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1001, "Bob")
+        cover_png = _png(320, 180, (20, 90, 160))
+        mp4_bytes = b"\x00\x00\x00\x18ftypmp42"
+        thumb_jpeg = b"\xff\xd8\xff\xe0chanthumb"
+
+        # 1) Channels v2.4.2 card with playable video asset -> downloads video & streams inline with metadata/caption
+        self.daemon.add_message(
+            "ch_vid", "wxid_bob",
+            "[Channels video] 央视新闻: 晚间新闻 <热点> (1:36)",
+            type_=49, appMessageType=51,
+            link={"title": None, "url": None, "sourceName": "央视新闻",
+                  "description": "晚间新闻 <热点>", "durationSeconds": 96},
+        )
+        self.daemon.media["ch_vid"] = [
+            {"id": "ch_vid_cov", "kind": "image", "variant": "thumbnail", "actualVariant": "thumbnail",
+             "state": "available", "contentType": "image/png", "byteLength": len(cover_png), "filename": "link-preview"},
+            {"id": "ch_vid_mp4", "kind": "video", "variant": "normal", "actualVariant": None,
+             "state": "pending", "contentType": None, "filename": "channels-video.mp4"},
+        ]
+        self.daemon.media_bytes["ch_vid_cov"] = (cover_png, "image/png")
+        self.daemon.media_bytes["ch_vid_mp4"] = (mp4_bytes, "video/mp4")
+
+        with patch("bridge.stickers.extract_video_meta_and_thumb", return_value=(720, 1280, 96.0, thumb_jpeg)):
+            await self.event("ch_vid", "wxid_bob")
+
+        self.assertEqual(self.daemon.media_transfers[-1], (
+            "ch_vid", {"messageId": "ch_vid", "assetId": "ch_vid_mp4", "quality": "normal"},
+        ))
+        sent_vid = self.b.bot.sent[-1]
+        self.assertEqual((sent_vid.file.name, sent_vid.file.read()), ("channels-video.mp4", mp4_bytes))
+        self.assertFalse(sent_vid.kwargs["force_document"])
+        self.assertTrue(sent_vid.kwargs["supports_streaming"])
+        self.assertTrue(sent_vid.kwargs["nosound_video"])
+        self.assertEqual(sent_vid.kwargs["mime_type"], "video/mp4")
+        self.assertEqual(sent_vid.kwargs["attributes"], [
+            types.DocumentAttributeVideo(duration=96.0, w=720, h=1280, supports_streaming=True),
+        ])
+        self.assertEqual((sent_vid.kwargs["thumb"].name, sent_vid.kwargs["thumb"].read()), ("thumb.jpg", thumb_jpeg))
+        self.assertEqual(sent_vid.kwargs["caption"], "🎬 <b>视频号 · 央视新闻</b> (1:36)\n晚间新闻 &lt;热点&gt;")
+
+        # 2) Channels v2.4.2 card when video transfer fails -> falls back to cover photo + caption + Chinese reason
+        self.daemon.add_message(
+            "ch_fail", "wxid_bob",
+            "[Channels video] 作者A: 已删除视频 (0:45)",
+            type_=49, appMessageType=51,
+            link={"title": None, "url": None, "sourceName": "作者A",
+                  "description": "已删除视频", "durationSeconds": 45},
+        )
+        self.daemon.media["ch_fail"] = [
+            {"id": "ch_fail_cov", "kind": "image", "variant": "thumbnail", "actualVariant": "thumbnail",
+             "state": "available", "contentType": "image/png", "byteLength": len(cover_png), "filename": "link-preview"},
+            {"id": "ch_fail_mp4", "kind": "video", "variant": "normal", "actualVariant": None,
+             "state": "pending", "contentType": None, "filename": "channels-video.mp4"},
+        ]
+        self.daemon.media_bytes["ch_fail_cov"] = (cover_png, "image/png")
+        self.daemon.transfer_fail_reasons["normal"] = "channels_post_unavailable"
+        await self.event("ch_fail", "wxid_bob")
+        self.daemon.transfer_fail_reasons.clear()
+
+        sent_fail = self.b.bot.sent[-1]
+        self.assertEqual((sent_fail.file.name, sent_fail.file.read()), ("channels-cover.png", cover_png))
+        self.assertFalse(sent_fail.kwargs["force_document"])
+        self.assertFalse(sent_fail.kwargs["supports_streaming"])
+        self.assertIn("🎬 <b>视频号 · 作者A</b> (0:45)\n已删除视频", sent_fail.kwargs["caption"])
+        self.assertIn("该视频号内容已删除、过期或设为私密", sent_fail.kwargs["caption"])
+
+        # 3) Channels v2.4.2 non-video card (cover only, no video asset) -> sends cover photo without video transfer/error
+        self.daemon.add_message(
+            "ch_pic", "wxid_bob",
+            "[Channels] 图文号: 图文动态",
+            type_=49, appMessageType=51,
+            link={"title": None, "url": None, "sourceName": "图文号", "description": "图文动态"},
+        )
+        self.daemon.media["ch_pic"] = [
+            {"id": "ch_pic_cov", "kind": "image", "variant": "thumbnail", "actualVariant": "thumbnail",
+             "state": "available", "contentType": "image/png", "byteLength": len(cover_png), "filename": "link-preview"},
+        ]
+        self.daemon.media_bytes["ch_pic_cov"] = (cover_png, "image/png")
+        transfers_before = len(self.daemon.media_transfers)
+        await self.event("ch_pic", "wxid_bob")
+        self.assertEqual(len(self.daemon.media_transfers), transfers_before)
+        sent_pic = self.b.bot.sent[-1]
+        self.assertEqual((sent_pic.file.name, sent_pic.file.read()), ("channels-cover.png", cover_png))
+        self.assertEqual(sent_pic.kwargs["caption"], "🎬 <b>视频号 · 图文号</b>\n图文动态")
+
+        # 4) Quoted Channels v2.4.2 cards (both embeddedText and title=None embeddedLink) + media_integrity_failed
+        self.daemon.add_message(
+            "ch_q1", "wxid_bob", "看这个", type_=49, appMessageType=57,
+            quote={"senderName": "Bob", "embeddedText": "[Channels video] 央视新闻: 晚间新闻 (1:36)"},
+        )
+        self.daemon.add_message(
+            "ch_q2", "wxid_bob", "同感", type_=49, appMessageType=57,
+            quote={"senderName": "Bob",
+                   "embeddedLink": {"title": None, "description": "新版引用文案",
+                                    "sourceName": "央视新闻", "durationSeconds": 96}},
+        )
+        self.daemon.add_message("v_bad", "wxid_bob", None, type_=43)
+        self.daemon.media["v_bad"] = [
+            {"id": "vb_norm", "kind": "video", "variant": "normal", "state": "not_cached", "contentType": "video/mp4"},
+        ]
+        self.daemon.transfer_fail_reasons["normal"] = "media_integrity_failed"
+        await self.event("ch_q1", "wxid_bob")
+        await self.event("ch_q2", "wxid_bob")
+        await self.event("v_bad", "wxid_bob")
+        self.daemon.transfer_fail_reasons.clear()
+
+        q1_msg, q2_msg, vbad_msg = self.b.bot.sent[-3:]
+        self.assertEqual(q1_msg.text, "<blockquote>Bob：🎬 央视新闻: 晚间新闻 (1:36)</blockquote>看这个")
+        self.assertEqual(q2_msg.text, "<blockquote>Bob：新版引用文案</blockquote>同感")
+        self.assertIn("[视频，无法获取：文件校验失败]", vbad_msg.text)
 
     async def test_file_upload_notice_is_skipped(self):
         self.daemon.add_thread("wxid_bob", "Bob")

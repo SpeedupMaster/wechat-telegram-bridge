@@ -374,15 +374,32 @@ class WeChatClient:
         return item
 
     # --- receiving media ----------------------------------------------------
+    async def download_channels_video(self, message: dict, max_bytes: int) -> Media | str | None:
+        """Fetch a Channels card's playable video if present, returning None when none is offered."""
+        return await self._download_media(message, max_bytes, channels=True)
+
     async def download_media(self, message: dict, max_bytes: int) -> Media | str:
         """Fetch the best available copy of a message attachment, or return a reason string."""
-        mid, mtype = message["id"], message["type"]
+        res = await self._download_media(message, max_bytes, channels=False)
+        assert res is not None
+        return res
+
+    async def _download_media(self, message: dict, max_bytes: int, *, channels: bool) -> Media | str | None:
+        mid = message["id"]
+        mtype = VIDEO if channels else message["type"]
         quality = "normal" if mtype in (VOICE, VIDEO) else "best"
+
+        def eligible(a: dict) -> bool:
+            if channels and a.get("kind") != "video":
+                return False
+            return _eligible_asset(a, mtype)
 
         async def assets() -> list[dict]:
             return (await self._req("GET", self._a(f"messages/{_id(mid)}/media"))).get("items", [])
 
         items = await assets()
+        if channels and not any(eligible(a) for a in items):
+            return None
         asset = None
         last_job: dict = {}
         variant_order = (
@@ -396,7 +413,7 @@ class WeChatClient:
             for variant in variant_order:
                 cands = [
                     a for a in items
-                    if _eligible_asset(a, mtype) and (a.get("actualVariant") or a.get("variant")) == variant
+                    if eligible(a) and (a.get("actualVariant") or a.get("variant")) == variant
                 ]
                 if not cands:
                     continue
@@ -420,7 +437,7 @@ class WeChatClient:
                 items = await assets()
                 avail = [
                     a for a in items
-                    if _eligible_asset(a, mtype)
+                    if eligible(a)
                     and (a.get("id") == cand.get("id") or (a.get("actualVariant") or a.get("variant")) == variant)
                     and a.get("state") == "available" and (a.get("byteLength") or 0) <= max_bytes
                 ]
@@ -428,9 +445,10 @@ class WeChatClient:
                     asset = avail[0]
                     break
         if not asset:
-            asset = _pick(items, mtype)
+            pool = [a for a in items if eligible(a)]
+            asset = _pick(pool, mtype)
         if not asset:
-            eligible_items = [a for a in items if _eligible_asset(a, mtype)]
+            eligible_items = [a for a in items if eligible(a)]
             states = {a.get("state") for a in eligible_items}
             if states & {"expired", "unsupported", "recalled"} and not states & {"pending", "not_cached"}:
                 reasons = [a["reason"] for a in eligible_items if a.get("reason")]
@@ -447,7 +465,7 @@ class WeChatClient:
                                   json={"messageId": mid, "assetId": None, "quality": quality})
             job = await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 300)
             items = await assets()
-            asset = _pick(items, mtype)
+            asset = _pick([a for a in items if eligible(a)], mtype)
             if not asset:
                 return job.get("reason") or job.get("state") or "下载失败"
         if (asset.get("byteLength") or 0) > max_bytes:
@@ -459,6 +477,12 @@ class WeChatClient:
             mime = asset["preview"]["contentType"]
         r = await self._req("GET", self._a(f"media/{_id(asset['id'])}/content"), params=params, raw=True,
                             timeout=httpx.Timeout(600.0))
+        if not params and mime == "application/octet-stream":
+            hdr_ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+            if hdr_ct and hdr_ct != "application/octet-stream":
+                mime = hdr_ct
+            elif mtype == VIDEO and ((fname := (asset.get("filename") or "").lower()).endswith(".mp4") or "." not in fname):
+                mime = "video/mp4"
         name = asset.get("filename") or f"{mid[-12:]}{_ext(mime)}"
         if params:
             name = name.rsplit(".", 1)[0] + _ext(mime)
