@@ -811,6 +811,62 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(s3.file)
         self.assertIn("[视频，无法获取：", s3.text)
 
+    async def test_video_metadata_and_thumb_sent_to_telegram(self):
+        from unittest.mock import patch
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1001, "Bob")
+        mp4_bytes = b"\x00\x00\x00\x18ftypmp42"
+        thumb_jpeg = b"\xff\xd8\xff\xe0testjpeg"
+
+        self.daemon.add_message("vmeta1", "wxid_bob", None, type_=43)
+        self.daemon.media["vmeta1"] = [
+            {"id": "vm1", "kind": "video", "variant": "normal", "state": "available",
+             "contentType": "video/mp4", "byteLength": len(mp4_bytes), "filename": "clip.mp4"},
+        ]
+        self.daemon.media_bytes["vm1"] = (mp4_bytes, "video/mp4")
+
+        with patch("bridge.stickers.extract_video_meta_and_thumb", return_value=(720, 1280, 6.0, thumb_jpeg)):
+            await self.event("vmeta1", "wxid_bob")
+
+        sent = self.b.bot.sent[-1]
+        self.assertEqual(sent.kwargs["mime_type"], "video/mp4")
+        self.assertTrue(sent.kwargs["nosound_video"])
+        self.assertTrue(sent.kwargs["supports_streaming"])
+        attrs = sent.kwargs["attributes"]
+        self.assertEqual(len(attrs), 1)
+        self.assertEqual(attrs[0], types.DocumentAttributeVideo(duration=6.0, w=720, h=1280, supports_streaming=True))
+        self.assertEqual((sent.kwargs["thumb"].name, sent.kwargs["thumb"].read()), ("thumb.jpg", thumb_jpeg))
+
+        # On Telethon RPCError when sending as streamable video, fallback to force_document=True strips video-only kwargs
+        self.daemon.add_message("vmeta2", "wxid_bob", None, type_=43)
+        self.daemon.media["vmeta2"] = [
+            {"id": "vm2", "kind": "video", "variant": "normal", "state": "available",
+             "contentType": "video/mp4", "byteLength": len(mp4_bytes), "filename": "fallback.mp4"},
+        ]
+        self.daemon.media_bytes["vm2"] = (mp4_bytes, "video/mp4")
+
+        orig_send_file = self.b.bot.send_file
+        calls = 0
+
+        async def flaky_send_file(chat, file, **kw):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise errors.RPCError(None, "VIDEO_CONTENT_TYPE_INVALID", 400)
+            return await orig_send_file(chat, file, **kw)
+
+        self.b.bot.send_file = flaky_send_file
+        with patch("bridge.stickers.extract_video_meta_and_thumb", return_value=(720, 1280, 6.0, thumb_jpeg)):
+            await self.event("vmeta2", "wxid_bob")
+
+        self.assertEqual(calls, 2)
+        fallback = self.b.bot.sent[-1]
+        self.assertTrue(fallback.kwargs["force_document"])
+        self.assertNotIn("attributes", fallback.kwargs)
+        self.assertNotIn("thumb", fallback.kwargs)
+        self.assertIsNone(fallback.kwargs["nosound_video"])
+
     async def test_latest_cursor(self):
         self.assertEqual(await self.b.wx.latest_cursor(), "42")
 
@@ -2265,6 +2321,26 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(im3.size, (240, 135))
             self.assertGreater(im3.n_frames, 1)
             self.assertLessEqual(im3.n_frames, self.stickers.WX_STICKER_MAX_FRAMES)
+
+    def test_extract_video_meta_and_thumb(self) -> None:
+        self.assertIsNone(self.stickers.extract_video_meta_and_thumb(b"not a video", "bad.mp4"))
+        if self.ffmpeg:
+            import io
+            import subprocess
+            from PIL import Image
+            mp4 = Path(self.tmp.name, "portrait_video.mp4")
+            subprocess.run([self.ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "testsrc=size=480x854:rate=15:duration=2.0",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(mp4)], check=True)
+            meta = self.stickers.extract_video_meta_and_thumb(mp4.read_bytes(), "portrait_video.mp4")
+            self.assertIsNotNone(meta)
+            w, h, dur, thumb = meta  # type: ignore[misc]
+            self.assertEqual((w, h), (480, 854))
+            self.assertAlmostEqual(dur, 2.0, delta=0.3)
+            with Image.open(io.BytesIO(thumb)) as im:
+                self.assertEqual(im.format, "JPEG")
+                self.assertLessEqual(max(im.size), 320)
+                self.assertEqual(im.size, (180, 320))
 
 
 class _FakeCallsSocket:

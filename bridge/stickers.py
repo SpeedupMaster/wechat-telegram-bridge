@@ -20,6 +20,7 @@ import io
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -703,3 +704,42 @@ async def convert(data: bytes, mime: str) -> tuple[str, bytes] | str:
         log.warning("Sticker conversion failed (%s): %s", mime, e)
         return f"贴纸转换失败：{type(e).__name__}"
     return f"不支持的贴纸格式 {mime}"
+
+
+_FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def extract_video_meta_and_thumb(data: bytes, filename: str = "video.mp4") -> tuple[int, int, float, bytes] | None:
+    """Extract display (width, height, duration_s, jpeg_thumb_bytes) from a video using ffmpeg."""
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg or not data:
+        return None
+    ext = os.path.splitext(filename)[1].lower() if "." in filename else ".mp4"
+    if not ext or not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+        ext = ".mp4"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, f"in{ext}")
+            frame = os.path.join(tmp, "frame.jpg")
+            with open(src, "wb") as f:
+                f.write(data)
+            res = subprocess.run(
+                [ffmpeg, "-hide_banner", "-y", "-i", src, "-frames:v", "1", "-q:v", "3", frame],
+                capture_output=True, text=True, errors="replace", timeout=30,
+            )
+            if res.returncode != 0 or not os.path.exists(frame):
+                return None
+            with Image.open(frame) as im:
+                im.load()
+                w, h = im.size
+                thumb_im = im.convert("RGB")
+                thumb_im.thumbnail((320, 320), Image.LANCZOS)
+                buf = io.BytesIO()
+                thumb_im.save(buf, "JPEG", quality=85)
+                thumb_bytes = buf.getvalue()
+        m = _FFMPEG_DURATION_RE.search(res.stderr or "")
+        duration = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) if m else 0.0
+        return w, h, duration, thumb_bytes
+    except Exception as e:
+        log.info("Could not extract video metadata/thumbnail: %s", e)
+        return None

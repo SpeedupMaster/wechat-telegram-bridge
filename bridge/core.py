@@ -1122,6 +1122,23 @@ class Bridge(LoginMixin):
                 kwargs = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
                               silent=silent, voice_note=is_voice, supports_streaming=t == VIDEO,
                               force_document=t == APP or (t == VOICE and not send_media.mime.startswith("audio/")))
+                if t == VIDEO:
+                    if send_media.mime.startswith("video/"):
+                        kwargs["mime_type"] = send_media.mime
+                    kwargs["nosound_video"] = True
+                    vmeta = await asyncio.to_thread(
+                        stickers.extract_video_meta_and_thumb, send_media.data, send_media.filename
+                    )
+                    if vmeta is not None:
+                        vw, vh, vdur, vthumb = vmeta
+                        kwargs["attributes"] = [
+                            types.DocumentAttributeVideo(
+                                duration=round(vdur, 2), w=vw, h=vh, supports_streaming=True
+                            )
+                        ]
+                        tf = io.BytesIO(vthumb)
+                        tf.name = "thumb.jpg"
+                        kwargs["thumb"] = tf
                 try:
                     out.append(await self.bot.send_file(chat_id, f, **kwargs))
                 except errors.RPCError as e:
@@ -1130,7 +1147,9 @@ class Bridge(LoginMixin):
                     # e.g. a photo too large/odd-sized for Telegram's photo type: send it as a file instead
                     log.info("Telegram refused media as-is (%s); sending as a file", e)
                     f.seek(0)
-                    kwargs.update(force_document=True, voice_note=False, supports_streaming=False)
+                    kwargs.update(force_document=True, voice_note=False, supports_streaming=False, nosound_video=None)
+                    kwargs.pop("attributes", None)
+                    kwargs.pop("thumb", None)
                     out.append(await self.bot.send_file(chat_id, f, **kwargs))
                 return out
             if (
