@@ -493,7 +493,9 @@ def _chunks(text: str, size: int = TG_TEXT_LIMIT) -> list[str]:
 
 
 def _member_label(m: dict) -> str:
-    return (m.get("mentionName") or m.get("roomDisplayName") or m.get("displayName") or m.get("id") or "").strip()
+    return (
+        m.get("mentionName") or m.get("roomDisplayName") or m.get("displayName") or m.get("nickname") or m.get("id") or ""
+    ).strip()
 
 
 def _is_mention_boundary(name: str, after: str) -> bool:
@@ -512,7 +514,7 @@ def _match_mentions(text: str, members: list[dict]) -> dict | None:
         uid = m.get("id")
         if not uid:
             continue
-        for key in ("mentionName", "roomDisplayName", "displayName"):
+        for key in ("mentionName", "roomDisplayName", "displayName", "nickname", "alias"):
             name = (m.get(key) or "").strip()
             if name:
                 candidates.append((name, uid))
@@ -934,8 +936,8 @@ class Bridge(LoginMixin):
         try:
             if msg["threadId"].endswith("@chatroom"):
                 member = await self.wx.group_member(msg["threadId"], sid)
-                if member and member.get("displayName"):
-                    name = member["displayName"]
+                if member and (m_name := member.get("displayName") or member.get("nickname")):
+                    name = m_name
             if name == sid:
                 name = (await self.wx.contact(sid)).get("displayName") or sid
         except WeChatError:
@@ -1957,15 +1959,19 @@ class Bridge(LoginMixin):
             await self.bot.send_message(chat_id, "只有在微信群聊里才能查看群成员", reply_to=reply_to)
             return
         try:
-            members = await self.wx.group_members(thread_id)
+            members = await self.wx.group_members(thread_id, search=query or None)
         except WeChatError as e:
             await self.bot.send_message(chat_id, f"获取群成员失败：{e.code}", reply_to=reply_to)
             return
-        if query:
-            q = query.lower()
-            members = [m for m in members if any(
-                q in str(m.get(k) or "").lower()
-                for k in ("mentionName", "roomDisplayName", "displayName", "id")
+        terms = query.lower().split() if query else []
+        if terms:
+            # Keep client-side AND filtering across fields for older daemons that ignore `?search=`
+            members = [m for m in members if all(
+                any(
+                    term in str(m.get(k) or "").lower()
+                    for k in ("mentionName", "roomDisplayName", "displayName", "nickname", "alias", "username", "id")
+                )
+                for term in terms
             )]
         if not members:
             await self.bot.send_message(chat_id, "没有匹配的群成员" if query else "没有拿到群成员", reply_to=reply_to)
@@ -1974,7 +1980,16 @@ class Bridge(LoginMixin):
         for m in members:
             label = _member_label(m)
             disp = (m.get("displayName") or "").strip()
-            extra = f" （{_esc(disp)}）" if disp and disp != label else ""
+            nick = (m.get("nickname") or "").strip()
+            alias = (m.get("alias") or "").strip()
+            extras: list[str] = []
+            if disp and disp != label:
+                extras.append(disp)
+            if nick and nick not in (label, disp):
+                extras.append(nick)
+            if alias and alias not in (label, disp, nick) and any(t in alias.lower() for t in terms):
+                extras.append(f"微信号 {alias}")
+            extra = f" （{_esc(' · '.join(extras))}）" if extras else ""
             lines.append(f"• <code>@{_esc(label)}</code>{extra}")
         header = f"<b>群成员</b>（{len(members)} 人，点按可复制）：\n也可直接发送 <code>@所有人</code>\n\n"
         pages: list[str] = []

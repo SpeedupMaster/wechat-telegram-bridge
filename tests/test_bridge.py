@@ -54,6 +54,8 @@ class FakeDaemon:
         self.transfer_jobs: dict[str, dict] = {}
         self.reject_image_quality = False
         self.group_members: dict[str, list[dict]] = {}
+        self.member_searches: list[tuple[str, str | None]] = []
+        self.ignore_member_search = False
         self.recalls: list[tuple[str, dict, str]] = []
         self.recall_error: tuple[int, str] | None = None
         self.recall_op = {"id": "rcop", "state": "succeeded"}
@@ -153,7 +155,18 @@ class FakeDaemon:
                 not q or q in (t.get("displayName") or "").lower() or q in t["id"].lower())]
             return httpx.Response(200, json={"items": items})
         if rest[0] == "groups" and rest[2] == "members" and len(rest) == 3:
-            members = self.group_members.get(rest[1], [])
+            search = request.url.params.get("search")
+            self.member_searches.append((rest[1], search))
+            members = list(self.group_members.get(rest[1], []))
+            if search and not self.ignore_member_search:
+                terms = search.lower().split()
+                members = [m for m in members if all(
+                    any(
+                        term in str(m.get(k) or "").lower()
+                        for k in ("id", "username", "displayName", "roomDisplayName", "nickname", "alias", "mentionName")
+                    )
+                    for term in terms
+                )]
             cur = request.url.params.get("cursor")
             if cur is None and len(members) > 2:
                 return httpx.Response(200, json={"items": members[:2], "nextCursor": "p2"})
@@ -1114,6 +1127,69 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("只有在微信群聊里", self.b.bot.sent[-1].text)
         await self.b.on_tg_message(tg_event(dm_chat, 21, "@Jessie hi"))
         self.assertNotIn("mentions", self.daemon.sends[-1][0])
+
+    async def test_group_member_search_nickname_and_alias(self):
+        self.daemon.add_thread("room@chatroom", "Book Club", kind="group")
+        self.daemon.group_members["room@chatroom"] = [
+            {
+                "id": "wxid_a1",
+                "username": "wxid_a1",
+                "displayName": "Book club",
+                "roomDisplayName": "Lantern",
+                "nickname": "Serena",
+                "alias": "sreads42",
+                "mentionName": "Lantern",
+            },
+            {
+                "id": "wxid_b2",
+                "username": "wxid_b2",
+                "displayName": "Quiet",
+                "roomDisplayName": None,
+                "nickname": "Other",
+                "alias": None,
+                "mentionName": "Quiet",
+            },
+        ]
+        self.daemon.add_message("rm1", "room@chatroom", "hi", sender="wxid_b2")
+        await self.event("rm1", "room@chatroom")
+        chat = self.b.store.chat_for_thread("room@chatroom")
+
+        # 1) Unfiltered /members shows remark + nickname concisely (without noise from alias)
+        await self.b.on_tg_message(tg_event(chat, 10, "/members"))
+        self.assertIn("<code>@Lantern</code> （Book club · Serena）", self.b.bot.sent[-1].text)
+        self.assertNotIn("sreads42", self.b.bot.sent[-1].text)
+        self.assertIsNone(self.daemon.member_searches[-1][1])
+
+        # 2) Searching by nickname / alias / multi-term AND sends `?search=` and displays matched alias
+        await self.b.on_tg_message(tg_event(chat, 11, "/members serena"))
+        self.assertEqual(self.daemon.member_searches[-1], ("room@chatroom", "serena"))
+        self.assertIn("<code>@Lantern</code> （Book club · Serena）", self.b.bot.sent[-1].text)
+        self.assertNotIn("Quiet", self.b.bot.sent[-1].text)
+
+        await self.b.on_tg_message(tg_event(chat, 12, "/members sreads42"))
+        self.assertEqual(self.daemon.member_searches[-1], ("room@chatroom", "sreads42"))
+        self.assertIn("<code>@Lantern</code> （Book club · Serena · 微信号 sreads42）", self.b.bot.sent[-1].text)
+        self.assertNotIn("Quiet", self.b.bot.sent[-1].text)
+
+        await self.b.on_tg_message(tg_event(chat, 13, "/members serena lantern"))
+        self.assertIn("<code>@Lantern</code>", self.b.bot.sent[-1].text)
+        self.assertNotIn("Quiet", self.b.bot.sent[-1].text)
+
+        await self.b.on_tg_message(tg_event(chat, 14, "/members serena quiet"))
+        self.assertIn("没有匹配的群成员", self.b.bot.sent[-1].text)
+
+        # 3) Fallback when an older daemon ignores `?search=` -> client-side AND filter still matches nickname/alias
+        self.daemon.ignore_member_search = True
+        await self.b.on_tg_message(tg_event(chat, 15, "/members sreads42"))
+        self.assertIn("<code>@Lantern</code> （Book club · Serena · 微信号 sreads42）", self.b.bot.sent[-1].text)
+        self.assertNotIn("Quiet", self.b.bot.sent[-1].text)
+        self.daemon.ignore_member_search = False
+
+        # 4) @nickname and @alias resolve to the member even behind a remark and roomDisplayName
+        await self.b.on_tg_message(tg_event(chat, 16, "@Serena 看下这个"))
+        self.assertEqual(self.daemon.sends[-1][0]["mentions"], {"all": False, "userIds": ["wxid_a1"]})
+        await self.b.on_tg_message(tg_event(chat, 17, "ping @sreads42"))
+        self.assertEqual(self.daemon.sends[-1][0]["mentions"], {"all": False, "userIds": ["wxid_a1"]})
 
     async def test_bot_commands_menu_and_management_commands(self):
         await self.b.sync_bot_commands()

@@ -189,12 +189,15 @@ class WeChatClient:
         data = await self._req("GET", self._a(f"groups/{_id(room)}/members/{_id(username)}"))
         return data.get("member")
 
-    async def group_members(self, room: str) -> list[dict]:
+    async def group_members(self, room: str, *, search: str | None = None) -> list[dict]:
         items: list[dict] = []
         seen: set[str] = set()
         cursor: str | None = None
+        q = (search or "").strip()
         while True:
             params: dict[str, Any] = {"limit": 500}
+            if q:
+                params["search"] = q
             if cursor:
                 params["cursor"] = cursor
             data = await self._req("GET", self._a(f"groups/{_id(room)}/members"), params=params)
