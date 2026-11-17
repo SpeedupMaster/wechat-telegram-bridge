@@ -3195,7 +3195,7 @@ class Bridge(LoginMixin):
                         return
                 if not self.wx_ready:
                     return await event.reply(
-                        "🔐 微信尚未登录，请先在手机确认或扫码，也可点击下方按钮重新登录。",
+                        "🔐 微信尚未登录，请先在手机微信上确认登录或扫码登录，也可以点击下方按钮重新发起登录。",
                         buttons=self._wx_login_buttons())
                 if arg:
                     cands = await self._wx_search_candidates(arg, limit=10)
@@ -3225,7 +3225,7 @@ class Bridge(LoginMixin):
                 await self.request_wechat_login(force_qr=(arg.lower() in ("qr", "scan")))
             elif cmd in ("/find", "/open") and not self.wx_ready:
                 await event.reply(
-                    "🔐 微信尚未登录，请先在手机确认或扫码，也可点击下方按钮重新登录。",
+                    "🔐 微信尚未登录，请先在手机微信上确认登录或扫码登录，也可以点击下方按钮重新发起登录。",
                     buttons=self._wx_login_buttons())
             elif cmd == "/find":
                 cands = await self._wx_search_candidates(arg, limit=15 if arg else 10)

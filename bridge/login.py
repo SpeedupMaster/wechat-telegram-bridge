@@ -572,7 +572,7 @@ class LoginMixin:
             except (httpx.HTTPError, WeChatError) as e:
                 log.warning("WeChat login step failed: %s", e)
                 await self.notify(
-                    f"⚠️ 微信登录出错：{e}\n点击下方按钮或发送 /wxlogin 重试。",
+                    f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
                     buttons=self._wx_login_buttons())
             self.wx_login_requested.clear()
             await self.wx_login_requested.wait()
@@ -615,7 +615,7 @@ class LoginMixin:
                                 "timeout": "登录超时",
                             }.get(str(reason), str(reason))
                             await self.notify(
-                                f"⚠️ 微信登录未完成（{friendly}）。\n点击下方按钮或发送 /wxlogin 重试。",
+                                f"⚠️ 微信登录未完成（{friendly}）。点击下方按钮重新登录或改用扫码登录，也可以发送 /wxlogin 重试。",
                                 buttons=self._wx_login_buttons(include_qr=True))
                             return False
                         gen = res.get("qrGeneration")
@@ -674,7 +674,7 @@ class LoginMixin:
                     if switched_to_qr:
                         continue
                     await self.notify(
-                        "⏱ 微信登录超时。\n点击下方按钮或发送 /wxlogin 重试。",
+                        "⏱ 微信登录超时，手机上一直没有确认。点击下方按钮重新登录或改用扫码登录，也可以发送 /wxlogin 重试。",
                         buttons=self._wx_login_buttons(include_qr=True))
                     try:
                         await self.wx.cancel_operation(op["id"])
@@ -711,7 +711,7 @@ class LoginMixin:
                 self.wx_state = "online"
         except (httpx.HTTPError, WeChatError) as e:
             await self.notify(
-                f"⚠️ 微信登录出错：{e}\n点击下方按钮或发送 /wxlogin 重试。",
+                f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
                 buttons=self._wx_login_buttons())
 
     async def wechat_monitor(self, interval: float = 60.0) -> None:
@@ -732,7 +732,7 @@ class LoginMixin:
                 if self.wx_state != "signed_out":
                     self.wx_state = "signed_out"
                     await self.notify(
-                        "⚠️ 微信已退出登录（可能在手机上移除了这台设备）。\n点击下方按钮或发送 /wxlogin 重新登录。",
+                        "⚠️ 微信已退出登录（可能在手机上移除了这台设备），点击下方按钮或发送 /wxlogin 重新登录。",
                         buttons=self._wx_login_buttons())
             elif conn == "disconnected":
                 try:
