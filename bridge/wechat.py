@@ -4,11 +4,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging
 import os
 import re
+import shutil
 import struct
+import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -57,6 +60,109 @@ class Media:
     data: bytes
     mime: str
     filename: str
+    # Large downloads live in a private temp file (named `filename`) instead of memory; `data` is then b"".
+    path: str | None = None
+
+    @property
+    def size(self) -> int:
+        if self.path is not None:
+            try:
+                return os.path.getsize(self.path)
+            except OSError:
+                return 0
+        return len(self.data)
+
+    def read(self) -> bytes:
+        """The whole payload as bytes (loads a file-backed download into memory)."""
+        if self.path is None:
+            return self.data
+        with open(self.path, "rb") as f:
+            return f.read()
+
+    def tg_file(self) -> str | io.BytesIO:
+        """What to hand Telethon: the temp file's path, or a fresh named in-memory buffer."""
+        if self.path is not None:
+            return self.path
+        f = io.BytesIO(self.data)
+        f.name = self.filename
+        return f
+
+    def close(self) -> None:
+        """Delete the temp file of a file-backed download (no-op for in-memory media)."""
+        if self.path is None:
+            return
+        path, self.path = self.path, None
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+
+# Downloads up to this size stay in memory; larger ones are streamed to a temp file.
+MEDIA_SPILL_BYTES = 8 * 1024 * 1024
+
+
+class _MediaTooLarge(Exception):
+    pass
+
+
+class _DownloadSink:
+    """Collects a download in memory and spills it to a private temp file once it grows past `spill`."""
+
+    def __init__(self, spill: int):
+        self.spill = spill
+        self.size = 0
+        self._buf = bytearray()
+        self._dir: str | None = None
+        self._file = None
+
+    def write(self, chunk: bytes) -> None:
+        if self._file is None and len(self._buf) + len(chunk) > self.spill:
+            self._dir = tempfile.mkdtemp(prefix="wx-media-")
+            self._file = open(os.path.join(self._dir, "download.part"), "wb")
+            self._file.write(self._buf)
+            self._buf = bytearray()
+        if self._file is not None:
+            self._file.write(chunk)
+        else:
+            self._buf += chunk
+        self.size += len(chunk)
+
+    def reset(self) -> None:
+        self.discard()
+        self.size = 0
+
+    def discard(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+        if self._dir is not None:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = None
+        self._buf = bytearray()
+
+    def finish(self, mime: str, filename: str) -> Media:
+        if self._file is None:
+            return Media(bytes(self._buf), mime, filename)
+        self._file.close()
+        self._file = None
+        assert self._dir is not None
+        path = os.path.join(self._dir, _safe_filename(filename))
+        os.replace(os.path.join(self._dir, "download.part"), path)
+        self._dir = None
+        return Media(b"", mime, filename, path=path)
+
+
+def _safe_filename(name: str) -> str:
+    """A plain file name for the temp copy (Telethon uses its basename as the document name)."""
+    base = os.path.basename((name or "").replace("\\", "/"))
+    base = re.sub(r'[\x00-\x1f\x7f<>:"|?*]', "", base).strip().lstrip(".-")
+    if not base or base == "download.part":
+        base = "file.bin"
+    if len(base.encode("utf-8")) > 200:
+        stem, ext = os.path.splitext(base)
+        ext = ext if len(ext) <= 16 else ""
+        while stem and len((stem + ext).encode("utf-8")) > 200:
+            stem = stem[:-1]
+        base = (stem or "file") + ext
+    return base
 
 
 _DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
@@ -103,14 +209,7 @@ class WeChatClient:
             try:
                 r = await self.http.request(method, self.base + path, **kw)
                 if r.status_code >= 400:
-                    code, retryable = "request_failed", r.status_code >= 500
-                    try:
-                        err = r.json().get("error", {})
-                        code = err.get("code", code)
-                        retryable = err.get("retryable", retryable)
-                    except Exception:
-                        pass
-                    raise WeChatError(r.status_code, code, retryable)
+                    raise _response_error(r)
                 if raw:
                     return r
                 return r.json() if r.content else None
@@ -130,6 +229,64 @@ class WeChatClient:
                             method, path, e, delay, attempt + 1, len(delays))
                 if delay > 0:
                     await asyncio.sleep(delay)
+
+    async def _stream_content(self, path: str, params: dict, max_bytes: int,
+                              spill: int) -> tuple[_DownloadSink, httpx.Headers]:
+        """GET a media body chunk by chunk into a sink, resuming with `Range` after a dropped connection.
+
+        Raises _MediaTooLarge once more than `max_bytes` arrive. A daemon that ignores `Range`
+        (answers 200 instead of 206) simply makes the download start over.
+        """
+        sink = _DownloadSink(spill)
+        headers: httpx.Headers | None = None
+        delays = self._read_retry_delays
+        attempt = 0
+        try:
+            while True:
+                # identity: resume offsets must count the bytes as stored, not a compressed transfer
+                req_headers = {"Accept-Encoding": "identity"}
+                if sink.size:
+                    req_headers["Range"] = f"bytes={sink.size}-"
+                try:
+                    async with self.http.stream("GET", self.base + path, params=params, headers=req_headers,
+                                                timeout=httpx.Timeout(600.0, connect=10.0)) as r:
+                        if r.status_code == 416 and sink.size:
+                            await r.aread()
+                            sink.reset()  # the daemon no longer agrees on the size: start over
+                            raise WeChatError(416, "range_not_satisfiable", True)
+                        if r.status_code >= 400:
+                            await r.aread()
+                            raise _response_error(r)
+                        if r.status_code == 206 and _range_start(r.headers.get("content-range")) != sink.size:
+                            await r.aread()
+                            sink.reset()  # not the piece we asked for: start over
+                            raise WeChatError(416, "range_mismatch", True)
+                        if r.status_code != 206 or headers is None:
+                            if sink.size:
+                                sink.reset()
+                            headers = r.headers
+                        async for chunk in r.aiter_bytes():  # unbuffered, so a resume offset counts every byte received
+                            if sink.size + len(chunk) > max_bytes:
+                                raise _MediaTooLarge()
+                            sink.write(chunk)
+                    return sink, headers
+                except _RETRYABLE_HTTP_ERRORS as e:
+                    if attempt >= len(delays):
+                        raise
+                    why = f"{type(e).__name__}: {e}"
+                except WeChatError as e:
+                    if attempt >= len(delays) or not (e.retryable and (e.status >= 500 or e.status == 416)):
+                        raise
+                    why = str(e)
+                delay = delays[attempt]
+                attempt += 1
+                log.warning("WeChat media download %s interrupted after %d bytes (%s); resuming in %.1fs (%d/%d)",
+                            path, sink.size, why, delay, attempt, len(delays))
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        except BaseException:
+            sink.discard()
+            raise
 
     # --- account ------------------------------------------------------------
     async def resolve_account(self) -> str:
@@ -565,10 +722,13 @@ class WeChatClient:
         if mime == "image/x-wxgf" and asset.get("preview"):  # WeChat's own image format: use the JPEG/PNG preview
             params = {"representation": "preview"}
             mime = asset["preview"]["contentType"]
-        r = await self._req("GET", self._a(f"media/{_id(asset['id'])}/content"), params=params, raw=True,
-                            timeout=httpx.Timeout(600.0))
+        try:
+            sink, headers = await self._stream_content(self._a(f"media/{_id(asset['id'])}/content"), params,
+                                                       max_bytes, MEDIA_SPILL_BYTES)
+        except _MediaTooLarge:
+            return "文件太大"
         if not params and mime == "application/octet-stream":
-            hdr_ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+            hdr_ct = headers.get("content-type", "").split(";")[0].strip().lower()
             if hdr_ct and hdr_ct != "application/octet-stream":
                 mime = hdr_ct
             elif mtype == VIDEO and ((fname := (asset.get("filename") or "").lower()).endswith(".mp4") or "." not in fname):
@@ -576,7 +736,7 @@ class WeChatClient:
         name = asset.get("filename") or f"{mid[-12:]}{_ext(mime)}"
         if params:
             name = name.rsplit(".", 1)[0] + _ext(mime)
-        return Media(r.content, mime, name)
+        return sink.finish(mime, name)
 
     async def download_link_thumbnail(self, message: dict, max_bytes: int = 4 * 1024 * 1024) -> bytes | None:
         """Fetch a shared link's thumbnail image bytes when available, or return None."""
@@ -638,6 +798,22 @@ class WeChatClient:
         except (WeChatError, httpx.HTTPError):
             return None
         return r.content or None
+
+
+def _range_start(content_range: str | None) -> int | None:
+    m = re.match(r"^\s*bytes\s+(\d+)-\d+/(?:\d+|\*)\s*$", content_range or "")
+    return int(m.group(1)) if m else None
+
+
+def _response_error(r: httpx.Response) -> WeChatError:
+    code, retryable = "request_failed", r.status_code >= 500
+    try:
+        err = r.json().get("error", {})
+        code = err.get("code", code)
+        retryable = err.get("retryable", retryable)
+    except Exception:
+        pass
+    return WeChatError(r.status_code, code, retryable)
 
 
 def _eligible_asset(asset: dict, mtype: int) -> bool:

@@ -1076,6 +1076,36 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(s3.file)
         self.assertIn("[视频，无法获取：", s3.text)
 
+    async def test_large_video_streamed_to_temp_file_and_removed_after_forward(self):
+        import os
+        from unittest.mock import patch
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1001, "Bob")
+        mp4_bytes = b"\x00\x00\x00\x18ftypmp42" + bytes(range(256)) * 8
+        self.daemon.add_message("bigvid", "wxid_bob", None, type_=43)
+        self.daemon.media["bigvid"] = [
+            {"id": "bv-norm", "kind": "video", "variant": "normal", "actualVariant": "normal", "state": "available",
+             "contentType": "video/mp4", "byteLength": len(mp4_bytes), "filename": "holiday clip.mp4"},
+        ]
+        self.daemon.media_bytes["bv-norm"] = (mp4_bytes, "video/mp4")
+        seen: list[tuple[str, bytes]] = []
+        orig_send_file = self.b.bot.send_file
+
+        async def send_file(chat, file, **kw):
+            self.assertIsInstance(file, str)  # a path, so Telethon streams the upload from disk
+            with open(file, "rb") as f:
+                seen.append((file, f.read()))
+            return await orig_send_file(chat, file, **kw)
+
+        self.b.bot.send_file = send_file
+        with patch("bridge.wechat.MEDIA_SPILL_BYTES", 64):
+            await self.event("bigvid", "wxid_bob")
+        self.assertEqual(len(seen), 1)
+        path, data = seen[0]
+        self.assertEqual((os.path.basename(path), data), ("holiday clip.mp4", mp4_bytes))
+        self.assertTrue(self.b.bot.sent[-1].kwargs["supports_streaming"])
+        self.assertFalse(os.path.exists(os.path.dirname(path)))  # temp copy cleaned up
+
     async def test_video_metadata_and_thumb_sent_to_telegram(self):
         from unittest.mock import patch
 
@@ -4470,3 +4500,208 @@ class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await wx.close()
             await runner.cleanup()
+
+
+class MediaStreamingTests(unittest.IsolatedAsyncioTestCase):
+    """Downloads stream from the daemon into memory or a temp file and resume with `Range`."""
+
+    PAYLOAD = bytes(range(256)) * 160  # 40 KiB
+
+    def client(self, handler) -> WeChatClient:
+        wx = WeChatClient("http://localhost:6174", "secret-token", ACC, read_retry_delays=(0.0, 0.0))
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler),
+                                    headers={"Authorization": "Bearer secret-token"})
+        return wx
+
+    @staticmethod
+    def assets(byte_length=None) -> dict:
+        a = {"id": "a1", "kind": "file", "variant": "original", "state": "available",
+             "contentType": "application/pdf", "filename": "report.pdf"}
+        if byte_length is not None:
+            a["byteLength"] = byte_length
+        return {"items": [a]}
+
+    @staticmethod
+    def broken_body(data: bytes, cut: int):
+        async def gen():
+            yield data[:cut]
+            raise httpx.ReadError("connection reset")
+        return gen()
+
+    async def download(self, wx, max_bytes, spill=10_000):
+        from unittest.mock import patch
+        msg = {"id": "m1", "type": 49}
+        with patch("bridge.wechat.MEDIA_SPILL_BYTES", spill):
+            return await wx.download_media(msg, max_bytes)
+
+    async def test_resumes_with_range_after_dropped_connection(self):
+        import os
+        ranges: list[str | None] = []
+        data = self.PAYLOAD
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/messages/m1/media"):
+                return httpx.Response(200, json=self.assets(len(data)))
+            ranges.append(request.headers.get("range"))
+            if len(ranges) == 1:
+                return httpx.Response(200, headers={"content-type": "application/pdf"},
+                                      content=self.broken_body(data, 15_000))
+            start = int(request.headers["range"].removeprefix("bytes=").rstrip("-"))
+            return httpx.Response(206, headers={"content-type": "application/pdf",
+                                                "content-range": f"bytes {start}-{len(data) - 1}/{len(data)}"},
+                                  content=data[start:])
+
+        wx = self.client(handler)
+        try:
+            media = await self.download(wx, 1 << 20)
+        finally:
+            await wx.close()
+        self.assertEqual(ranges, [None, "bytes=15000-"])
+        self.assertEqual(media.data, b"")  # larger than the spill size: kept on disk
+        self.assertEqual(os.path.basename(media.path), "report.pdf")
+        self.assertEqual((media.read(), media.size, media.mime), (data, len(data), "application/pdf"))
+        folder = os.path.dirname(media.path)
+        media.close()
+        self.assertFalse(os.path.exists(folder))
+        self.assertIsNone(media.path)
+
+    async def test_restarts_when_daemon_ignores_range(self):
+        calls = 0
+        data = self.PAYLOAD
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            if request.url.path.endswith("/messages/m1/media"):
+                return httpx.Response(200, json=self.assets(len(data)))
+            calls += 1
+            if calls == 1:
+                return httpx.Response(200, content=self.broken_body(data, 15_000))
+            return httpx.Response(200, content=data)  # an older daemon answers 200 with the whole file
+
+        wx = self.client(handler)
+        try:
+            media = await self.download(wx, 1 << 20)
+        finally:
+            await wx.close()
+        try:
+            self.assertEqual(calls, 2)
+            self.assertEqual(media.read(), data)
+        finally:
+            media.close()
+
+    async def test_restarts_when_partial_response_starts_elsewhere(self):
+        ranges: list[str | None] = []
+        encodings: list[str | None] = []
+        data = self.PAYLOAD
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/messages/m1/media"):
+                return httpx.Response(200, json=self.assets(len(data)))
+            ranges.append(request.headers.get("range"))
+            encodings.append(request.headers.get("accept-encoding"))
+            if len(ranges) == 1:
+                return httpx.Response(200, content=self.broken_body(data, 15_000))
+            if len(ranges) == 2:  # wrong piece: must not be appended after the first 15000 bytes
+                return httpx.Response(206, headers={"content-range": f"bytes 0-{len(data) - 1}/{len(data)}"},
+                                      content=data)
+            return httpx.Response(200, content=data)
+
+        wx = self.client(handler)
+        try:
+            media = await self.download(wx, 1 << 20)
+        finally:
+            await wx.close()
+        try:
+            self.assertEqual(ranges, [None, "bytes=15000-", None])
+            self.assertEqual(set(encodings), {"identity"})
+            self.assertEqual(media.read(), data)
+        finally:
+            media.close()
+
+    async def test_small_download_stays_in_memory(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/messages/m1/media"):
+                return httpx.Response(200, json=self.assets(5))
+            self.assertNotIn("range", request.headers)
+            return httpx.Response(200, content=b"%PDF-")
+
+        wx = self.client(handler)
+        try:
+            media = await self.download(wx, 1 << 20)
+        finally:
+            await wx.close()
+        self.assertIsNone(media.path)
+        self.assertEqual((media.data, media.read()), (b"%PDF-", b"%PDF-"))
+        f = media.tg_file()
+        self.assertEqual((f.name, f.read()), ("report.pdf", b"%PDF-"))
+
+    async def test_stream_larger_than_limit_is_aborted_and_cleaned_up(self):
+        import os
+        import tempfile as tf
+        from unittest.mock import patch
+        made: list[str] = []
+        real_mkdtemp = tf.mkdtemp
+
+        def mkdtemp(*a, **kw):
+            made.append(real_mkdtemp(*a, **kw))
+            return made[-1]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/messages/m1/media"):
+                return httpx.Response(200, json=self.assets())  # size not advertised
+
+            async def pieces():
+                for i in range(0, len(self.PAYLOAD), 4096):
+                    yield self.PAYLOAD[i:i + 4096]
+            return httpx.Response(200, content=pieces())
+
+        wx = self.client(handler)
+        try:
+            with patch("bridge.wechat.tempfile.mkdtemp", mkdtemp):
+                res = await self.download(wx, 20_000, spill=1_000)
+        finally:
+            await wx.close()
+        self.assertEqual(res, "文件太大")
+        self.assertTrue(made)
+        self.assertFalse(any(os.path.exists(d) for d in made))
+
+    async def test_gives_up_after_retries_and_cleans_up(self):
+        import os
+        import tempfile as tf
+        from unittest.mock import patch
+        made: list[str] = []
+        real_mkdtemp = tf.mkdtemp
+
+        def mkdtemp(*a, **kw):
+            made.append(real_mkdtemp(*a, **kw))
+            return made[-1]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/messages/m1/media"):
+                return httpx.Response(200, json=self.assets(len(self.PAYLOAD)))
+            start = int((request.headers.get("range") or "bytes=0-").removeprefix("bytes=").rstrip("-"))
+            return httpx.Response(206 if start else 200,
+                                  content=self.broken_body(self.PAYLOAD[start:], 5_000))
+
+        wx = self.client(handler)
+        try:
+            with patch("bridge.wechat.tempfile.mkdtemp", mkdtemp):
+                with self.assertRaises(httpx.ReadError):
+                    await self.download(wx, 1 << 20, spill=1_000)
+        finally:
+            await wx.close()
+        self.assertTrue(made)
+        self.assertFalse(any(os.path.exists(d) for d in made))
+
+
+class SafeFilenameTests(unittest.TestCase):
+    def test_strips_paths_and_unsafe_characters(self):
+        from bridge.wechat import _safe_filename
+        self.assertEqual(_safe_filename("../../etc/passwd"), "passwd")
+        self.assertEqual(_safe_filename(r"C:\Users\x\a:b?.mp4"), "ab.mp4")
+        self.assertEqual(_safe_filename("-rf.mp4"), "rf.mp4")
+        self.assertEqual(_safe_filename(""), "file.bin")
+        self.assertEqual(_safe_filename("download.part"), "file.bin")
+        long = _safe_filename("视" * 100 + ".mp4")
+        self.assertTrue(long.endswith(".mp4"))
+        self.assertLessEqual(len(long.encode("utf-8")), 200)

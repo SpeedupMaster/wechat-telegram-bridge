@@ -1092,20 +1092,27 @@ async def convert(data: bytes, mime: str) -> tuple[str, bytes] | str:
 _FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 
-def extract_video_meta_and_thumb(data: bytes, filename: str = "video.mp4") -> tuple[int, int, float, bytes] | None:
-    """Extract display (width, height, duration_s, jpeg_thumb_bytes) from a video using ffmpeg."""
+def extract_video_meta_and_thumb(data: bytes, filename: str = "video.mp4", *,
+                                 path: str | None = None) -> tuple[int, int, float, bytes] | None:
+    """Extract display (width, height, duration_s, jpeg_thumb_bytes) from a video using ffmpeg.
+
+    Reads the video from `path` when given (large downloads stay on disk), else from `data`.
+    """
     ffmpeg = find_ffmpeg()
-    if not ffmpeg or not data:
+    if not ffmpeg or not (data or path):
         return None
     ext = os.path.splitext(filename)[1].lower() if "." in filename else ".mp4"
     if not ext or not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
         ext = ".mp4"
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            src = os.path.join(tmp, f"in{ext}")
             frame = os.path.join(tmp, "frame.jpg")
-            with open(src, "wb") as f:
-                f.write(data)
+            if path:
+                src = path
+            else:
+                src = os.path.join(tmp, f"in{ext}")
+                with open(src, "wb") as f:
+                    f.write(data)
             res = subprocess.run(
                 [ffmpeg, "-hide_banner", "-y", "-i", src, "-frames:v", "1", "-q:v", "3", frame],
                 capture_output=True, text=True, errors="replace", timeout=30,

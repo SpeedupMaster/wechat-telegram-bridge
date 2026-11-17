@@ -1404,7 +1404,8 @@ class Bridge(LoginMixin):
             if isinstance(media, str):
                 log.info("Could not download the attachment of WeChat message %s (type %s): %s", msg["id"], t, media)
             if isinstance(media, Media) and t == VOICE and media.mime == "audio/wav":
-                if ogg := await wav_to_ogg(media.data):
+                if ogg := await wav_to_ogg(media.read()):
+                    media.close()
                     media = Media(ogg, "audio/ogg", "voice.ogg")
         elif is_channels:
             try:
@@ -1433,10 +1434,14 @@ class Bridge(LoginMixin):
                 media = Media(card_png, "image/png", "link-card.png")
 
         silent = outgoing and self.cfg.bridge.outgoing_silent
-        sent = await self._send_tg(
-            chat, thread, header, prefix, msg, media, reply_to, silent,
-            channels_video_err=channels_video_err,
-        )
+        try:
+            sent = await self._send_tg(
+                chat, thread, header, prefix, msg, media, reply_to, silent,
+                channels_video_err=channels_video_err,
+            )
+        finally:
+            if isinstance(media, Media):
+                media.close()  # large downloads were streamed to a temp file
         for m in sent:
             self.store.map_message(chat, "bot", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
             if chat < -1000000000000:
@@ -1531,8 +1536,7 @@ class Bridge(LoginMixin):
                 if is_channels and channels_video_err else ""
             )
             if isinstance(send_media, Media) and is_link:
-                f = io.BytesIO(send_media.data)
-                f.name = send_media.filename
+                f = send_media.tg_file()
                 caption = (header + prefix).rstrip("\n")
                 buttons = _link_buttons(msg.get("link"), msg.get("appMessageType"))
                 kw = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
@@ -1548,7 +1552,7 @@ class Bridge(LoginMixin):
                         src = cards.identify_link_source(msg.get("link"), msg.get("appMessageType"))
                         link_line = f'<a href="{_esc(url)}"><b>{_esc(src.button_label)}</b></a>'
                         fallback_cap = f"{caption}\n{link_line}" if caption else link_line
-                        f.seek(0)
+                        f = send_media.tg_file()
                         kw["buttons"] = None
                         kw["caption"] = fallback_cap[:TG_CAPTION_LIMIT]
                         try:
@@ -1569,7 +1573,7 @@ class Bridge(LoginMixin):
                     + channels_err_note
                 )
                 if t == STICKER:
-                    converted = await asyncio.to_thread(stickers.from_wechat_sticker, send_media.data, send_media.mime)
+                    converted = await asyncio.to_thread(stickers.from_wechat_sticker, send_media.read(), send_media.mime)
                     if converted is not None:
                         sk_kind, sk_bytes, sk_meta = converted
                         sf = io.BytesIO(sk_bytes)
@@ -1605,8 +1609,7 @@ class Bridge(LoginMixin):
                             if out:
                                 caption = ""
                                 reply = top
-                f = io.BytesIO(send_media.data)
-                f.name = send_media.filename
+                f = send_media.tg_file()
                 is_voice = t == VOICE and send_media.mime in ("audio/ogg", "audio/opus")
                 is_video = t == VIDEO or (is_channels and send_media.mime.startswith("video/"))
                 kwargs = dict(
@@ -1620,7 +1623,8 @@ class Bridge(LoginMixin):
                         kwargs["mime_type"] = send_media.mime
                     kwargs["nosound_video"] = True
                     vmeta = await asyncio.to_thread(
-                        stickers.extract_video_meta_and_thumb, send_media.data, send_media.filename
+                        stickers.extract_video_meta_and_thumb, send_media.data, send_media.filename,
+                        path=send_media.path,
                     )
                     if vmeta is not None:
                         vw, vh, vdur, vthumb = vmeta
@@ -1639,7 +1643,7 @@ class Bridge(LoginMixin):
                         raise
                     # e.g. a photo too large/odd-sized for Telegram's photo type: send it as a file instead
                     log.info("Telegram refused media as-is (%s); sending as a file", e)
-                    f.seek(0)
+                    f = send_media.tg_file()
                     kwargs.update(force_document=True, voice_note=False, supports_streaming=False, nosound_video=None)
                     kwargs.pop("attributes", None)
                     kwargs.pop("thumb", None)
