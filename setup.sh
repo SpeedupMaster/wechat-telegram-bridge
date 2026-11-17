@@ -27,6 +27,11 @@ if [ ! -f .env ]; then
   ask TG_BOT_TOKEN "TG_BOT_TOKEN: "
   printf 'TG_PROXY（海外 VPS 直接回车跳过）: '
   read -r TG_PROXY || TG_PROXY=""
+  echo "使用方式：1) 每个微信会话一个 Telegram 群（需登录你的 Telegram 账号）"
+  echo "          2) 一个话题群，每个微信会话一个话题（只用机器人）"
+  printf '选择 1 或 2（回车 = 1）: '
+  read -r mode_choice || mode_choice=""
+  case "$mode_choice" in 2) BRIDGE_MODE=topics ;; *) BRIDGE_MODE=groups ;; esac
   (
     umask 077
     {
@@ -34,6 +39,7 @@ if [ ! -f .env ]; then
       echo "TG_API_HASH=$TG_API_HASH"
       echo "TG_BOT_TOKEN=$TG_BOT_TOKEN"
       echo "TG_PROXY=$TG_PROXY"
+      echo "BRIDGE_MODE=$BRIDGE_MODE"
     } > .env
   )
   echo "已写入 .env"
@@ -59,10 +65,10 @@ while [ $i -lt 90 ]; do
     echo
     echo "    /login $code"
     echo
-    echo "然后按机器人的提示登录 Telegram、扫码登录微信。"
+    echo "然后按机器人的提示完成设置（群模式登录 Telegram；话题模式设置话题群），再登录微信。"
     exit 0
   fi
-  if printf '%s\n' "$logs" | grep -q "Telegram user:"; then
+  if printf '%s\n' "$logs" | grep -q -e "Telegram user:" -e "Topics mode:"; then
     echo "Telegram 已经登录过了。如果微信还没登录，机器人会把二维码发给你（也可以私聊机器人发 /wxlogin）。"
     exit 0
   fi

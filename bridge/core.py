@@ -1,4 +1,4 @@
-"""WeChat (agent-wechat) <-> Telegram bridge: one Telegram group per WeChat chat."""
+"""WeChat (agent-wechat) <-> Telegram bridge: one Telegram group (or forum topic) per WeChat chat."""
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +34,39 @@ DEAD_CHAT_ERRORS = (errors.ChatWriteForbiddenError, errors.ChatIdInvalidError, e
 def _dead_chat(e: Exception) -> bool:
     # Telethon raises ValueError("Could not find the input entity ...") for chats it cannot reach.
     return isinstance(e, DEAD_CHAT_ERRORS) or (isinstance(e, ValueError) and "input entity" in str(e))
+
+
+def _topic_gone(e: Exception) -> bool:
+    """The forum topic we posted into was deleted (the forum itself is still there)."""
+    # Telethon raises known errors as their own class (whose .message is generic), unknown ones as
+    # a base class carrying Telegram's error string.
+    return isinstance(e, getattr(errors, "TopicDeletedError", ())) or (
+        isinstance(e, errors.RPCError) and getattr(e, "message", "") in ("TOPIC_DELETED", "TOPIC_ID_INVALID"))
+
+
+def _msg_topic(msg) -> int | None:
+    """Forum topic a message was posted in (id of the topic's first message); None = General / not a forum."""
+    r = getattr(msg, "reply_to", None)
+    if r is None or not getattr(r, "forum_topic", False):
+        return None
+    return getattr(r, "reply_to_top_id", None) or getattr(r, "reply_to_msg_id", None)
+
+
+def _reply_target(msg) -> int | None:
+    """The message this one really replies to. In forums every message "replies" to its topic's
+    first message; that is only a topic marker, not a reply."""
+    r = getattr(msg, "reply_to", None)
+    rid = getattr(r, "reply_to_msg_id", None) if r is not None else None
+    if not rid:
+        return None
+    if getattr(r, "forum_topic", False) and not getattr(r, "reply_to_top_id", None):
+        return None
+    return rid
+
+
+# Telegram only accepts these topic icon colours; one for contacts, one for WeChat groups.
+TOPIC_COLOR_DIRECT = 0x6FB9F0
+TOPIC_COLOR_GROUP = 0x8EEE98
 
 
 async def wav_to_ogg(data: bytes) -> bytes | None:
@@ -89,6 +122,56 @@ GROUP_HELP = (
     "💡 发 <code>@成员名</code> / <code>@所有人</code> 可微信提醒；删单条消息或回复 <code>/recall</code> 可撤回；<code>//</code> 开头仅留在 Telegram。"
 )
 
+TOPIC_HELP = (
+    "<b>微信 ↔ Telegram 桥接指南（话题模式）</b>\n\n"
+    "所有微信会话都在一个话题群里，每个会话对应一个话题：在话题里发消息即发送到微信，"
+    "<b>回复</b>消息即微信引用回复。\n\n"
+    "<b>私聊命令</b>\n"
+    "• <code>/find</code> [关键词] — 搜索微信联系人/群（不填显示最近会话，点按钮直接打开）\n"
+    "• <code>/open</code> [关键词] — 为微信联系人/群新建话题并主动发起聊天\n"
+    "• <code>/chats</code> [关键词] — 查看已连接的会话列表（别名 <code>/list</code>）\n"
+    "• <code>/status</code> — 查看运行状态与微信登录态\n"
+    "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
+    "• <code>/help</code> — 显示这份帮助\n\n"
+    "<b>话题群内命令</b>\n"
+    "• <code>/forum</code> — 把当前群设为桥接话题群（需先开启话题，并把我设为管理员）\n"
+    "• <code>/link</code> [关键词] — 在某个话题里发，把该话题绑定到微信会话\n"
+    "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
+    "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
+    "• <code>/rename</code> — 同步微信备注/群名为话题标题（别名 <code>/title</code>）\n"
+    "• <code>/unlink</code> — 解除当前话题与微信会话的绑定\n"
+    "• <code>/help</code> — 显示群内帮助\n\n"
+    "<b>常用技巧</b>\n"
+    "• 话题内发送 <code>@成员名</code> 或 <code>@所有人</code> 可触发微信 @ 提醒\n"
+    "• 回复 <code>/recall</code> 可撤回微信消息（2 分钟内有效）\n"
+    "• 以 <code>//</code> 开头的内容仅留在 Telegram，不会发到微信"
+)
+
+TOPIC_GROUP_HELP = (
+    "<b>话题群命令</b>\n"
+    "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
+    "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
+    "• <code>/rename</code> — 同步最新微信备注/群名为话题标题（别名 <code>/title</code>）\n"
+    "• <code>/link</code> [关键词] — 把当前话题绑定（或改绑）到微信会话\n"
+    "• <code>/unlink</code> — 解除当前话题与微信会话的绑定\n"
+    "• <code>/forum</code> — 把当前群设为桥接话题群\n"
+    "• <code>/help</code> — 显示群内帮助\n\n"
+    "💡 发 <code>@成员名</code> / <code>@所有人</code> 可微信提醒；回复 <code>/recall</code> 可撤回；<code>//</code> 开头仅留在 Telegram。"
+)
+
+
+def forum_setup_text(bot_username: str) -> str:
+    return (
+        "<b>设置话题群</b>（只需一次）\n"
+        "1. 新建一个 Telegram 群，在群设置里开启「话题」(Topics)\n"
+        f"2. 把 @{_esc(bot_username)} 拉进群并设为管理员，勾选「管理话题」权限\n"
+        "3. 在群里发送 <code>/forum</code>\n\n"
+        "之后每个微信会话会自动在群里生成一个话题。"
+    )
+
+
 PRIVATE_BOT_COMMANDS = [
     ("find", "搜索微信联系人或群（可一键建群）"),
     ("open", "为微信会话建群发起聊天"),
@@ -107,6 +190,27 @@ GROUP_BOT_COMMANDS = [
     ("rename", "同步最新微信名称到群标题"),
     ("link", "绑定或切换当前群对应的微信会话"),
     ("unlink", "解除当前群与微信的绑定"),
+    ("help", "查看群内命令帮助"),
+]
+
+
+TOPIC_PRIVATE_BOT_COMMANDS = [
+    ("find", "搜索微信联系人或群（可一键建话题）"),
+    ("open", "为微信会话新建话题发起聊天"),
+    ("chats", "查看已连接的会话列表"),
+    ("status", "查看运行与微信在线状态"),
+    ("wxlogin", "重新登录微信（手机确认或扫码）"),
+    ("help", "查看使用指南"),
+]
+
+TOPIC_GROUP_BOT_COMMANDS = [
+    ("wx", "查看对应的微信会话"),
+    ("members", "查看群成员（点按复制 @名字）"),
+    ("recall", "回复消息以撤回微信消息"),
+    ("rename", "同步最新微信名称到话题标题"),
+    ("link", "绑定或切换当前话题对应的微信会话"),
+    ("unlink", "解除当前话题与微信的绑定"),
+    ("forum", "把当前群设为桥接话题群"),
     ("help", "查看群内命令帮助"),
 ]
 
@@ -591,16 +695,23 @@ class Bridge(LoginMixin):
         self._link_wait: dict | None = None
         self._recall_notice_ttl: float = 5.0
         self._notice_tasks: set[asyncio.Task] = set()
+        # Topics mode: everything happens in one forum supergroup and only the bot is used.
+        self.topics = cfg.bridge.mode == "topics"
+        self.forum_chat: int | None = (
+            cfg.bridge.forum_chat or int(self.store.get("forum_chat") or 0) or None) if self.topics else None
+        self._forum_warned_at: float | None = None
 
     # ======================================================================
     # startup
     # ======================================================================
     async def sync_bot_commands(self) -> None:
         """Register private and group `/` menus with Telegram."""
+        private, group = ((TOPIC_PRIVATE_BOT_COMMANDS, TOPIC_GROUP_BOT_COMMANDS) if self.topics
+                          else (PRIVATE_BOT_COMMANDS, GROUP_BOT_COMMANDS))
         scopes = [
-            (types.BotCommandScopeDefault(), PRIVATE_BOT_COMMANDS),
-            (types.BotCommandScopeUsers(), PRIVATE_BOT_COMMANDS),
-            (types.BotCommandScopeChats(), GROUP_BOT_COMMANDS),
+            (types.BotCommandScopeDefault(), private),
+            (types.BotCommandScopeUsers(), private),
+            (types.BotCommandScopeChats(), group),
         ]
         for scope, items in scopes:
             cmds = [types.BotCommand(command=cmd, description=desc) for cmd, desc in items]
@@ -615,7 +726,8 @@ class Bridge(LoginMixin):
         if not self.bot_me.username:
             raise SystemExit("The bot has no username; check TG_BOT_TOKEN")
         await self.sync_bot_commands()
-        await self.user.connect()
+        if not self.topics:  # topics mode never uses your Telegram account
+            await self.user.connect()
         self.bot.add_event_handler(self.on_bot_private, events.NewMessage(incoming=True, func=lambda e: e.is_private))
         self.bot.add_event_handler(self.on_bot_callback, events.CallbackQuery())
         # The user client's update loop may only start once that account is logged in
@@ -623,6 +735,9 @@ class Bridge(LoginMixin):
         await asyncio.gather(self.main(), self.bot.run_until_disconnected())
 
     async def main(self) -> None:
+        if self.topics:
+            await self._main_topics()
+            return
         if await self.user.is_user_authorized():
             self.tg_ready.set()
         else:
@@ -652,6 +767,39 @@ class Bridge(LoginMixin):
             incoming=True, func=lambda e: not e.is_private and e.sender_id == self.owner_id
             and self.store.thread_for_chat(e.chat_id) is not None))
         await asyncio.gather(self.wechat_side(), self.user.run_until_disconnected())
+
+    async def _main_topics(self) -> None:
+        """Topics mode: the bot alone. Whoever enters the pairing code once becomes the owner."""
+        # "greeted" holds the account id from groups mode, so switching modes needs no new pairing.
+        owner = self.store.get("owner") or self.store.get("greeted")
+        if owner:
+            self.owner_id = int(owner)
+            self.tg_ready.set()
+        else:
+            self.start_pairing()
+            await self.tg_ready.wait()
+        self.store.set("owner", str(self.owner_id))
+        log.info("Topics mode: bot @%s, owner %s, forum group %s", self.bot_me.username, self.owner_id,
+                 self.forum_chat or "not set yet (send /forum in the group)")
+        self.bot.add_event_handler(self.on_forum_message, events.NewMessage(
+            incoming=True, func=lambda e: not e.is_private and e.sender_id == self.owner_id))
+        self.bot.add_event_handler(self.on_tg_delete, events.MessageDeleted())
+        if not self.forum_chat:
+            await self.notify(forum_setup_text(self.bot_me.username), parse_mode="html")
+        await self.wechat_side()
+
+    async def _pair_topics_owner(self, event) -> None:
+        """Topics mode: a correct pairing code is all the setup the Telegram side needs."""
+        self.owner_id = event.sender_id
+        self.store.set("owner", str(self.owner_id))
+        self.pairing_code = None
+        self.login_step = None
+        text = "✅ <b>配对成功</b>（话题模式：只使用机器人，无需登录 Telegram 账号）。"
+        if not self.forum_chat:
+            text += "\n\n" + forum_setup_text(self.bot_me.username)
+        text += "\n\n接下来会自动发起微信登录（支持手机确认或扫码）。"
+        await event.reply(text, parse_mode="html")
+        self.tg_ready.set()
 
     async def wechat_side(self) -> None:
         await self.ensure_wechat()
@@ -842,7 +990,130 @@ class Bridge(LoginMixin):
         tpl = self.cfg.bridge.title_group if thread.get("kind") == "group" else self.cfg.bridge.title_direct
         return tpl.format(name=name)[:128]
 
+    # --- bindings, whichever the mode ---------------------------------------
+    def _dest_for_thread(self, tid: str) -> tuple[int, int | None] | None:
+        """(chat, topic) a WeChat thread is bridged to; topic is None in groups mode."""
+        if self.topics:
+            dest = self.store.topic_for_thread(tid)
+            return dest if dest and dest[0] == self.forum_chat else None
+        chat = self.store.chat_for_thread(tid)
+        return None if chat is None else (chat, None)
+
+    def _topic_for(self, chat: int, tid: str) -> int | None:
+        """Topic to post into for a thread in `chat` (None: groups mode, or not the forum)."""
+        if not self.topics or chat != self.forum_chat:
+            return None
+        dest = self.store.topic_for_thread(tid)
+        return dest[1] if dest and dest[0] == chat else None
+
+    def _thread_for_event(self, event) -> str | None:
+        if not self.topics:
+            return self.store.thread_for_chat(event.chat_id)
+        topic = _msg_topic(event.message)
+        if event.chat_id != self.forum_chat or topic is None:
+            return None
+        return self.store.thread_for_topic(event.chat_id, topic)
+
+    def _unlink_thread(self, tid: str) -> None:
+        if self.topics:
+            self.store.unlink_topic(tid)
+        else:
+            self.store.unlink(tid)
+
+    def _link_rows(self) -> list[tuple[str, str, str]]:
+        """(wx_thread, title, where) for every active binding of the current mode."""
+        if self.topics:
+            if not self.forum_chat:
+                return []
+            return [(wx, title, f"{self.forum_chat}#{topic}")
+                    for wx, topic, title, _ in self.store.list_topics(self.forum_chat)]
+        return [(wx, title, str(chat)) for wx, chat, title, _ in self.store.list_threads()]
+
+    def _link_title(self, tid: str) -> str:
+        return next((title for wx, title, _ in self._link_rows() if wx == tid), "")
+
+    async def _drop_dead_dest(self, chat: int, thread: dict, e: Exception) -> bool:
+        """After a failed send: forget a destination that is gone. True = create a new one and retry."""
+        if self.topics:
+            if _topic_gone(e):
+                log.warning("Topic for %s in %s is gone (%s); creating a new one", thread["id"], chat, e)
+                self.store.unlink_topic(thread["id"])
+                self.store.forget_messages(chat, thread["id"])
+                return True
+            if _dead_chat(e):
+                await self._forum_problem(
+                    f"无法在话题群 {chat} 里发消息（{type(e).__name__}: {e}）。"
+                    "请确认我还在群里、是管理员，或在新的话题群里发送 /forum。")
+            return False
+        if not _dead_chat(e):
+            return False
+        log.warning("Telegram group %s for %s is gone (%s); creating a new one", chat, thread["id"], e)
+        self.store.unlink(thread["id"])
+        return True
+
+    async def _forum_problem(self, text: str) -> None:
+        """Tell the owner the forum group can't be used; at most every 10 minutes."""
+        log.warning("%s", text)
+        now = time.monotonic()
+        if self._forum_warned_at is not None and now - self._forum_warned_at < 600:
+            return
+        self._forum_warned_at = now
+        await self.notify("⚠️ " + text + "\n（期间收到的微信消息不会转发到 Telegram）")
+
+    # --- forum topics -----------------------------------------------------
+    async def _forum_call(self, name: str, chat: int, **kw):
+        """Run a forum-topic request. Newer Telegram layers have it under messages., older under channels."""
+        peer = await self.bot.get_input_entity(chat)
+        if cls := getattr(functions.messages, name, None):
+            return await self.bot(cls(peer=peer, **kw))
+        return await self.bot(getattr(functions.channels, name)(channel=peer, **kw))
+
+    async def _create_topic(self, chat: int, title: str, *, group: bool) -> int:
+        color = TOPIC_COLOR_GROUP if group else TOPIC_COLOR_DIRECT
+        while True:
+            try:
+                result = await self._forum_call("CreateForumTopicRequest", chat, title=title, icon_color=color)
+                break
+            except errors.FloodWaitError as e:
+                log.warning("Telegram asks to wait %ss before creating another topic", e.seconds)
+                await asyncio.sleep(e.seconds + 1)
+        updates = getattr(result, "updates", None) or []
+        for u in updates:
+            m = getattr(u, "message", None)
+            if isinstance(m, types.MessageService) and isinstance(m.action, types.MessageActionTopicCreate):
+                return m.id
+        for u in updates:
+            if isinstance(u, types.UpdateMessageID):
+                return u.id
+        raise RuntimeError("Telegram did not return the id of the new topic")
+
+    async def _ensure_topic(self, thread: dict) -> int | None:
+        tid = thread["id"]
+        if (dest := self._dest_for_thread(tid)) is not None:
+            return dest[0]
+        async with self.create_lock:
+            if (dest := self._dest_for_thread(tid)) is not None:
+                return dest[0]
+            forum = self.forum_chat
+            if not forum:
+                await self._forum_problem("还没有设置话题群：请在开启了「话题」的群里把我设为管理员，然后在群里发送 /forum。")
+                return None
+            title = self._title(thread)
+            try:
+                topic = await self._create_topic(forum, title, group=thread.get("kind") == "group")
+            except Exception as e:
+                await self._forum_problem(
+                    f"无法在话题群 {forum} 里创建话题「{title}」（{type(e).__name__}: {e}）。"
+                    "请确认群已开启「话题」，我是管理员且有「管理话题」权限。")
+                return None
+            self.store.link_topic(tid, forum, topic, title)
+            log.info("Created topic %r (%s) in %s for WeChat chat %s", title, topic, forum, tid)
+        await self._init_chat(forum, None, thread)
+        return forum
+
     async def ensure_chat(self, thread: dict) -> int | None:
+        if self.topics:
+            return await self._ensure_topic(thread)
         tid = thread["id"]
         if (chat := self.store.chat_for_thread(tid)) is not None:
             return chat
@@ -891,7 +1162,7 @@ class Bridge(LoginMixin):
             return f"{type(e).__name__}: {e}"
 
     async def sync_title(self, chat_id: int, thread_id: str) -> tuple[str | None, str]:
-        """Update Telegram group title from WeChat display name. Returns (new_title, error_or_status)."""
+        """Update Telegram group (or topic) title from WeChat display name. Returns (new_title, error_or_status)."""
         try:
             try:
                 thread = await self.wx.thread(thread_id)
@@ -901,6 +1172,19 @@ class Bridge(LoginMixin):
                 contact = await self.wx.contact(thread_id)
                 thread = {"id": thread_id, "kind": "direct", "displayName": contact.get("displayName") or thread_id}
             title = self._title(thread)
+            if self.topics:
+                topic = self._topic_for(chat_id, thread_id)
+                if topic is None:
+                    return None, "这个会话没有对应的话题"
+                try:
+                    await self._forum_call("EditForumTopicRequest", chat_id, topic_id=topic, title=title)
+                except errors.RPCError as e:
+                    if getattr(e, "message", "") != "TOPIC_NOT_MODIFIED":
+                        raise
+                    self.store.update_topic_title(thread_id, title)
+                    return title, "unchanged"
+                self.store.update_topic_title(thread_id, title)
+                return title, ""
             try:
                 if chat_id < -1000000000000:
                     await self.user(functions.channels.EditTitleRequest(
@@ -917,13 +1201,15 @@ class Bridge(LoginMixin):
             log.info("Could not sync group title for %s: %s", thread_id, e)
             return None, f"{type(e).__name__}: {e}"
 
-    async def _init_chat(self, chat_id: int, raw_chat_id: int, thread: dict) -> None:
-        if self.cfg.bridge.sync_avatar:
+    async def _init_chat(self, chat_id: int, raw_chat_id: int | None, thread: dict) -> None:
+        if self.cfg.bridge.sync_avatar and not self.topics:  # topics have no photo
             # Fetching an avatar from WeChat can take a while; don't hold up the first message.
             asyncio.create_task(self.sync_avatar(chat_id, thread["id"]))
         kind = "群聊" if thread.get("kind") == "group" else "联系人"
+        kw = {"reply_to": topic} if (topic := self._topic_for(chat_id, thread["id"])) else {}
         await self.bot.send_message(chat_id, f"已连接微信{kind}：<b>{_esc(thread.get('displayName'))}</b>\n"
-                                             f"<code>{_esc(thread['id'])}</code>", parse_mode="html", silent=True)
+                                             f"<code>{_esc(thread['id'])}</code>", parse_mode="html", silent=True,
+                                    **kw)
 
     # --- rendering --------------------------------------------------------
     async def _sender_name(self, msg: dict) -> str:
@@ -1073,13 +1359,14 @@ class Bridge(LoginMixin):
             q = msg["quote"]
             q_msg_id = Store._norm_id(q.get("messageId") or q.get("referencedMessageId") or q.get("targetMessageId"))
             q_server = Store._norm_id(q.get("serverId") or q.get("serverMessageId"))
-            hit = self.store.tg_for_wx(msg["threadId"], q_msg_id, q_server)
+            hit = self.store.tg_for_wx(msg["threadId"], q_msg_id, q_server, tg_chat=chat)
             orig = None
             if not (hit and hit[0] == chat) and (q_msg_id or q_server):
                 if not self._quote_inline_text(q):
                     orig = await self._lookup_wx_message(msg["threadId"], q_msg_id, q_server)
                     if orig:
-                        hit2 = self.store.tg_for_wx(msg["threadId"], orig.get("id"), orig.get("serverId"))
+                        hit2 = self.store.tg_for_wx(msg["threadId"], orig.get("id"), orig.get("serverId"),
+                                                    tg_chat=chat)
                         if hit2 and hit2[0] == chat:
                             hit = hit2
             if hit and hit[0] == chat:
@@ -1214,7 +1501,9 @@ class Bridge(LoginMixin):
                        *, channels_video_err: str = "") -> list:
         async def go(chat_id: int) -> list:
             out = []
-            reply = reply_to
+            # Topics mode: anything that is not a reply goes to the thread's topic.
+            top = self._topic_for(chat_id, thread["id"])
+            reply = reply_to if reply_to is not None else top
             t = msg.get("type")
             is_channels = t == APP and msg.get("appMessageType") == APP_CHANNELS
             is_link = _is_link_card(msg)
@@ -1287,7 +1576,7 @@ class Bridge(LoginMixin):
                             out.append(await self.bot.send_message(
                                 chat_id, caption.rstrip("\n"), parse_mode="html",
                                 reply_to=reply, silent=silent, link_preview=False))
-                            sk_kwargs["reply_to"] = None
+                            sk_kwargs["reply_to"] = top
                         try:
                             out.append(await self.bot.send_file(chat_id, sf, **sk_kwargs))
                             return out
@@ -1297,7 +1586,7 @@ class Bridge(LoginMixin):
                             log.info("Telegram refused sticker as-is (%s); falling back to original media", e)
                             if out:
                                 caption = ""
-                                reply = None
+                                reply = top
                 f = io.BytesIO(send_media.data)
                 f.name = send_media.filename
                 is_voice = t == VOICE and send_media.mime in ("audio/ogg", "audio/opus")
@@ -1376,7 +1665,7 @@ class Bridge(LoginMixin):
                 for i, part in enumerate(parts):
                     out.append(await self.bot.send_message(
                         chat_id, part, parse_mode="html", silent=silent,
-                        reply_to=reply if i == 0 else None,
+                        reply_to=reply if i == 0 else top,
                         buttons=buttons if i == len(parts) - 1 else None,
                         link_preview=False,
                     ))
@@ -1389,7 +1678,7 @@ class Bridge(LoginMixin):
                 for i, part in enumerate(fallback_parts):
                     out.append(await self.bot.send_message(
                         chat_id, part, parse_mode="html", silent=silent,
-                        reply_to=reply if i == 0 else None,
+                        reply_to=reply if i == 0 else top,
                         link_preview=False,
                     ))
             if (
@@ -1399,18 +1688,20 @@ class Bridge(LoginMixin):
                 and loc.get("longitude") is not None
             ):
                 geo = types.InputMediaGeoPoint(types.InputGeoPoint(lat=loc["latitude"], long=loc["longitude"]))
-                out.append(await self.bot.send_file(chat_id, geo, silent=silent))
+                out.append(await self.bot.send_file(chat_id, geo, silent=silent,
+                                                    **({"reply_to": top} if top else {})))
             return out
 
         try:
             return await go(chat)
         except Exception as e:
-            if not _dead_chat(e):
+            if not await self._drop_dead_dest(chat, thread, e):
                 raise
-            log.warning("Telegram group %s for %s is gone (%s); creating a new one", chat, thread["id"], e)
-            self.store.unlink(thread["id"])
             new_chat = await self.ensure_chat(thread)
-            return await go(new_chat) if new_chat else []
+            if not new_chat:
+                return []
+            reply_to = None  # the message it replied to went away with the old group/topic
+            return await go(new_chat)
 
     async def on_wx_recall(self, data: dict) -> None:
         tid = data.get("threadId") or ""
@@ -1418,7 +1709,8 @@ class Bridge(LoginMixin):
         if sid and (tid, str(sid)) in self.tg_recalls:
             self.tg_recalls.discard((tid, str(sid)))
             return
-        hit = self.store.tg_for_wx(tid, data.get("messageId"), sid)
+        dest = self._dest_for_thread(tid)
+        hit = self.store.tg_for_wx(tid, data.get("messageId"), sid, tg_chat=dest[0] if dest else None)
         if not hit:
             return
         text = "↩️ 这条消息已在微信中撤回"
@@ -1545,19 +1837,19 @@ class Bridge(LoginMixin):
         chat = await self.ensure_chat(thread)
         if chat is None:
             return None
-        try:
-            sent = await self.bot.send_message(chat, text, parse_mode="html", buttons=buttons, link_preview=False)
-            return chat, sent.id
-        except Exception as e:
-            if not _dead_chat(e):
-                raise
-            log.warning("Telegram group %s for %s is gone (%s); creating a new one", chat, thread["id"], e)
-            self.store.unlink(thread["id"])
-            new_chat = await self.ensure_chat(thread)
-            if not new_chat:
-                return None
-            sent = await self.bot.send_message(new_chat, text, parse_mode="html", buttons=buttons, link_preview=False)
-            return new_chat, sent.id
+        for retry in (False, True):
+            topic = self._topic_for(chat, thread["id"])
+            try:
+                sent = await self.bot.send_message(chat, text, parse_mode="html", buttons=buttons, link_preview=False,
+                                                   **({"reply_to": topic} if topic else {}))
+                return chat, sent.id
+            except Exception as e:
+                if retry or not await self._drop_dead_dest(chat, thread, e):
+                    raise
+                chat = await self.ensure_chat(thread)
+                if not chat:
+                    return None
+        return None
 
     @staticmethod
     def _render_call(entry: dict) -> tuple[str, list | None]:
@@ -1879,14 +2171,81 @@ class Bridge(LoginMixin):
     # ======================================================================
     # Telegram -> WeChat
     # ======================================================================
+    async def on_forum_message(self, event) -> None:
+        """Topics mode: every message of yours in a group the bot is in (the bot must be admin to see them)."""
+        msg = event.message
+        if msg.action or msg.via_bot_id:
+            return
+        text = (msg.message or "").strip()
+        cmd, _, arg = text.partition(" ")
+        cmd_name, _, at_bot = cmd.partition("@")
+        cmd_name = cmd_name.lower() if cmd_name.startswith("/") else ""
+        if at_bot and at_bot.lower() != self.bot_me.username.lower():
+            cmd_name = ""
+        if cmd_name == "/forum":
+            await self._set_forum(event)
+            return
+        if event.chat_id != self.forum_chat:
+            return
+        if self._thread_for_event(event) is not None:
+            await self.on_tg_message(event)
+            return
+        # The General topic, or a topic not bound to a WeChat chat: only a few commands do anything.
+        if not cmd_name:
+            return
+        topic = _msg_topic(msg)
+        if cmd_name == "/link":
+            if topic is None:
+                await self._send_group_notice(
+                    event.chat_id, msg.id,
+                    "请打开要绑定的话题，在话题里发送 <code>/link</code>；"
+                    "想为微信会话新建话题，私聊我发 <code>/open</code>。")
+            else:
+                await self._handle_group_link(event, arg.strip())
+        elif cmd_name == "/help":
+            await self._send_group_notice(event.chat_id, msg.id, TOPIC_GROUP_HELP)
+        elif cmd_name in ("/wx", "/unlink", "/members", "/at", "/recall", "/rename", "/title", "/avatar"):
+            await self._send_group_notice(event.chat_id, msg.id,
+                                          "这个话题还没有绑定微信会话，发送 <code>/link</code> 绑定。")
+
+    async def _set_forum(self, event) -> None:
+        chat_id, msg_id = event.chat_id, event.message.id
+        try:
+            chat = await event.get_chat()
+        except Exception:
+            chat = None
+        if not getattr(chat, "forum", False):
+            await self._send_group_notice(
+                chat_id, msg_id,
+                "这个群还没有开启「话题」：请在群设置中开启话题（Topics），"
+                "并把我设为管理员、勾选「管理话题」权限，然后再发 <code>/forum</code>。")
+            return
+        fixed = self.cfg.bridge.forum_chat
+        if fixed and fixed != chat_id:
+            await self._send_group_notice(
+                chat_id, msg_id,
+                f"话题群已由 TG_FORUM_CHAT 固定为 <code>{fixed}</code>。要改用这个群，"
+                f"请把 TG_FORUM_CHAT 改为 <code>{chat_id}</code>（或删掉它）后重启。")
+            return
+        old = self.forum_chat
+        self.forum_chat = chat_id
+        self.store.set("forum_chat", str(chat_id))
+        self._forum_warned_at = None
+        log.info("Forum group set to %s (was %s)", chat_id, old)
+        text = "✅ 已把当前群设为桥接话题群。新的微信消息会自动在这里创建话题；私聊我发 <code>/open</code> 可主动新建话题。"
+        if old and old != chat_id:
+            text += f"\n\n（原话题群 <code>{old}</code> 的绑定已保留，改回去即可恢复。）"
+        await self._send_group_notice(chat_id, msg_id, text)
+
     async def on_tg_message(self, event: events.NewMessage.Event) -> None:
         msg = event.message
         if msg.action or msg.via_bot_id:
             return
         chat_id = event.chat_id
-        thread_id = self.store.thread_for_chat(chat_id)
+        thread_id = self._thread_for_event(event)
         if not thread_id:
             return
+        noun = "话题" if self.topics else "群"
         text = msg.message or ""
         if text.startswith("//"):
             return
@@ -1896,7 +2255,7 @@ class Bridge(LoginMixin):
         if not at_bot or at_bot.lower() == self.bot_me.username.lower():
             cmd_name = cmd_name.lower()
             if cmd_name == "/wx":
-                title = next((t for w, _, t, _ in self.store.list_threads() if w == thread_id), "")
+                title = self._link_title(thread_id)
                 if self.wx_ready:
                     try:
                         thread = await self.wx.thread(thread_id)
@@ -1907,6 +2266,10 @@ class Bridge(LoginMixin):
                 await self.bot.send_message(chat_id, f"{head}<code>{_esc(thread_id)}</code>",
                                             parse_mode="html", reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
+            if cmd_name == "/avatar" and self.topics:
+                await self.bot.send_message(chat_id, "Telegram 话题不支持设置头像",
+                                            reply_to=await self._bot_reply_id(chat_id, msg.id))
+                return
             if cmd_name == "/avatar":
                 why = await self.sync_avatar(chat_id, thread_id)
                 await self.bot.send_message(chat_id, f"没有拿到这个会话的微信头像（{why}）" if why else "已更新群头像",
@@ -1915,33 +2278,33 @@ class Bridge(LoginMixin):
             if cmd_name in ("/rename", "/title"):
                 title, status = await self.sync_title(chat_id, thread_id)
                 if status == "unchanged":
-                    reply = f"群标题已是最新：{_esc(title)}"
+                    reply = f"{noun}标题已是最新：{_esc(title)}"
                 elif status:
-                    reply = f"无法同步群标题（{_esc(status)}）"
+                    reply = f"无法同步{noun}标题（{_esc(status)}）"
                 else:
-                    reply = f"已更新群标题：{_esc(title)}"
+                    reply = f"已更新{noun}标题：{_esc(title)}"
                 await self.bot.send_message(chat_id, reply, parse_mode="html",
                                             reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/unlink":
-                self.store.unlink(thread_id)
+                self._unlink_thread(thread_id)
                 await self.bot.send_message(
                     chat_id,
-                    f"已解除当前群与微信会话 <code>{_esc(thread_id)}</code> 的绑定。",
+                    f"已解除当前{noun}与微信会话 <code>{_esc(thread_id)}</code> 的绑定。",
                     parse_mode="html", reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/link":
                 await self._handle_group_link(event, arg.strip())
                 return
             if cmd_name == "/help":
-                await self.bot.send_message(chat_id, GROUP_HELP, parse_mode="html",
+                await self.bot.send_message(chat_id, TOPIC_GROUP_HELP if self.topics else GROUP_HELP, parse_mode="html",
                                             reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name in ("/members", "/at"):
                 await self._send_members(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg.strip())
                 return
             if cmd_name == "/recall":
-                reply_id = msg.reply_to.reply_to_msg_id if msg.reply_to and msg.reply_to.reply_to_msg_id else None
+                reply_id = _reply_target(msg)
                 if not reply_id:
                     await self.bot.send_message(chat_id, "请回复你要撤回的那条消息再发送 /recall",
                                                 reply_to=await self._bot_reply_id(chat_id, msg.id))
@@ -1964,8 +2327,7 @@ class Bridge(LoginMixin):
             return  # other commands are not forwarded
 
         quote_ref = None
-        if msg.reply_to and msg.reply_to.reply_to_msg_id:
-            reply_id = msg.reply_to.reply_to_msg_id
+        if reply_id := _reply_target(msg):
             if entry := self.store.wx_entry_for_tg(chat_id, reply_id):
                 r_thread, r_wx_msg, r_server = entry
                 if r_thread == thread_id and r_server:
@@ -2099,8 +2461,9 @@ class Bridge(LoginMixin):
             cur += line + "\n"
         if cur:
             pages.append(cur.rstrip())
+        top = self._topic_for(chat_id, thread_id)
         for i, part in enumerate(pages):
-            await self.bot.send_message(chat_id, part, parse_mode="html", reply_to=reply_to if i == 0 else None)
+            await self.bot.send_message(chat_id, part, parse_mode="html", reply_to=reply_to if i == 0 else top)
 
     def _map_tg_wx(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,
                    wx_server: str | None) -> None:
@@ -2266,24 +2629,26 @@ class Bridge(LoginMixin):
         if not (wx_server and self.store.is_sent(thread_id, wx_server)):
             return
         ok, info = await self._recall_tg_msg(chat_id, tg_msg, thread_id, wx_msg, wx_server, "recall-del")
+        topic = self._topic_for(chat_id, thread_id)
         if ok:
             try:
-                notice = await self.bot.send_message(chat_id, "↩️ " + info, silent=True)
+                notice = await self.bot.send_message(chat_id, "↩️ " + info, silent=True,
+                                                     **({"reply_to": topic} if topic else {}))
             except Exception as e:
                 log.info("Could not notify recall in chat %s: %s", chat_id, e)
                 return
             if notice is not None and getattr(notice, "id", None) is not None:
                 self._schedule_delete_notice(chat_id, notice.id, self._recall_notice_ttl)
         else:
-            await self._report(chat_id, None, info)
+            await self._report(chat_id, None, info, topic=topic)
 
-    async def _report(self, chat_id: int, reply_to: int | None, text: str) -> None:
+    async def _report(self, chat_id: int, reply_to: int | None, text: str, *, topic: int | None = None) -> None:
         try:
-            await self.bot.send_message(chat_id, "⚠️ " + text, reply_to=reply_to)
+            await self.bot.send_message(chat_id, "⚠️ " + text, reply_to=reply_to if reply_to is not None else topic)
         except Exception:
             if reply_to is not None:
                 try:
-                    await self.bot.send_message(chat_id, "⚠️ " + text)
+                    await self.bot.send_message(chat_id, "⚠️ " + text, **({"reply_to": topic} if topic else {}))
                     return
                 except Exception:
                     pass
@@ -2380,14 +2745,14 @@ class Bridge(LoginMixin):
         return (unlinked + linked)[:limit]
 
     def _wx_picker_buttons(self, cands: list[dict], *, action: str, extra: dict | None = None,
-                           current_chat: int | None = None) -> list[list]:
+                           current: tuple[int, int | None] | None = None) -> list[list]:
         rows: list[list] = []
         for c in cands[:8]:
             icon = "👥" if c["kind"] == "group" else "👤"
-            linked_chat = self.store.chat_for_thread(c["id"])
-            if current_chat is not None and linked_chat == current_chat:
+            linked = self._dest_for_thread(c["id"])
+            if current is not None and linked == current:
                 suffix = "（当前）"
-            elif linked_chat is not None:
+            elif linked is not None:
                 suffix = "（已绑）"
             else:
                 suffix = ""
@@ -2415,6 +2780,9 @@ class Bridge(LoginMixin):
         except Exception as e:
             if not _dead_chat(e):
                 raise
+            if self.topics:  # no Telegram account to invite the bot with
+                log.info("Bot cannot send to group %s: %s", chat_id, e)
+                return None
         try:
             if chat_id < -1000000000000:
                 await self.user(functions.channels.InviteToChannelRequest(
@@ -2434,7 +2802,7 @@ class Bridge(LoginMixin):
 
     async def _send_group_notice(self, chat_id: int, reply_to: int | None, text: str, buttons=None) -> None:
         sent = await self._send_group_bot_message(chat_id, text, reply_to=reply_to, buttons=buttons)
-        if sent is None and hasattr(self.user, "send_message"):
+        if sent is None and not self.topics and hasattr(self.user, "send_message"):
             try:
                 await self.user.send_message(
                     chat_id, f"⚠️ 请先把 @{self.bot_me.username} 拉进这个群，再发送 /link", reply_to=reply_to)
@@ -2466,14 +2834,17 @@ class Bridge(LoginMixin):
             except Exception:
                 chat_obj = None
         tg_title = (getattr(chat_obj, "title", None) or str(chat_id)).strip()
+        topic = _msg_topic(event.message) if self.topics else None
+        noun = "话题" if self.topics else "群"
         cands = await self._wx_search_candidates(arg, limit=10)
         if arg and " " not in arg:
             exact = next((c for c in cands if c["id"] == arg), None)
             if exact:
-                wx_title, _ = await self._complete_link(exact["id"], chat_id, exact["name"], notify_group=False)
+                wx_title, _ = await self._complete_link(exact["id"], chat_id, exact["name"], notify_group=False,
+                                                        tg_topic=topic)
                 await self._send_group_notice(
                     chat_id, msg_id,
-                    f"✅ 已将当前群绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(exact['id'])}</code>")
+                    f"✅ 已将当前{noun}绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(exact['id'])}</code>")
                 return
         if not cands:
             hint = (f"没有找到匹配「{_esc(arg)}」的微信联系人或群。" if arg
@@ -2481,14 +2852,15 @@ class Bridge(LoginMixin):
             await self._send_group_notice(chat_id, msg_id, hint)
             return
         buttons = self._wx_picker_buttons(
-            cands, action="link_bind", extra={"tg_chat": chat_id, "tg_title": tg_title, "in_group": True},
-            current_chat=chat_id)
-        header = f"<b>搜索「{_esc(arg)}」的结果</b>" if arg else "<b>选择要绑定到此群的微信会话</b>"
+            cands, action="link_bind",
+            extra={"tg_chat": chat_id, "tg_title": tg_title, "in_group": True, "tg_topic": topic},
+            current=(chat_id, topic))
+        header = f"<b>搜索「{_esc(arg)}」的结果</b>" if arg else f"<b>选择要绑定到此{noun}的微信会话</b>"
         tip = "点下方按钮即可绑定（也可发 <code>/link 关键词</code> 缩小范围）："
         await self._send_group_notice(chat_id, msg_id, f"{header}\n{tip}", buttons=buttons)
 
     async def _complete_link(self, wx_id: str, tg_chat: int, wx_name: str = "",
-                             *, notify_group: bool = False) -> tuple[str, bool]:
+                             *, notify_group: bool = False, tg_topic: int | None = None) -> tuple[str, bool]:
         title = wx_name.strip()
         if not title and self.wx_ready:
             try:
@@ -2500,7 +2872,10 @@ class Bridge(LoginMixin):
                     except WeChatError:
                         pass
         title = title or wx_id
-        self.store.link(wx_id, tg_chat, title)
+        if self.topics and tg_topic:
+            self.store.link_topic(wx_id, tg_chat, tg_topic, title)
+        else:
+            self.store.link(wx_id, tg_chat, title)
         bot_ok = True
         if notify_group:
             sent = await self._send_group_bot_message(
@@ -2541,7 +2916,7 @@ class Bridge(LoginMixin):
         tg_chat, tg_title = wait["tg_chat"], wait["tg_title"]
         buttons = self._wx_picker_buttons(
             cands, action="link_bind", extra={"tg_chat": tg_chat, "tg_title": tg_title, "in_group": False},
-            current_chat=tg_chat)
+            current=(tg_chat, None))
         await event.reply(
             f"搜索「<b>{_esc(query)}</b>」的结果（将绑定到 <b>{_esc(tg_title)}</b>）：",
             parse_mode="html", buttons=buttons)
@@ -2565,18 +2940,22 @@ class Bridge(LoginMixin):
                 await event.answer("微信还没有登录，请先 /wxlogin", alert=True)
                 return
             wx_id = payload["wx_id"]
-            existed = self.store.chat_for_thread(wx_id) is not None
+            existed = self._dest_for_thread(wx_id) is not None
             try:
                 thread = await self.wx.thread(wx_id)
             except WeChatError:
                 thread = {"id": wx_id, "kind": payload.get("kind", "direct"),
                           "displayName": payload.get("name") or wx_id}
-            await self.ensure_chat(thread)
+            noun = "话题" if self.topics else "群"
+            if await self.ensure_chat(thread) is None:
+                await self._edit_ui_msg(event, f"⚠️ 无法建立 Telegram {noun}，请查看我刚发的提示。")
+                await event.answer()
+                return
             title = self._title(thread)
-            msg = (f"ℹ️ <b>{_esc(title)}</b> 已经有对应的 Telegram 群了" if existed
-                   else f"✅ 已建立 Telegram 群：<b>{_esc(title)}</b>")
+            msg = (f"ℹ️ <b>{_esc(title)}</b> 已经有对应的 Telegram {noun}了" if existed
+                   else f"✅ 已建立 Telegram {noun}：<b>{_esc(title)}</b>")
             await self._edit_ui_msg(event, msg)
-            await event.answer("已有群" if existed else "已建群")
+            await event.answer(f"已有{noun}" if existed else f"已建{noun}")
             return
         if action == "link_pick_tg":
             if not self.wx_ready:
@@ -2587,7 +2966,7 @@ class Bridge(LoginMixin):
             cands = await self._wx_search_candidates("", limit=8)
             buttons = self._wx_picker_buttons(
                 cands, action="link_bind", extra={"tg_chat": tg_chat, "tg_title": tg_title, "in_group": False},
-                current_chat=tg_chat)
+                current=(tg_chat, None))
             prompt = (
                 f"已选 Telegram 群：<b>{_esc(tg_title)}</b>\n\n"
                 + ("请点选下方最近的微信会话，或<b>直接回复微信名称/关键词</b>搜索："
@@ -2619,9 +2998,10 @@ class Bridge(LoginMixin):
             tg_chat = payload["tg_chat"]
             tg_title = payload.get("tg_title") or str(tg_chat)
             in_group = bool(payload.get("in_group"))
-            wx_title, bot_ok = await self._complete_link(wx_id, tg_chat, wx_name, notify_group=not in_group)
+            wx_title, bot_ok = await self._complete_link(wx_id, tg_chat, wx_name, notify_group=not in_group,
+                                                         tg_topic=payload.get("tg_topic"))
             if in_group:
-                text = f"✅ 已将当前群绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>"
+                text = f"✅ 已将当前{'话题' if payload.get('tg_topic') else '群'}绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>"
             else:
                 text = f"✅ 已绑定：<b>{_esc(tg_title)}</b> ↔ <b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>"
                 if not bot_ok:
@@ -2637,29 +3017,39 @@ class Bridge(LoginMixin):
     async def on_bot_command(self, event) -> None:
         cmd, _, arg = event.raw_text.partition(" ")
         cmd, arg = cmd.split("@")[0].lower(), arg.strip()
+        noun = "话题" if self.topics else "群"
         try:
             if cmd in ("/start", "/help"):
-                await event.reply(HELP, parse_mode="html")
+                await event.reply(TOPIC_HELP if self.topics else HELP, parse_mode="html")
             elif cmd == "/status":
                 up = int(time.time() - self.started)
                 state = {"online": "在线", "disconnected": "连接断开，重连中", "signed_out": "已退出登录（发 /wxlogin）",
                          "unknown": "未登录（发 /wxlogin）"}.get(self.wx_state, self.wx_state)
+                mode = ""
+                if self.topics:
+                    forum = f"<code>{self.forum_chat}</code>" if self.forum_chat else "未设置（在群里发 /forum）"
+                    mode = f"\n模式：话题群 {forum}"
                 await event.reply(f"运行 {up // 3600}h{up % 3600 // 60}m，已转发 {self.forwarded} 条，"
-                                  f"已连接 {len(self.store.linked_chats())} 个会话。\n"
-                                  f"微信：{state}，账号 <code>{_esc(self.wx.account or '-')}</code>", parse_mode="html")
+                                  f"已连接 {len(self._link_rows())} 个会话。\n"
+                                  f"微信：{state}，账号 <code>{_esc(self.wx.account or '-')}</code>{mode}",
+                                  parse_mode="html")
             elif cmd in ("/chats", "/list"):
-                rows = self.store.list_threads()
+                rows = self._link_rows()
                 kw = arg.lower()
                 if kw:
-                    rows = [r for r in rows if kw in r[0].lower() or kw in r[2].lower() or kw in str(r[1])]
+                    rows = [r for r in rows if kw in r[0].lower() or kw in r[1].lower() or kw in r[2]]
                 if not rows:
                     return await event.reply("没有找到匹配的已连接会话" if kw else "还没有任何已连接的会话")
                 lines = [
-                    f"• {_esc(title or wx_id)} — <code>{_esc(wx_id)}</code> ↔ <code>{tg_chat}</code>"
-                    for wx_id, tg_chat, title, _ in rows[:40]
+                    f"• {_esc(title or wx_id)} — <code>{_esc(wx_id)}</code> ↔ <code>{_esc(where)}</code>"
+                    for wx_id, title, where in rows[:40]
                 ]
                 suffix = f"\n\n共 {len(rows)} 个会话（仅显示前 40 个）" if len(rows) > 40 else f"\n\n共 {len(rows)} 个会话"
                 await event.reply("\n".join(lines) + suffix, parse_mode="html")
+            elif cmd == "/link" and self.topics:
+                await event.reply(
+                    "话题模式下请在话题群里操作：打开要绑定的话题，在话题里发送 <code>/link</code> [关键词]。\n"
+                    "想为某个微信会话新建话题，直接发 <code>/open</code> [关键词]。", parse_mode="html")
             elif cmd == "/link":
                 parts = arg.split()
                 if len(parts) == 2:
@@ -2715,17 +3105,17 @@ class Bridge(LoginMixin):
                 lines = []
                 for c in cands:
                     icon = "👥" if c["kind"] == "group" else "👤"
-                    tag = "（已建群）" if self.store.chat_for_thread(c["id"]) is not None else ""
+                    tag = f"（已建{noun}）" if self._dest_for_thread(c["id"]) is not None else ""
                     lines.append(f"{icon} <b>{_esc(c['name'])}</b>{tag} — <code>{_esc(c['id'])}</code>")
                 buttons = []
                 for c in cands[:8]:
-                    has_chat = self.store.chat_for_thread(c["id"]) is not None
-                    lbl = f"{'💬 打开' if has_chat else '➕ 建群'}：{c['name'][:22]}"
+                    has_chat = self._dest_for_thread(c["id"]) is not None
+                    lbl = f"{'💬 打开' if has_chat else f'➕ 建{noun}'}：{c['name'][:22]}"
                     tok = self._make_ui_token(
                         {"action": "open_wx", "wx_id": c["id"], "name": c["name"], "kind": c["kind"]})
                     buttons.append([Button.inline(lbl, tok)])
-                header = (f"<b>搜索「{_esc(arg)}」的结果</b>（点按钮可直接建群）：\n\n" if arg
-                          else "<b>最近的微信会话</b>（点按钮可直接建群）：\n\n")
+                header = (f"<b>搜索「{_esc(arg)}」的结果</b>（点按钮可直接建{noun}）：\n\n" if arg
+                          else f"<b>最近的微信会话</b>（点按钮可直接建{noun}）：\n\n")
                 await event.reply(header + "\n".join(lines), parse_mode="html", buttons=buttons)
             elif cmd == "/open":
                 if not arg:
@@ -2735,7 +3125,7 @@ class Bridge(LoginMixin):
                                                  parse_mode="html")
                     buttons = [
                         [Button.inline(
-                            f"{'💬' if self.store.chat_for_thread(c['id']) is not None else '➕'} {c['name'][:24]}",
+                            f"{'💬' if self._dest_for_thread(c['id']) is not None else '➕'} {c['name'][:24]}",
                             self._make_ui_token(
                                 {"action": "open_wx", "wx_id": c["id"], "name": c["name"], "kind": c["kind"]})
                         )]
@@ -2770,7 +3160,7 @@ class Bridge(LoginMixin):
                     else:
                         buttons = [
                             [Button.inline(
-                                f"{'💬' if self.store.chat_for_thread(c['id']) is not None else '➕'} {c['name'][:24]}",
+                                f"{'💬' if self._dest_for_thread(c['id']) is not None else '➕'} {c['name'][:24]}",
                                 self._make_ui_token(
                                     {"action": "open_wx", "wx_id": c["id"], "name": c["name"], "kind": c["kind"]})
                             )]
@@ -2780,11 +3170,12 @@ class Bridge(LoginMixin):
                         return await event.reply(
                             f"找到多个匹配「<b>{_esc(arg)}</b>」的会话，请点选：",
                             parse_mode="html", buttons=buttons)
-                existed = self.store.chat_for_thread(thread["id"]) is not None
-                await self.ensure_chat(thread)
+                existed = self._dest_for_thread(thread["id"]) is not None
+                if await self.ensure_chat(thread) is None:
+                    return await event.reply(f"⚠️ 无法建立 Telegram {noun}，请查看我刚发的提示。")
                 await event.reply(
-                    f"这个会话已经有群了：<b>{_esc(self._title(thread))}</b>" if existed
-                    else f"已建群：<b>{_esc(self._title(thread))}</b>",
+                    f"这个会话已经有{noun}了：<b>{_esc(self._title(thread))}</b>" if existed
+                    else f"已建{noun}：<b>{_esc(self._title(thread))}</b>",
                     parse_mode="html")
         except WeChatError as e:
             await event.reply(f"出错：{e.code}")

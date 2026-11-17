@@ -2,7 +2,7 @@
 #   Docker：复制到 config/config.toml，然后 docker compose restart telegram-bridge
 #   本地运行：复制到项目根目录的 config.toml
 # 环境变量（.env）会覆盖这里的同名设置：TG_API_ID、TG_API_HASH、TG_BOT_TOKEN、TG_PROXY、
-# WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR
+# WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR、BRIDGE_MODE、TG_FORUM_CHAT
 
 [wechat]
 # agent-wechat 守护进程（wx serve）的地址。用本项目的 compose.yaml 部署时不用填
@@ -25,7 +25,13 @@
 [bridge]
 # 数据目录（数据库、Telegram 登录会话），相对于本文件。Docker 里固定为 /app/data
 # data_dir = "data"
-# Telegram 群名模板，{name} = 微信备注名/昵称/群名
+# 使用方式（环境变量 BRIDGE_MODE）：
+#   "groups" = 每个微信会话一个 Telegram 群，由你的 Telegram 账号自动建群
+#   "topics" = 一个开启了「话题」的群，每个微信会话一个话题，只用机器人（机器人需是群管理员并有「管理话题」权限）
+# mode = "groups"
+# topics 模式的话题群 ID（环境变量 TG_FORUM_CHAT，-100 开头）；0 = 在群里发 /forum 指定
+# forum_chat = 0
+# Telegram 群名（topics 模式下为话题名）模板，{name} = 微信备注名/昵称/群名
 title_direct = "{name}"
 title_group = "👥 {name}"
 # 是否桥接微信群聊
@@ -36,7 +42,7 @@ bridge_official_accounts = false
 forward_outgoing = true
 # 上面这类同步消息静音发送，不触发通知
 outgoing_silent = true
-# 建群时把微信头像设为群头像
+# 建群时把微信头像设为群头像（topics 模式下话题没有头像，此项无效）
 sync_avatar = true
 # 在 Telegram 回复后，把对应微信会话标记为已读
 mark_read_on_reply = true

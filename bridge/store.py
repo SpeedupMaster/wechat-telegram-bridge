@@ -1,4 +1,4 @@
-"""SQLite state: event cursor, WeChat thread <-> Telegram group, message id mapping."""
+"""SQLite state: event cursor, WeChat thread <-> Telegram group or forum topic, message id mapping."""
 from __future__ import annotations
 
 import sqlite3
@@ -12,6 +12,16 @@ CREATE TABLE IF NOT EXISTS threads (
     tg_chat    INTEGER NOT NULL UNIQUE,
     title      TEXT,
     created_at INTEGER NOT NULL
+);
+-- Topics mode: WeChat thread <-> topic in a forum supergroup (kept apart from `threads`, so
+-- switching modes keeps both sets of bindings). tg_topic = id of the topic's first message.
+CREATE TABLE IF NOT EXISTS topics (
+    wx_thread  TEXT PRIMARY KEY,
+    tg_chat    INTEGER NOT NULL,
+    tg_topic   INTEGER NOT NULL,
+    title      TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (tg_chat, tg_topic)
 );
 -- Message ids in Telegram basic groups are per account: the same message has one id for the bot
 -- and another for your account. side = 'bot' (ids the bot uses, e.g. for reply_to) or
@@ -83,6 +93,37 @@ class Store:
     def update_title(self, wx_thread: str, title: str) -> None:
         self.db.execute("UPDATE threads SET title=? WHERE wx_thread=?", (title, wx_thread))
 
+    # --- forum topics -----------------------------------------------------
+    def topic_for_thread(self, wx_thread: str) -> tuple[int, int] | None:
+        row = self.db.execute("SELECT tg_chat, tg_topic FROM topics WHERE wx_thread=?", (wx_thread,)).fetchone()
+        return (row[0], row[1]) if row else None
+
+    def thread_for_topic(self, tg_chat: int, tg_topic: int) -> str | None:
+        row = self.db.execute("SELECT wx_thread FROM topics WHERE tg_chat=? AND tg_topic=?",
+                              (tg_chat, tg_topic)).fetchone()
+        return row[0] if row else None
+
+    def link_topic(self, wx_thread: str, tg_chat: int, tg_topic: int, title: str) -> None:
+        self.db.execute("DELETE FROM topics WHERE wx_thread=? OR (tg_chat=? AND tg_topic=?)",
+                        (wx_thread, tg_chat, tg_topic))
+        self.db.execute("INSERT INTO topics(wx_thread,tg_chat,tg_topic,title,created_at) VALUES(?,?,?,?,?)",
+                        (wx_thread, tg_chat, tg_topic, title, int(time.time())))
+
+    def unlink_topic(self, wx_thread: str) -> None:
+        self.db.execute("DELETE FROM topics WHERE wx_thread=?", (wx_thread,))
+
+    def list_topics(self, tg_chat: int) -> list[tuple[str, int, str, int]]:
+        return list(self.db.execute(
+            "SELECT wx_thread, tg_topic, COALESCE(title, ''), created_at FROM topics WHERE tg_chat=? "
+            "ORDER BY created_at DESC", (tg_chat,)))
+
+    def update_topic_title(self, wx_thread: str, title: str) -> None:
+        self.db.execute("UPDATE topics SET title=? WHERE wx_thread=?", (title, wx_thread))
+
+    def forget_messages(self, tg_chat: int, wx_thread: str) -> None:
+        """Drop message mappings of a thread in a chat (its topic was deleted: those messages are gone)."""
+        self.db.execute("DELETE FROM msgmap WHERE tg_chat=? AND wx_thread=?", (tg_chat, wx_thread))
+
     # --- messages ---------------------------------------------------------
     @staticmethod
     def _norm_id(value: str | int | None) -> str | None:
@@ -116,20 +157,24 @@ class Store:
         return (entry[1], entry[2]) if entry else None
 
     def tg_for_wx(self, wx_thread: str, wx_msg: str | None, wx_server: str | None,
-                  side: str = "bot") -> tuple[int, int] | None:
+                  side: str = "bot", tg_chat: int | None = None) -> tuple[int, int] | None:
+        """Telegram copy of a WeChat message; `tg_chat` limits it to one chat (e.g. after switching modes)."""
+        in_chat, chat_args = ("", ()) if tg_chat is None else (" AND tg_chat=?", (tg_chat,))
         for col, val in (("wx_msg", self._norm_id(wx_msg)), ("wx_server", self._norm_id(wx_server))):
             if not val:
                 continue
             row = self.db.execute(
-                f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side=? ORDER BY tg_msg LIMIT 1",
-                (wx_thread, val, side)).fetchone()
+                f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side=?{in_chat} "
+                "ORDER BY tg_msg LIMIT 1",
+                (wx_thread, val, side, *chat_args)).fetchone()
             if row:
                 return row[0], row[1]
             # Supergroups share one message-ID space across user and bot sessions; also match legacy user-only rows.
             if side == "bot":
                 row = self.db.execute(
-                    f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side='user' AND tg_chat < -1000000000000 ORDER BY tg_msg LIMIT 1",
-                    (wx_thread, val)).fetchone()
+                    f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side='user' "
+                    f"AND tg_chat < -1000000000000{in_chat} ORDER BY tg_msg LIMIT 1",
+                    (wx_thread, val, *chat_args)).fetchone()
                 if row:
                     return row[0], row[1]
         return None

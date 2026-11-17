@@ -75,9 +75,11 @@ class LoginMixin:
     def start_pairing(self) -> None:
         self.pairing_code = secrets.token_hex(4)
         banner = "=" * 64
-        log.warning("\n%s\n  Telegram account is not logged in.\n  Open a private chat with @%s and send:\n\n"
+        why = ("The bridge has no owner yet (topics mode)." if getattr(self, "topics", False)
+               else "Telegram account is not logged in.")
+        log.warning("\n%s\n  %s\n  Open a private chat with @%s and send:\n\n"
                     "      /login %s\n\n  PAIRING CODE: %s\n%s",
-                    banner, self.bot_me.username, self.pairing_code, self.pairing_code, banner)
+                    banner, why, self.bot_me.username, self.pairing_code, self.pairing_code, banner)
 
     async def on_login_message(self, event) -> None:
         """Bot private messages while the Telegram account is not logged in yet."""
@@ -94,6 +96,9 @@ class LoginMixin:
                 await event.reply("配对码不对。请在服务器日志中查看（docker compose logs telegram-bridge）。")
                 return
             self.login_owner = sender
+            if getattr(self, "topics", False):
+                await self._pair_topics_owner(event)
+                return
             await self._ask_method(event)
             return
         if sender != self.login_owner:

@@ -1917,6 +1917,234 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+FORUM = -1009000000001
+OWNER = 4242
+
+
+class FakeForumBot(FakeBot):
+    """The bot as admin of a forum supergroup: creates/edits topics; posting into a deleted topic fails."""
+
+    def __init__(self):
+        super().__init__()
+        self.topics: dict[int, tuple[str, int]] = {}  # topic id -> (title, icon colour)
+        self.topic_edits: list[tuple[int, str]] = []
+        self.deleted_topics: set[int] = set()
+        self.next_topic = 10 ** 6  # far from Sent ids
+
+    async def get_input_entity(self, chat):
+        return types.InputPeerChannel(channel_id=abs(chat) - 10 ** 12, access_hash=0)
+
+    async def __call__(self, request):
+        if isinstance(request, functions.messages.CreateForumTopicRequest):
+            self.next_topic += 10
+            tid = self.next_topic
+            self.topics[tid] = (request.title, request.icon_color)
+            created = types.MessageService(
+                id=tid, peer_id=types.PeerChannel(9000000001),
+                action=types.MessageActionTopicCreate(title=request.title, icon_color=request.icon_color))
+            return types.Updates(updates=[types.UpdateMessageID(id=tid, random_id=1),
+                                          types.UpdateNewChannelMessage(message=created, pts=1, pts_count=1)],
+                                 users=[], chats=[], date=None, seq=0)
+        if isinstance(request, functions.messages.EditForumTopicRequest):
+            if self.topics.get(request.topic_id, ("",))[0] == request.title:
+                raise errors.BadRequestError(request=None, message="TOPIC_NOT_MODIFIED")
+            self.topic_edits.append((request.topic_id, request.title))
+            self.topics[request.topic_id] = (request.title, self.topics[request.topic_id][1])
+            return types.Updates(updates=[], users=[], chats=[], date=None, seq=0)
+        return await super().__call__(request)
+
+    async def send_message(self, chat, text, **kw):
+        if kw.get("reply_to") in self.deleted_topics:
+            raise errors.TopicDeletedError(request=None)
+        return await super().send_message(chat, text, **kw)
+
+
+def forum_event(chat_id, msg_id, text, topic=None, reply_to=None, *, is_forum=True):
+    """A message of yours in a forum group, as the bot sees it. topic=None: the General topic."""
+    if topic is None:
+        rt = SimpleNamespace(reply_to_msg_id=reply_to, reply_to_top_id=None, forum_topic=False) if reply_to else None
+    elif reply_to:
+        rt = SimpleNamespace(forum_topic=True, reply_to_msg_id=reply_to, reply_to_top_id=topic)
+    else:
+        rt = SimpleNamespace(forum_topic=True, reply_to_msg_id=topic, reply_to_top_id=None)
+    msg = SimpleNamespace(id=msg_id, message=text, action=None, via_bot_id=None, media=None, reply_to=rt)
+
+    async def get_chat():
+        return SimpleNamespace(forum=is_forum, title="WeChat")
+    return SimpleNamespace(message=msg, chat_id=chat_id, sender_id=OWNER, get_chat=get_chat)
+
+
+class TopicModeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.daemon = FakeDaemon()
+        self.b = await self.make_bridge(forum_chat=FORUM)
+
+    async def make_bridge(self, **bridge_kw):
+        cfg = Config(WeChatConfig(token="secret-token"), TelegramConfig(api_id=1, api_hash="x", bot_token="y"),
+                     BridgeConfig(mode="topics", create_interval_seconds=0, **bridge_kw),
+                     Path(self.tmp.name) / "config.toml")
+        b = Bridge(cfg)
+        await b.wx.http.aclose()
+        b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(self.daemon.handler),
+                                      headers={"Authorization": "Bearer secret-token"})
+        b.user = None  # topics mode must never touch your Telegram account
+        b.bot = FakeForumBot()
+        b.bot_me = SimpleNamespace(username="mybot", id=1)
+        b.owner_id = OWNER
+        b.wx_ready = True
+        await b.wx.resolve_account()
+        return b
+
+    async def asyncTearDown(self):
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+
+    async def event(self, mid, tid, direction="incoming"):
+        await self.b.handle_event({"cursor": "1", "kind": "message.committed",
+                                   "data": {"messageId": mid, "threadId": tid, "origin": "live",
+                                            "direction": direction}})
+
+    def topic_of(self, tid):
+        return self.b.store.topic_for_thread(tid)[1]
+
+    async def test_one_topic_per_chat_and_messages_land_in_it(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_thread("123@chatroom", "Team", kind="group")
+        self.daemon.add_message("m1", "wxid_bob", "hello")
+        self.daemon.add_message("m2", "wxid_bob", "again")
+        self.daemon.add_message("g1", "123@chatroom", "hey", sender="wxid_alice")
+        await self.event("m1", "wxid_bob")
+        await self.event("m2", "wxid_bob")
+        await self.event("g1", "123@chatroom")
+
+        bob, team = self.topic_of("wxid_bob"), self.topic_of("123@chatroom")
+        self.assertEqual(self.b.bot.topics, {bob: ("Bob", 0x6FB9F0), team: ("👥 Team", 0x8EEE98)})
+        self.assertEqual(self.b.store.chat_for_thread("wxid_bob"), None, "groups-mode bindings untouched")
+        self.assertTrue(all(s.chat == FORUM for s in self.b.bot.sent))
+        by_text = [(s.text, s.kwargs.get("reply_to")) for s in self.b.bot.sent]
+        self.assertIn("已连接微信联系人", by_text[0][0])
+        self.assertEqual(by_text[0][1], bob)
+        self.assertEqual(by_text[1:3], [("hello", bob), ("again", bob)])
+        self.assertEqual(by_text[-1], ("<b>Alice in group</b>：\nhey", team))
+        self.assertEqual(sorted(where for _, _, where in self.b._link_rows()),
+                         sorted([f"{FORUM}#{bob}", f"{FORUM}#{team}"]))
+
+    async def test_your_messages_in_a_topic_go_to_its_wechat_chat(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m1", "wxid_bob", "question", server="777")
+        await self.event("m1", "wxid_bob")
+        bob = self.topic_of("wxid_bob")
+        bridged = self.b.bot.sent[-1].id
+
+        await self.b.on_forum_message(forum_event(FORUM, 9000, "plain", topic=bob))
+        body, key = self.daemon.sends[-1]
+        self.assertEqual((body["text"], key), ("plain", f"tg-{FORUM}-9000"))
+        self.assertNotIn("quote", body, "the topic marker is not a reply")
+
+        await self.b.on_forum_message(forum_event(FORUM, 9001, "answer", topic=bob, reply_to=bridged))
+        self.assertEqual(self.daemon.sends[-1][0]["quote"], {"messageId": "m1", "serverId": "777"})
+
+        n = len(self.daemon.sends)
+        await self.b.on_forum_message(forum_event(FORUM, 9002, "in General"))
+        await self.b.on_forum_message(forum_event(FORUM, 9003, "unbound topic", topic=bob + 5))
+        await self.b.on_forum_message(forum_event(-1001234, 9004, "other group", topic=bob))
+        self.assertEqual(len(self.daemon.sends), n)
+
+        await self.b.on_forum_message(forum_event(FORUM, 9005, "/wx", topic=bob))
+        self.assertIn("wxid_bob", self.b.bot.sent[-1].text)
+        self.assertEqual(self.b.bot.sent[-1].kwargs["reply_to"], 9005)
+
+        # Echo of our own send is dropped, and WeChat quoting it maps back into the topic.
+        n_sent = len(self.b.bot.sent)
+        self.daemon.add_message("echo", "wxid_bob", "plain", direction="outgoing", server="901")
+        await self.event("echo", "wxid_bob", direction="outgoing")
+        self.assertEqual(len(self.b.bot.sent), n_sent)
+
+    async def test_deleted_topic_is_recreated_and_rename_edits_topic(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m1", "wxid_bob", "one")
+        self.daemon.add_message("m2", "wxid_bob", "two")
+        await self.event("m1", "wxid_bob")
+        old = self.topic_of("wxid_bob")
+        self.b.bot.deleted_topics.add(old)
+        await self.event("m2", "wxid_bob")
+        new = self.topic_of("wxid_bob")
+        self.assertNotEqual(new, old)
+        self.assertEqual((self.b.bot.sent[-1].text, self.b.bot.sent[-1].kwargs["reply_to"]), ("two", new))
+        self.assertIsNone(self.b.store.tg_for_wx("wxid_bob", "m1", None), "messages of the deleted topic forgotten")
+
+        self.daemon.threads["wxid_bob"]["displayName"] = "Bobby"
+        await self.b.on_forum_message(forum_event(FORUM, 9100, "/rename", topic=new))
+        self.assertEqual(self.b.bot.topic_edits, [(new, "Bobby")])
+        self.assertIn("已更新话题标题", self.b.bot.sent[-1].text)
+        await self.b.on_forum_message(forum_event(FORUM, 9101, "/rename", topic=new))
+        self.assertIn("话题标题已是最新", self.b.bot.sent[-1].text)
+
+        await self.b.on_forum_message(forum_event(FORUM, 9102, "/unlink", topic=new))
+        self.assertIsNone(self.b.store.topic_for_thread("wxid_bob"))
+
+    async def test_link_binds_a_topic_and_forum_command(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        await self.b.on_forum_message(forum_event(FORUM, 9200, "/link wxid_bob", topic=555))
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob"), (FORUM, 555))
+        self.assertIn("已将当前话题绑定", self.b.bot.sent[-1].text)
+        await self.b.on_forum_message(forum_event(FORUM, 9201, "/link", topic=None))
+        self.assertIn("请打开要绑定的话题", self.b.bot.sent[-1].text)
+
+        # /forum: refused while TG_FORUM_CHAT pins another group, and in a group without topics.
+        await self.b.on_forum_message(forum_event(-1007777, 9202, "/forum"))
+        self.assertIn("TG_FORUM_CHAT", self.b.bot.sent[-1].text)
+        self.b.cfg.bridge.forum_chat = 0
+        await self.b.on_forum_message(forum_event(-1007777, 9203, "/forum@mybot", is_forum=False))
+        self.assertIn("还没有开启「话题」", self.b.bot.sent[-1].text)
+        await self.b.on_forum_message(forum_event(-1007777, 9204, "/forum"))
+        self.assertEqual((self.b.forum_chat, self.b.store.get("forum_chat")), (-1007777, "-1007777"))
+        self.assertIsNone(self.b._dest_for_thread("wxid_bob"), "bindings of the old forum are kept but inactive")
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob"), (FORUM, 555))
+
+    async def test_no_forum_yet_tells_owner_once(self):
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.b = await self.make_bridge()
+        self.assertIsNone(self.b.forum_chat)
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("m1", "wxid_bob", "lost")
+        self.daemon.add_message("m2", "wxid_bob", "lost too")
+        await self.event("m1", "wxid_bob")
+        await self.event("m2", "wxid_bob")
+        self.assertEqual(self.b.bot.topics, {})
+        warnings = [s for s in self.b.bot.sent if s.chat == OWNER]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("/forum", warnings[0].text)
+
+    async def test_pairing_makes_owner_without_account_login(self):
+        self.b.owner_id = None
+        replies = []
+
+        async def reply(t, **kw):
+            replies.append(t)
+        self.b.start_pairing()
+        code = self.b.pairing_code
+        await self.b.on_bot_private(SimpleNamespace(raw_text=f"/login {code}", sender_id=77, chat_id=77,
+                                                    reply=reply, respond=reply))
+        self.assertTrue(self.b.tg_ready.is_set())
+        self.assertEqual((self.b.owner_id, self.b.store.get("owner")), (77, "77"))
+        self.assertIn("配对成功", replies[-1])
+        self.assertIsNone(self.b.login_step, "no Telegram account login in topics mode")
+
+    async def test_topics_bot_commands_menu(self):
+        await self.b.sync_bot_commands()
+        menus = dict(self.b.bot.commands)
+        group = [c for c, _ in menus[types.BotCommandScopeChats]]
+        self.assertIn("forum", group)
+        self.assertNotIn("avatar", group)
+        self.assertNotIn("link", [c for c, _ in menus[types.BotCommandScopeUsers]])
+
+
 class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_parsing_and_cursor_expiry(self):
         body = (": keepalive\n\n"
@@ -1949,6 +2177,14 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(cfg.data_dir.is_dir())
             with self.assertRaisesRegex(ValueError, "TG_BOT_TOKEN"):
                 load_config(Path(tmp) / "missing.toml", {k: v for k, v in env.items() if k != "TG_BOT_TOKEN"})
+            self.assertEqual((cfg.bridge.mode, cfg.bridge.forum_chat), ("groups", 0))
+            cfg = load_config(Path(tmp) / "missing.toml",
+                              {**env, "BRIDGE_MODE": "Topic", "TG_FORUM_CHAT": "-1001234567890"})
+            self.assertEqual((cfg.bridge.mode, cfg.bridge.forum_chat), ("topics", -1001234567890))
+            with self.assertRaisesRegex(ValueError, "mode"):
+                load_config(Path(tmp) / "missing.toml", {**env, "BRIDGE_MODE": "channels"})
+            with self.assertRaisesRegex(ValueError, "TG_FORUM_CHAT"):
+                load_config(Path(tmp) / "missing.toml", {**env, "TG_FORUM_CHAT": "my group"})
 
 
 class LoginDaemon:

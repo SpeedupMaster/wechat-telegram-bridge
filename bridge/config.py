@@ -31,9 +31,16 @@ class TelegramConfig:
     proxy: str = ""  # e.g. socks5://127.0.0.1:7890 or http://127.0.0.1:7890
 
 
+MODES = {"groups": "groups", "group": "groups", "topics": "topics", "topic": "topics", "forum": "topics"}
+
+
 @dataclass
 class BridgeConfig:
     data_dir: str = "data"
+    # "groups": one Telegram group per WeChat chat, created by your Telegram account (needs account login).
+    # "topics": one forum supergroup, one topic per WeChat chat, run by the bot alone.
+    mode: str = "groups"
+    forum_chat: int = 0  # topics mode: the forum supergroup id (-100...); 0 = set it with /forum in the group
     title_direct: str = "{name}"
     title_group: str = "👥 {name}"
     bridge_groups: bool = True
@@ -48,6 +55,13 @@ class BridgeConfig:
     link_card_images: bool = True
     gif_as_sticker: bool = True
     skip_threads: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        mode = MODES.get(str(self.mode).strip().lower())
+        if mode is None:
+            raise ValueError(f"[bridge] mode must be \"groups\" or \"topics\", not {self.mode!r}")
+        self.mode = mode
+        self.forum_chat = int(self.forum_chat or 0)
 
 
 @dataclass
@@ -77,7 +91,10 @@ ENV = {
     "WECHAT_TOKEN_FILE": ("wechat", "token_file"),
     "WECHAT_ACCOUNT": ("wechat", "account"),
     "BRIDGE_DATA_DIR": ("bridge", "data_dir"),
+    "BRIDGE_MODE": ("bridge", "mode"),
+    "TG_FORUM_CHAT": ("bridge", "forum_chat"),
 }
+INT_KEYS = {"api_id", "forum_chat"}
 
 
 def _section(cls, raw: dict | None):
@@ -99,7 +116,10 @@ def load_config(path: str | Path, environ: dict | None = None) -> Config:
     for var, (section, key) in ENV.items():
         value = environ.get(var, "").strip()
         if value:
-            raw.setdefault(section, {})[key] = int(value) if key == "api_id" else value
+            try:
+                raw.setdefault(section, {})[key] = int(value) if key in INT_KEYS else value
+            except ValueError:
+                raise ValueError(f"{var} must be a number, not {value!r}") from None
     cfg = Config(
         wechat=_section(WeChatConfig, raw.get("wechat")),
         telegram=_section(TelegramConfig, raw.get("telegram")),

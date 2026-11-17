@@ -89,6 +89,8 @@ services:
       TG_API_HASH: ${TG_API_HASH:?set TG_API_HASH in .env}
       TG_BOT_TOKEN: ${TG_BOT_TOKEN:?set TG_BOT_TOKEN in .env}
       TG_PROXY: ${TG_PROXY:-}
+      BRIDGE_MODE: ${BRIDGE_MODE:-}
+      TG_FORUM_CHAT: ${TG_FORUM_CHAT:-}
       WECHAT_URL: http://127.0.0.1:6174
       WECHAT_TOKEN_FILE: /token/bridge-token
     volumes:
