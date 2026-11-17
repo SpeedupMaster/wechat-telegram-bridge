@@ -146,16 +146,28 @@ sh setup.sh
 
 来电通知下方会多一个「**📞 接听**」按钮：点开是一个通话网页（Telegram Mini App），点「接听」后用手机/电脑麦克风和对方通话，可静音、挂断；群语音通话邀请会显示「**🎧 加入**」。不配置时只保留「📵 拒接」。
 
-浏览器只允许 **HTTPS** 页面使用麦克风，所以需要一个指向 VPS 的域名和反向代理：
+浏览器只允许 **HTTPS** 页面使用麦克风，所以需要一个域名，把 HTTPS 流量转到通话页面（它只监听本机 `127.0.0.1:8780`）。下面第 1、2 步二选一：**自建反向代理**，或者 **Cloudflare Tunnel**。
 
-1. **域名**：添加一条 DNS 记录，例如 `call.example.com` → VPS 公网 IP，并在防火墙放行 `80`/`443`。
-2. **反向代理**：通话页面只监听本机 `127.0.0.1:8780`。以 [Caddy](https://caddyserver.com/) 为例（自动申请证书，WebSocket 无需额外配置）：
+1. **域名**：添加一条 DNS 记录，例如 `call.example.com` → VPS 公网 IP，并在防火墙放行 `80`/`443`。（用 Cloudflare Tunnel 时跳过这一步，见下方）
+2. **反向代理**：以 [Caddy](https://caddyserver.com/) 为例（自动申请证书，WebSocket 无需额外配置）：
    ```text
    call.example.com {
        reverse_proxy 127.0.0.1:8780
    }
    ```
    nginx 需要额外转发 WebSocket（`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`），并把 `proxy_read_timeout` 调到 `3600s`。也可以用子路径，例如 `https://example.com/wxcall`（代理时保留路径前缀）。
+
+   **或者用 Cloudflare Tunnel**（域名托管在 Cloudflare 即可；VPS 不用开放任何端口、不用装证书，Compose 里已带可选的 `cloudflared` 服务）：
+   1. 打开 Cloudflare 控制台 → **Zero Trust → Networks → Tunnels → Create a tunnel**，类型选 **Cloudflared**，起个名字后复制安装命令里的 token（`eyJ...` 那一长串）。
+   2. 在该隧道的 **Public Hostname** 里添加：子域名 `call`、域名 `example.com`，Service 选 `HTTP`，URL 填 `127.0.0.1:8780`。DNS 记录会自动创建。
+   3. 在 `.env` 中设置：
+      ```bash
+      COMPOSE_PROFILES=cloudflare
+      CF_TUNNEL_TOKEN=eyJ...
+      ```
+      然后 `docker compose up -d cloudflared`，隧道状态变成 **HEALTHY** 即可。
+
+   注意：不要给这个子域名开 Cloudflare Access 登录、Bot Fight Mode 或质询页面，否则 Mini App 打不开或 WebSocket 连不上；不要用 `trycloudflare.com` 临时隧道（每次重启地址都会变）。音频经 Cloudflare 中转，延迟会比直连略高一些。
 3. **启用**：在 `.env` 中设置 `CALL_WEB_URL=https://call.example.com`，然后 `docker compose up -d --no-deps telegram-bridge`。
 4. **（推荐）注册为 Mini App**：找 [@BotFather](https://t.me/BotFather) 发 `/newapp`，选择你的机器人，Web App URL 填上面的地址，记下短名称（如 `call`），再在 `.env` 中设置 `CALL_WEB_APP=call` 并重启。这样「接听」按钮会直接在 Telegram 内以 Mini App 打开，并校验 Telegram 身份（只有桥接账号本人能接听）。不注册时按钮是普通链接，会用 Telegram 内置浏览器打开，凭链接里的一次性随机令牌鉴权。
 

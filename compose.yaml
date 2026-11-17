@@ -109,3 +109,22 @@ services:
       agent-wechat:
         condition: service_started
     restart: unless-stopped
+
+  # Optional: Cloudflare Tunnel in front of the call answering page (CALL_WEB_URL), instead of
+  # Caddy/nginx. Needs no open ports and no certificate on the VPS. Turn it on with
+  # COMPOSE_PROFILES=cloudflare and CF_TUNNEL_TOKEN in .env, and point the tunnel's public
+  # hostname at http://127.0.0.1:8780 in the Cloudflare dashboard (see README).
+  cloudflared:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-latest}
+    profiles: [cloudflare]
+    network_mode: host
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:-}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      telegram-bridge:
+        condition: service_started
+    restart: unless-stopped
