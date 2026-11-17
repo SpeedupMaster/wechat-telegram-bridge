@@ -690,8 +690,17 @@ async def _read_http_error(reader: asyncio.StreamReader, headers: dict[str, str]
     return WeChatError(status, code, retryable)
 
 
+def _ws_mask(payload: bytes, mask: bytes) -> bytes:
+    """XOR `payload` with the repeating 4-byte WebSocket `mask` (fast path for audio-rate traffic)."""
+    n = len(payload)
+    if not n:
+        return b""
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(payload, "little") ^ int.from_bytes(key, "little")).to_bytes(n, "little")
+
+
 class CallsSocket:
-    """Minimal RFC 6455 WebSocket client for /v1/accounts/{a}/calls/socket."""
+    """Minimal RFC 6455 WebSocket client for the calls control socket and a call's media socket."""
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
@@ -769,7 +778,7 @@ class CallsSocket:
             head.extend(struct.pack("!Q", n))
         mask = os.urandom(4)
         head.extend(mask)
-        masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        masked = _ws_mask(payload, mask)
         async with self._write_lock:
             self.writer.write(bytes(head) + masked)
             await self.writer.drain()
@@ -800,7 +809,7 @@ class CallsSocket:
             mask = await asyncio.wait_for(self.reader.readexactly(4), timeout=read_timeout) if masked else b""
             payload = await asyncio.wait_for(self.reader.readexactly(length), timeout=read_timeout) if length else b""
             if masked and payload:
-                payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+                payload = _ws_mask(payload, mask)
 
             if opcode == 0x8:  # Close
                 if not self._closing:
@@ -844,6 +853,30 @@ class CallsSocket:
             raise WeChatError(status, code, False)
         if msg.get("type") != "hello":
             raise WeChatError(502, "unexpected_hello", True)
+        self._reader_task = asyncio.create_task(self._read_loop())
+        return msg
+
+    async def attach_media(self, client_id: str, owner_token: str, timeout: float = 10.0) -> dict:
+        """Media socket handshake: media.attach -> media.ready (the send and receive tracks)."""
+        await self.send_json({
+            "type": "media.attach",
+            "supportedProtocolVersions": [2],
+            "clientId": client_id,
+            "ownerToken": owner_token,
+        })
+        while True:
+            raw = await self._recv_text(read_timeout=timeout)
+            if raw is None:
+                raise WeChatError(503, "closed", True)
+            msg = json.loads(raw)
+            mtype = msg.get("type")
+            if mtype in ("protocol.error", "call.error"):
+                code = msg.get("code") or "call_error"
+                raise WeChatError(403 if code in ("forbidden", "not_owner") else 400, code, False)
+            if mtype == "media.ready":
+                break
+        if msg.get("protocolVersion") != 2:
+            raise WeChatError(400, "unsupported_protocol_version", False)
         self._reader_task = asyncio.create_task(self._read_loop())
         return msg
 
@@ -926,4 +959,16 @@ async def _open_calls_socket(self: WeChatClient, timeout: float = 10.0) -> tuple
         raise
 
 
+async def _open_call_media(self: WeChatClient, call_id: str, client_id: str, owner_token: str,
+                           timeout: float = 10.0) -> tuple[CallsSocket, dict]:
+    sock = await CallsSocket.connect(self.base + self._a(f"calls/{_id(call_id)}/media"), self._token, timeout=timeout)
+    try:
+        ready = await sock.attach_media(client_id, owner_token, timeout=timeout)
+        return sock, ready
+    except Exception:
+        await sock.close()
+        raise
+
+
 WeChatClient.calls_socket = _open_calls_socket  # type: ignore[attr-defined]
+WeChatClient.call_media = _open_call_media  # type: ignore[attr-defined]

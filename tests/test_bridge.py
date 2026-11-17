@@ -4034,3 +4034,439 @@ class LinkCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("buttons", s3.kwargs)
 
 
+class _FakeMediaSocket:
+    """Stands in for the agent-wechat media socket of one call."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+
+    async def send_json(self, obj: dict) -> None:
+        self.sent.append(obj)
+
+    async def events(self):
+        while True:
+            item = await self.queue.get()
+            if item is None:
+                return
+            yield item
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.queue.put_nowait(None)
+
+
+def _init_data(bot_token: str, user_id: int, auth_date: int | None = None) -> str:
+    import hashlib
+    import hmac
+    import time
+    from urllib.parse import urlencode
+    fields = {"auth_date": str(auth_date or int(time.time())), "query_id": "AAE",
+              "user": json.dumps({"id": user_id, "first_name": "Me"}, separators=(",", ":"))}
+    check = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+def _button_urls(sent) -> list[str]:
+    urls = [getattr(getattr(b, "type", None), "url", None) or getattr(b, "url", None)
+            for row in (sent.kwargs.get("buttons") or []) for b in row]
+    return [u for u in urls if u]
+
+
+def _button_texts(sent) -> list[str]:
+    return [b.text for row in (sent.kwargs.get("buttons") or []) for b in row]
+
+
+class CallWebTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import aiohttp
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cfg = Config(WeChatConfig(token="secret-token"), TelegramConfig(api_id=1, api_hash="x", bot_token="123:abc"),
+                     BridgeConfig(create_interval_seconds=0, sync_avatar=False,
+                                  call_web_url="http://127.0.0.1/wxcall", call_web_listen="127.0.0.1:0"),
+                     Path(self.tmp.name) / "config.toml")
+        self.daemon = FakeDaemon()
+        self.b = Bridge(cfg)
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(self.daemon.handler),
+                                           headers={"Authorization": "Bearer secret-token"})
+        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.bot_input = object()
+        self.b.bot_me = SimpleNamespace(username="mybot")
+        self.b.tg_ready.set()
+        self.b.owner_id = 999
+        await self.b.wx.resolve_account()
+        self.sock = _FakeCallsSocket()
+        self.b._calls_sock = self.sock
+        self.media = _FakeMediaSocket()
+        self.media_calls: list[tuple[str, str, str]] = []
+
+        async def call_media(call_id, client_id, owner_token, timeout=10.0):
+            self.media_calls.append((call_id, client_id, owner_token))
+            return self.media, {"type": "media.ready", "protocolVersion": 2,
+                                "sendTrack": {"id": 1, "generation": 1, "direction": "send",
+                                              "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}},
+                                "receiveTracks": [{"id": 2, "generation": 1, "direction": "receive",
+                                                   "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}]}
+
+        self.b.wx.call_media = call_media
+        await self.b.call_web.start()
+        self.http = aiohttp.ClientSession()
+        self.base = f"http://127.0.0.1:{self.b.call_web.bound_port}/wxcall"
+        await self.b.handle_call_event({
+            "type": "hello", "protocolVersion": 2, "clientId": "ctl-1", "conferenceInvitations": [],
+            "capabilities": {"directAudio": True, "conferenceJoin": True, "conferenceAudio": True},
+            "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
+        })
+
+    async def asyncTearDown(self):
+        await self.http.close()
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+
+    async def _page(self, token: str, init_data: str = ""):
+        ws = await self.http.ws_connect(self.base + "/ws")
+        await ws.send_json({"type": "auth", "token": token, "initData": init_data})
+        return ws
+
+    async def _next(self, ws, mtype: str = "state", pred=lambda m: True, timeout: float = 2.0) -> dict:
+        import aiohttp
+        while True:
+            msg = await asyncio.wait_for(ws.receive(), timeout=timeout)
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    raise AssertionError("page socket closed")
+                continue
+            m = json.loads(msg.data)
+            if m.get("type") == mtype and pred(m):
+                return m
+
+    async def _until(self, cond, timeout: float = 2.0):
+        for _ in range(int(timeout / 0.01)):
+            if cond():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("condition not met")
+
+    def test_verify_init_data(self):
+        from bridge.callweb import verify_init_data
+        good = _init_data("123:abc", 999)
+        self.assertEqual(verify_init_data(good, "123:abc"), 999)
+        self.assertIsNone(verify_init_data(good, "123:other"))
+        self.assertIsNone(verify_init_data(good.replace("999", "998"), "123:abc"))
+        self.assertIsNone(verify_init_data(_init_data("123:abc", 999, auth_date=1000), "123:abc"))
+        self.assertIsNone(verify_init_data("", "123:abc"))
+        self.assertIsNone(verify_init_data("hash=abc&hash=def", "123:abc"))
+
+    async def test_page_served_under_prefix(self):
+        async with self.http.get(self.base + "/call/sometoken") as r:
+            self.assertEqual(r.status, 200)
+            body = await r.text()
+            self.assertEqual(r.headers.get("Referrer-Policy"), "no-referrer")
+        self.assertIn("registerProcessor('bridge-io'", body)
+        self.assertIn('"base": "/wxcall"', body)
+        self.assertNotIn("__CFG__", body)
+        self.assertNotIn("__WORKLET__", body)
+
+    async def test_answer_pending_call_relay_audio_mute_and_hangup(self):
+        import aiohttp
+        import base64
+        import struct
+        self.daemon.add_thread("wxid_alice", "Alice")
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.ready" and cmd.get("ready"):
+                async def offered():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.offered", "offer": {
+                        "callId": "call-1", "revision": 3, "kind": "direct", "callType": "voice",
+                        "callerId": "wxid_alice"}})
+                asyncio.create_task(offered())
+            if cmd["type"] == "call.answer":
+                async def connected():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "call-1", "revision": 4, "kind": "direct", "callType": "voice",
+                        "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+                asyncio.create_task(connected())
+                return {"type": "command.result", "status": "accepted", "callId": "call-1", "ownerToken": "own-1"}
+            return None
+
+        self.sock.on_command = on_cmd
+        await self.b.handle_call_event({"type": "call.pending", "offer": {
+            "callId": "call-1", "revision": 1, "kind": "direct", "callType": "voice",
+            "callerId": "wxid_alice", "phase": "waiting_for_ready"}})
+        msg = self.b.bot.sent[-1]
+        self.assertEqual(_button_texts(msg), ["📞 接听", "📵 拒接"])
+        url = _button_urls(msg)[0]
+        self.assertTrue(url.startswith("http://127.0.0.1/wxcall/call/"))
+        token = url.rsplit("/", 1)[1]
+
+        # A Mini App opened by somebody else is refused even with the right link
+        intruder = await self._page(token, _init_data("123:abc", 111))
+        fatal = await self._next(intruder, "fatal")
+        self.assertIn("本人", fatal["message"])
+        await intruder.close()
+
+        ws = await self._page(token, _init_data("123:abc", 999))
+        st = await self._next(ws)
+        self.assertEqual((st["phase"], st["name"], st["answerable"]), ("ringing", "Alice", True))
+
+        await ws.send_json({"type": "answer"})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "active")
+        self.assertTrue(st["mine"])
+        self.assertEqual(st["rate"], 16000)
+        self.assertEqual([c["type"] for c in self.sock.commands[:2]], ["call.ready", "call.answer"])
+        self.assertEqual(self.sock.commands[0]["scope"], {"kind": "offer", "callId": "call-1", "expectedRevision": 1})
+        self.assertEqual(self.sock.commands[1]["expectedRevision"], 3)
+        self.assertEqual(self.media_calls, [("call-1", "ctl-1", "own-1")])
+        self.assertEqual(self.media.sent[0], {"type": "audio.start", "trackId": 1, "generation": 1})
+        self.assertIn("通话中（Telegram 接听）", msg.text)
+        self.assertEqual(_button_texts(msg), ["🎧 通话界面", "📴 挂断"])
+
+        # page -> WeChat
+        pcm = struct.pack("<4h", 1, -1, 32767, -32768)
+        await ws.send_bytes(pcm)
+        await self._until(lambda: any(m["type"] == "audio.chunk" for m in self.media.sent))
+        chunk = next(m for m in self.media.sent if m["type"] == "audio.chunk")
+        self.assertEqual((chunk["trackId"], chunk["generation"]), (1, 1))
+        self.assertEqual(base64.b64decode(chunk["pcmBase64"]), pcm)
+
+        # WeChat -> page: track id header + PCM
+        self.media.queue.put_nowait({"type": "audio.chunk", "trackId": 2, "generation": 1, "sequence": 1,
+                                     "sampleOffset": 0, "pcmBase64": base64.b64encode(b"\x01\x00\x02\x00").decode()})
+        got = None
+        while got is None:
+            m = await asyncio.wait_for(ws.receive(), timeout=2)
+            if m.type == aiohttp.WSMsgType.BINARY:
+                got = m.data
+        self.assertEqual(got, struct.pack("<I", 2) + b"\x01\x00\x02\x00")
+
+        # mute -> call.mute; the daemon then moves the send track to a new generation
+        await ws.send_json({"type": "mute", "muted": True})
+        st = await self._next(ws, pred=lambda m: m.get("muted"))
+        self.assertEqual(self.sock.commands[-1], {"type": "call.mute", "callId": "call-1", "muted": True})
+        await self.b.handle_call_event({"type": "track.updated", "callId": "call-1", "track": {
+            "id": 1, "generation": 2, "direction": "send",
+            "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}})
+        self.assertEqual(self.media.sent[-1], {"type": "audio.start", "trackId": 1, "generation": 2})
+        n_chunks = sum(m["type"] == "audio.chunk" for m in self.media.sent)
+        await ws.send_bytes(pcm)  # muted: dropped
+        await asyncio.sleep(0.05)
+        self.assertEqual(sum(m["type"] == "audio.chunk" for m in self.media.sent), n_chunks)
+
+        # hang up from the page
+        await ws.send_json({"type": "hangup"})
+        await self._until(lambda: self.sock.commands[-1]["type"] == "call.hangup")
+        self.assertEqual(self.sock.commands[-1]["expectedRevision"], 4)
+        await self._until(lambda: "已在 Telegram 挂断" in msg.text)
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "call-1", "revision": 6, "kind": "direct", "callType": "voice",
+            "direction": "incoming", "state": "ended", "ownedByThisClient": True}})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "ended")
+        self.assertIn("已在 Telegram 挂断", msg.text)
+        self.assertIsNone(msg.kwargs["buttons"])
+        self.assertTrue(self.media.closed)
+        # readiness advertised for the pending offer is withdrawn once the call is over
+        self.assertEqual(self.sock.commands[-1]["type"], "call.ready")
+        self.assertFalse(self.sock.commands[-1]["ready"])
+        self.assertFalse(self.b.call_web.has_session("call-1"))
+        await ws.close()
+
+    async def test_unknown_token_video_call_and_answered_elsewhere(self):
+        ws = await self._page("nope-not-a-token")
+        fatal = await self._next(ws, "fatal")
+        self.assertIn("失效", fatal["message"])
+        await ws.close()
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "vid-1", "revision": 2, "kind": "direct", "callType": "video", "callerId": "wxid_bob"}})
+        self.assertEqual(_button_texts(self.b.bot.sent[-1]), ["📵 拒接"])  # video cannot be answered
+
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "v-2", "revision": 2, "kind": "direct", "callType": "voice", "callerId": "wxid_bob"}})
+        msg = self.b.bot.sent[-1]
+        token = _button_urls(msg)[0].rsplit("/", 1)[1]
+        ws = await self._page(token)  # plain browser: the link alone authorises
+        self.assertEqual((await self._next(ws))["phase"], "ringing")
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "v-2", "revision": 3, "kind": "direct", "callType": "voice",
+            "direction": "incoming", "state": "connected", "ownedByThisClient": False}})
+        st = await self._next(ws, pred=lambda m: m["phase"] != "ringing")
+        self.assertEqual(st["phase"], "elsewhere")
+        await ws.send_json({"type": "answer"})
+        err = await self._next(ws, "error")
+        self.assertIn("已在其他设备处理", err["message"])
+        self.assertEqual(self.sock.commands, [])
+        await ws.close()
+
+    async def test_reject_from_page(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "r-1", "revision": 2, "kind": "direct", "callType": "voice", "callerId": "wxid_bob"}})
+        msg = self.b.bot.sent[-1]
+        ws = await self._page(_button_urls(msg)[0].rsplit("/", 1)[1])
+        await self._next(ws)
+        await ws.send_json({"type": "reject"})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "ended")
+        self.assertIn("已在 Telegram 拒接", st["status"])
+        self.assertEqual([c["type"] for c in self.sock.commands], ["call.reject"])
+        self.assertIn("已在 Telegram 拒接", msg.text)
+        await ws.close()
+
+    async def test_join_group_call_and_auto_hangup_when_page_closes(self):
+        import bridge.callweb as callweb
+        self.daemon.add_thread("123@chatroom", "Team", kind="group")
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.join":
+                # The daemon reports the new call before the command result reaches us
+                await self.b.handle_call_event({"type": "call.state", "call": {
+                    "callId": "conf-1", "revision": 2, "kind": "conference", "callType": "voice",
+                    "direction": "outgoing", "state": "connected", "ownedByThisClient": True,
+                    "groupId": "123@chatroom", "participants": []}})
+                return {"type": "command.result", "status": "accepted", "callId": "conf-1", "ownerToken": "own-c"}
+            return None
+
+        self.sock.on_command = on_cmd
+        await self.b.handle_call_event({"type": "conference.invitations", "invitations": [
+            {"invitationId": "inv-1", "revision": 4, "groupId": "123@chatroom", "callerId": "wxid_a"}]})
+        msg = self.b.bot.sent[-1]
+        self.assertEqual(_button_texts(msg), ["🎧 加入"])
+        token = _button_urls(msg)[0].rsplit("/", 1)[1]
+
+        ws = await self._page(token)
+        st = await self._next(ws)
+        self.assertEqual((st["phase"], st["joinable"], st["name"]), ("invite", True, "Team"))
+        await ws.send_json({"type": "join"})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "active")
+        self.assertTrue(st["mine"])
+        self.assertEqual([c["type"] for c in self.sock.commands[:2]], ["call.ready", "call.join"])
+        self.assertEqual(self.sock.commands[0]["scope"], {"kind": "outgoing"})
+        self.assertEqual(self.sock.commands[1]["invitationRevision"], 4)
+        self.assertEqual(self.media_calls, [("conf-1", "ctl-1", "own-c")])
+        self.assertIn("微信群语音通话", msg.text)
+        self.assertIn("通话中（Telegram 接听）", msg.text)
+        self.assertEqual(_button_texts(msg), ["🎧 通话界面", "📴 挂断"])
+
+        # The invitation disappears once joined: the message keeps showing the call
+        await self.b.handle_call_event({"type": "conference.invitations", "invitations": []})
+        self.assertIn("通话中", msg.text)
+
+        # Closing the page hangs up after the grace period
+        callweb.DETACH_GRACE_SECONDS, saved = 0.05, callweb.DETACH_GRACE_SECONDS
+        try:
+            await ws.close()
+            await self._until(lambda: self.sock.commands[-1]["type"] == "call.hangup")
+        finally:
+            callweb.DETACH_GRACE_SECONDS = saved
+        self.assertEqual(self.sock.commands[-1]["callId"], "conf-1")
+        await self._until(lambda: "自动挂断" in msg.text)
+
+    async def test_reconnecting_page_takes_over_within_grace(self):
+        import bridge.callweb as callweb
+        self.daemon.add_thread("wxid_alice", "Alice")
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.answer":
+                return {"type": "command.result", "status": "accepted", "callId": "c-9", "ownerToken": "own-9"}
+            return None
+
+        self.sock.on_command = on_cmd
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "c-9", "revision": 2, "kind": "direct", "callType": "voice", "callerId": "wxid_alice"}})
+        token = _button_urls(self.b.bot.sent[-1])[0].rsplit("/", 1)[1]
+        ws = await self._page(token)
+        await self._next(ws)
+        await ws.send_json({"type": "answer"})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "connecting")
+        self.assertTrue(st["mine"])
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "c-9", "revision": 3, "kind": "direct", "callType": "voice",
+            "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+        await self._next(ws, pred=lambda m: m["phase"] == "active")
+
+        callweb.DETACH_GRACE_SECONDS, saved = 0.3, callweb.DETACH_GRACE_SECONDS
+        try:
+            await ws.close()
+            ws2 = await self._page(token)
+            st = await self._next(ws2)
+            self.assertEqual((st["phase"], st["mine"]), ("active", False))
+            await ws2.send_json({"type": "attach"})
+            st = await self._next(ws2, pred=lambda m: m["mine"])
+            await asyncio.sleep(0.4)
+        finally:
+            callweb.DETACH_GRACE_SECONDS = saved
+        self.assertNotIn("call.hangup", [c["type"] for c in self.sock.commands])
+        self.assertTrue(self.b.call_web.has_session("c-9"))
+        await ws2.close()
+
+
+class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_call_media_attach_and_audio_roundtrip(self):
+        import base64
+        from aiohttp import WSMsgType, web
+        from bridge.wechat import WeChatError
+        seen: list[dict] = []
+        auth: list[str] = []
+
+        async def media(request):
+            auth.append(request.headers.get("Authorization", ""))
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            attach = await ws.receive_json()
+            seen.append(attach)
+            if attach.get("ownerToken") != "own-1":
+                await ws.send_json({"type": "call.error", "code": "not_owner"})
+                await ws.close()
+                return ws
+            await ws.send_json({"type": "media.ready", "protocolVersion": 2,
+                                "sendTrack": {"id": 1, "generation": 1, "direction": "send",
+                                              "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}},
+                                "receiveTracks": []})
+            async for msg in ws:
+                if msg.type != WSMsgType.TEXT:
+                    continue
+                m = json.loads(msg.data)
+                seen.append(m)
+                if m["type"] == "audio.chunk":
+                    await ws.send_json({"type": "audio.chunk", "trackId": 2, "generation": 1, "sequence": 0,
+                                        "sampleOffset": 0, "pcmBase64": m["pcmBase64"]})
+                    await ws.close()
+            return ws
+
+        app = web.Application()
+        app.router.add_get("/v1/accounts/acc1/calls/{call}/media", media)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+        wx = WeChatClient(f"http://127.0.0.1:{port}", "tok", "acc1")
+        try:
+            sock, ready = await wx.call_media("c1", "ctl-1", "own-1")
+            self.assertEqual(ready["sendTrack"]["id"], 1)
+            await sock.send_json({"type": "audio.start", "trackId": 1, "generation": 1})
+            pcm = bytes(range(256)) * 5  # > 125 bytes: exercises the 16-bit length + masking paths
+            await sock.send_json({"type": "audio.chunk", "trackId": 1, "generation": 1,
+                                  "pcmBase64": base64.b64encode(pcm).decode()})
+            events = [ev async for ev in sock.events()]
+            await sock.close()
+            self.assertEqual(auth[0], "Bearer tok")
+            self.assertEqual(seen[0], {"type": "media.attach", "supportedProtocolVersions": [2],
+                                       "clientId": "ctl-1", "ownerToken": "own-1"})
+            self.assertEqual([m["type"] for m in seen[1:]], ["audio.start", "audio.chunk"])
+            self.assertEqual(base64.b64decode(events[0]["pcmBase64"]), pcm)
+
+            with self.assertRaises(WeChatError) as cm:
+                await wx.call_media("c1", "ctl-1", "wrong")
+            self.assertEqual(cm.exception.code, "not_owner")
+        finally:
+            await wx.close()
+            await runner.cleanup()

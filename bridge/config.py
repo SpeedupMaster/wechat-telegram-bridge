@@ -52,6 +52,11 @@ class BridgeConfig:
     create_interval_seconds: float = 20.0
     max_media_mb: int = 200
     call_notifications: bool = True
+    # Answering WeChat calls in a Telegram Mini App / web page (empty URL = off):
+    # call_web_url is the public HTTPS address your reverse proxy forwards to call_web_listen.
+    call_web_url: str = ""
+    call_web_listen: str = "127.0.0.1:8780"
+    call_web_app: str = ""  # optional BotFather Mini App short name: buttons open t.me/<bot>/<app> instead
     link_card_images: bool = True
     gif_as_sticker: bool = True
     skip_threads: list[str] = field(default_factory=list)
@@ -62,6 +67,13 @@ class BridgeConfig:
             raise ValueError(f"[bridge] mode must be \"groups\" or \"topics\", not {self.mode!r}")
         self.mode = mode
         self.forum_chat = int(self.forum_chat or 0)
+        self.call_web_url = str(self.call_web_url or "").strip().rstrip("/")
+        if self.call_web_url and not self.call_web_url.lower().startswith(("https://", "http://")):
+            raise ValueError(f"[bridge] call_web_url must start with https://, not {self.call_web_url!r}")
+        self.call_web_app = str(self.call_web_app or "").strip().strip("/")
+        host, sep, port = str(self.call_web_listen or "").strip().rpartition(":")
+        if not sep or not port.isdigit() or not host:
+            raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
 
 
 @dataclass
@@ -93,6 +105,9 @@ ENV = {
     "BRIDGE_DATA_DIR": ("bridge", "data_dir"),
     "BRIDGE_MODE": ("bridge", "mode"),
     "TG_FORUM_CHAT": ("bridge", "forum_chat"),
+    "CALL_WEB_URL": ("bridge", "call_web_url"),
+    "CALL_WEB_LISTEN": ("bridge", "call_web_listen"),
+    "CALL_WEB_APP": ("bridge", "call_web_app"),
 }
 INT_KEYS = {"api_id", "forum_chat"}
 

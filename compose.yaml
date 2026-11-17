@@ -91,6 +91,11 @@ services:
       TG_PROXY: ${TG_PROXY:-}
       BRIDGE_MODE: ${BRIDGE_MODE:-}
       TG_FORUM_CHAT: ${TG_FORUM_CHAT:-}
+      # optional: answer WeChat calls in a Telegram Mini App. The page listens on CALL_WEB_LISTEN
+      # (loopback by default); put an HTTPS reverse proxy for CALL_WEB_URL in front of it (see README).
+      CALL_WEB_URL: ${CALL_WEB_URL:-}
+      CALL_WEB_LISTEN: ${CALL_WEB_LISTEN:-}
+      CALL_WEB_APP: ${CALL_WEB_APP:-}
       WECHAT_URL: http://127.0.0.1:6174
       WECHAT_TOKEN_FILE: /token/bridge-token
     volumes:

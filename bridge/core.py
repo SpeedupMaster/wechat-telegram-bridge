@@ -18,6 +18,7 @@ from telethon import Button, TelegramClient, errors, events, functions, types, u
 
 from .config import Config
 from . import cards, stickers
+from .callweb import CallActionError, CallWeb
 from .login import LoginMixin
 from .store import Store
 from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE, LOCATION, SEND_OK, STICKER,
@@ -691,6 +692,13 @@ class Bridge(LoginMixin):
         self._call_tokens: dict[str, str] = {}
         self._conf_invites: dict[str, dict] = {}
         self._calls_retry_sleep: float = 300.0
+        self._calls_client_id: str = ""
+        self._calls_caps: dict = {}
+        self._orphan_call_states: dict[str, dict] = {}
+        b = cfg.bridge
+        self.call_web: CallWeb | None = (
+            CallWeb(self, b.call_web_url, b.call_web_listen, b.call_web_app)
+            if b.call_web_url and b.call_notifications else None)
         self._ui_tokens: dict[str, dict] = {}
         self._link_wait: dict | None = None
         self._recall_notice_ttl: float = 5.0
@@ -807,6 +815,11 @@ class Bridge(LoginMixin):
         tasks = [self.event_loop(), self.wechat_monitor()]
         if self.cfg.bridge.call_notifications:
             tasks.append(self.calls_loop())
+            if self.call_web is not None:
+                try:
+                    await self.call_web.start()
+                except OSError as e:
+                    log.error("Could not start the call answering page on %s: %s", self.cfg.bridge.call_web_listen, e)
         await asyncio.gather(*tasks)
 
     async def on_bot_private(self, event) -> None:
@@ -832,6 +845,9 @@ class Bridge(LoginMixin):
         if data.startswith(b"callrej:"):
             await self._on_call_reject_callback(event, data[8:].decode("utf-8", errors="ignore"))
             return
+        if data.startswith(b"callhup:"):
+            await self._on_call_hangup_callback(event, data[8:].decode("utf-8", errors="ignore"))
+            return
         if data.startswith(b"ui:"):
             await self._on_ui_callback(event, data[3:].decode("utf-8", errors="ignore"))
             return
@@ -845,6 +861,8 @@ class Bridge(LoginMixin):
             task.cancel()
         if self._notice_tasks:
             await asyncio.gather(*list(self._notice_tasks), return_exceptions=True)
+        if self.call_web is not None:
+            await self.call_web.stop()
         if self._calls_sock is not None:
             await self._calls_sock.close()
             self._calls_sock = None
@@ -1770,6 +1788,8 @@ class Bridge(LoginMixin):
         if etype == "hello":
             if fmt := event.get("audioFormat"):
                 self._calls_audio_format = fmt
+            self._calls_client_id = event.get("clientId") or ""
+            self._calls_caps = event.get("capabilities") or {}
             live_ids = {
                 x.get("callId")
                 for x in (event.get("currentOffer"), event.get("currentPendingOffer"), event.get("currentCall"))
@@ -1779,8 +1799,9 @@ class Bridge(LoginMixin):
                 if not entry["terminal"] and cid not in live_ids:
                     entry["terminal"] = True
                     entry["stage"] = "ended"
-                    if not entry["rejected_by_tg"]:
-                        entry["status_text"] = "⚪ 来电已结束或状态已重置"
+                    if not self._call_status_final(entry):
+                        entry["status_text"] = ("⚪ 通话已结束" if entry["was_connected"]
+                                                else "⚪ 来电已结束或状态已重置")
                     entry["offered_event"].set()
                     await self._sync_call_msg(entry)
             if offer := event.get("currentOffer"):
@@ -1798,7 +1819,7 @@ class Bridge(LoginMixin):
                     if not entry["terminal"] and entry["stage"] == "pending":
                         entry["terminal"] = True
                         entry["stage"] = "ended"
-                        if not entry["rejected_by_tg"]:
+                        if not self._call_status_final(entry):
                             entry["status_text"] = "⚪ 来电已取消或已在其他设备处理"
                         entry["offered_event"].set()
                         await self._sync_call_msg(entry)
@@ -1810,6 +1831,9 @@ class Bridge(LoginMixin):
                 await self._on_call_state(call)
         elif etype == "conference.invitations":
             await self._on_conf_invitations(event.get("invitations") or [])
+        elif etype == "track.updated":
+            if self.call_web is not None:
+                await self.call_web.on_track_updated(event)
         elif etype == "call.error":
             log.warning("WeChat call error event: %s", event.get("code"))
 
@@ -1852,25 +1876,52 @@ class Bridge(LoginMixin):
         return None
 
     @staticmethod
-    def _render_call(entry: dict) -> tuple[str, list | None]:
-        title = "📹 <b>微信视频来电</b>" if entry["call_type"] == "video" else "📞 <b>微信语音来电</b>"
+    def _call_status_final(entry: dict) -> bool:
+        """The call ended by our own action: keep that status instead of a generic "ended"."""
+        return bool(entry.get("rejected_by_tg") or entry.get("hungup_by_tg"))
+
+    def _render_call(self, entry: dict) -> tuple[str, list | None]:
+        if entry["kind"] == "conference":
+            title, who = "📞 <b>微信群语音通话</b>", "发起人"
+        elif entry["call_type"] == "video":
+            title, who = "📹 <b>微信视频来电</b>", "来电人"
+        else:
+            title, who = "📞 <b>微信语音来电</b>", "来电人"
         text = (
             f"{title}\n"
-            f"来电人：<b>{_esc(entry['caller_name'])}</b>\n"
+            f"{who}：<b>{_esc(entry['caller_name'])}</b>\n"
             f"状态：{entry['status_text']}"
         )
-        buttons = (
-            [[Button.inline("📵 拒接", f"callrej:{entry['token']}".encode())]]
-            if not entry["terminal"] and entry["stage"] in ("pending", "offered")
-            else None
-        )
-        return text, buttons
+        rows: list[list] = []
+        web = self.call_web
+        if not entry["terminal"]:
+            if entry["stage"] in ("pending", "offered"):
+                row = []
+                if web is not None and web.can_answer(entry):
+                    row.append(Button.url("📞 接听", web.link(web.token_for_call(entry))))
+                row.append(Button.inline("📵 拒接", f"callrej:{entry['token']}".encode()))
+                rows.append(row)
+            elif web is not None and entry.get("answered_by_tg") and web.has_session(entry["call_id"]):
+                rows.append([
+                    Button.url("🎧 通话界面", web.link(web.token_for_call(entry))),
+                    Button.inline("📴 挂断", f"callhup:{entry['token']}".encode()),
+                ])
+        return text, rows or None
+
+    @staticmethod
+    def _render_key(text: str, buttons: list | None) -> tuple:
+        return text, tuple(getattr(b, "text", "") for row in (buttons or []) for b in row)
 
     async def _sync_call_msg(self, entry: dict) -> None:
+        if self.call_web is not None:
+            try:
+                await self.call_web.on_entry_changed(entry)
+            except Exception:
+                log.exception("Could not update the call page for %s", entry.get("call_id"))
         if not entry.get("chat_id") or not entry.get("msg_id"):
             return
         text, buttons = self._render_call(entry)
-        render_key = (text, bool(buttons))
+        render_key = self._render_key(text, buttons)
         if entry.get("_last_render") == render_key:
             return
         try:
@@ -1886,11 +1937,46 @@ class Bridge(LoginMixin):
         if len(self._active_calls) <= 200:
             return
         for cid, entry in list(self._active_calls.items()):
-            if entry["terminal"]:
+            if entry["terminal"] and not (self.call_web and self.call_web.has_session(cid)):
                 self._active_calls.pop(cid, None)
                 self._call_tokens.pop(entry["token"], None)
             if len(self._active_calls) <= 150:
                 break
+
+    def _new_call_entry(self, call_id: str, *, kind: str, call_type: str, caller_id: str, caller_name: str,
+                        thread_id: str, stage: str, revision: int, phase: str | None = None) -> dict:
+        self._prune_calls()
+        token = secrets.token_hex(6)
+        entry = {
+            "call_id": call_id,
+            "token": token,
+            "kind": kind,
+            "call_type": call_type,
+            "caller_id": caller_id,
+            "caller_name": caller_name,
+            "thread_id": thread_id,
+            "stage": stage,
+            "phase": phase,
+            "revision": revision,
+            "chat_id": None,
+            "msg_id": None,
+            "terminal": False,
+            "rejected_by_tg": False,
+            "rejecting": False,
+            "answering": False,
+            "answered_by_tg": False,
+            "hungup_by_tg": False,
+            "was_connected": False,
+            "connected_at": None,
+            "offered_event": asyncio.Event(),
+            "status_text": "🔔 响铃中…",
+            "_last_render": None,
+        }
+        if stage == "offered":
+            entry["offered_event"].set()
+        self._active_calls[call_id] = entry
+        self._call_tokens[token] = call_id
+        return entry
 
     async def _on_call_offer(self, offer: dict, *, stage: str) -> None:
         call_id = offer.get("callId")
@@ -1916,42 +2002,24 @@ class Bridge(LoginMixin):
         if thread is None:
             return
 
-        self._prune_calls()
-        token = secrets.token_hex(6)
-        entry = {
-            "call_id": call_id,
-            "token": token,
-            "kind": kind,
-            "call_type": offer.get("callType") or "voice",
-            "caller_id": caller_id,
-            "caller_name": caller_name,
-            "thread_id": thread["id"],
-            "stage": stage,
-            "phase": offer.get("phase"),
-            "revision": offer.get("revision", 0),
-            "chat_id": None,
-            "msg_id": None,
-            "terminal": False,
-            "rejected_by_tg": False,
-            "rejecting": False,
-            "was_connected": False,
-            "offered_event": asyncio.Event(),
-            "status_text": "🔔 响铃中…",
-            "_last_render": None,
-        }
-        if stage == "offered":
-            entry["offered_event"].set()
-        self._active_calls[call_id] = entry
-        self._call_tokens[token] = call_id
-
+        entry = self._new_call_entry(
+            call_id, kind=kind, call_type=offer.get("callType") or "voice", caller_id=caller_id,
+            caller_name=caller_name, thread_id=thread["id"], stage=stage, revision=offer.get("revision", 0),
+            phase=offer.get("phase"),
+        )
         text, buttons = self._render_call(entry)
         res = await self._send_call_tg_msg(thread, text, buttons=buttons)
         if not res:
             return
         entry["chat_id"], entry["msg_id"] = res
-        entry["_last_render"] = (text, bool(buttons))
+        entry["_last_render"] = self._render_key(text, buttons)
         # In case call state updated while ensure_chat was creating the group:
         await self._sync_call_msg(entry)
+
+    async def _replay_orphan_call_state(self, call_id: str) -> None:
+        """A call we just claimed may have reported its state before we knew about it."""
+        if call := self._orphan_call_states.pop(call_id, None):
+            await self._on_call_state(call)
 
     async def _on_call_state(self, call: dict) -> None:
         call_id = call.get("callId")
@@ -1961,6 +2029,10 @@ class Bridge(LoginMixin):
         entry = self._active_calls.get(call_id)
         if entry is None:
             if call.get("direction") != "incoming" or state in ("ending", "ended", "uncertain"):
+                # Maybe a group call we are joining right now: keep it for _replay_orphan_call_state.
+                self._orphan_call_states[call_id] = call
+                while len(self._orphan_call_states) > 20:
+                    self._orphan_call_states.pop(next(iter(self._orphan_call_states)))
                 return
             caller_id = next(
                 (c.get("participantId") for c in (call.get("controls") or []) if c.get("participantId")), ""
@@ -1981,77 +2053,101 @@ class Bridge(LoginMixin):
                 return
 
         entry["revision"] = call.get("revision", entry["revision"])
+        if entry["terminal"]:
+            await self._sync_call_msg(entry)
+            return
+        conf = entry["kind"] == "conference"
         if state == "offered":
             entry["stage"] = "offered"
             entry["status_text"] = "🔔 响铃中…"
             entry["offered_event"].set()
         elif state in ("dialing", "ringing"):
             entry["stage"] = state
-            entry["status_text"] = "🔔 响铃中…"
+            entry["status_text"] = "🟡 正在加入…" if entry.get("answered_by_tg") else "🔔 响铃中…"
         elif state == "connecting":
             entry["stage"] = "connecting"
-            entry["status_text"] = "🟡 接通中…"
+            entry["status_text"] = "🟡 正在加入…" if conf and entry.get("answered_by_tg") else "🟡 接通中…"
             entry["offered_event"].set()
         elif state == "connected":
             entry["stage"] = "connected"
             entry["was_connected"] = True
-            entry["status_text"] = "🟢 通话中"
+            entry["connected_at"] = entry.get("connected_at") or time.time()
+            entry["status_text"] = "🟢 通话中（Telegram 接听）" if entry.get("answered_by_tg") else "🟢 通话中"
             entry["offered_event"].set()
         elif state in ("ending", "ended"):
             entry["stage"] = state
             entry["terminal"] = True
-            if not entry["rejected_by_tg"]:
+            if not self._call_status_final(entry):
                 entry["status_text"] = "⚪ 通话已结束" if entry["was_connected"] else "⚪ 来电已结束（未接听或已取消）"
             entry["offered_event"].set()
         elif state == "uncertain":
             entry["stage"] = "uncertain"
             entry["terminal"] = True
-            if not entry["rejected_by_tg"]:
-                entry["status_text"] = "⚠️ 来电状态未确认"
+            if not self._call_status_final(entry):
+                entry["status_text"] = "⚠️ 通话状态未确认"
             entry["offered_event"].set()
         await self._sync_call_msg(entry)
 
-    async def _on_conf_invitations(self, invitations: list[dict]) -> None:
-        current_ids = {inv.get("invitationId") for inv in invitations if inv.get("invitationId")}
-        for inv_id in list(self._conf_invites):
-            if inv_id not in current_ids:
-                old = self._conf_invites.pop(inv_id)
-                old["status_text"] = "⚪ 邀请已结束或已过期"
-                try:
-                    await self.bot.edit_message(old["chat_id"], old["msg_id"],
-                                                f"📞 <b>微信群语音通话邀请</b>\n"
-                                                f"发起人：<b>{_esc(old['caller_name'])}</b>\n"
-                                                f"状态：{old['status_text']}",
-                                                parse_mode="html", link_preview=False)
-                except errors.MessageNotModifiedError:
-                    pass
-                except Exception as e:
-                    log.info("Could not update conference invitation %s: %s", inv_id, e)
+    def _render_invite(self, inv: dict) -> tuple[str, list | None]:
+        text = (
+            "📞 <b>微信群语音通话邀请</b>\n"
+            f"发起人：<b>{_esc(inv['caller_name'])}</b>\n"
+            f"状态：{inv['status_text']}"
+        )
+        web = self.call_web
+        if web is not None and inv.get("live") and web.can_join():
+            return text, [[Button.url("🎧 加入", web.link(web.token_for_invite(inv)))]]
+        return text, None
 
-        for inv in invitations:
-            inv_id = inv.get("invitationId")
+    async def _on_conf_invitations(self, invitations: list[dict]) -> None:
+        current = {inv.get("invitationId"): inv for inv in invitations if inv.get("invitationId")}
+        for inv_id in list(self._conf_invites):
+            if inv_id in current:
+                continue
+            old = self._conf_invites.pop(inv_id)
+            old["live"] = False
+            if old.get("joined_call"):
+                continue  # the invitation message now shows the call we joined
+            old["status_text"] = "⚪ 邀请已结束或已过期"
+            if self.call_web is not None:
+                await self.call_web.on_invite_changed(old)
+            text, _ = self._render_invite(old)
+            try:
+                await self.bot.edit_message(old["chat_id"], old["msg_id"], text, buttons=None,
+                                            parse_mode="html", link_preview=False)
+            except errors.MessageNotModifiedError:
+                pass
+            except Exception as e:
+                log.info("Could not update conference invitation %s: %s", inv_id, e)
+
+        for inv_id, inv in current.items():
             group_id = inv.get("groupId") or ""
             caller_id = inv.get("callerId") or ""
-            if not inv_id or not group_id or inv_id in self._conf_invites:
+            if known := self._conf_invites.get(inv_id):
+                known["revision"] = inv.get("revision", known.get("revision", 0))
+                continue
+            if not group_id:
                 continue
             thread, caller_name = await self._resolve_call_target(group_id, caller_id, "conference")
             if thread is None:
                 continue
-            text = (
-                "📞 <b>微信群语音通话邀请</b>\n"
-                f"发起人：<b>{_esc(caller_name)}</b>\n"
-                "状态：🔔 邀请中…"
-            )
-            res = await self._send_call_tg_msg(thread, text)
+            entry = {
+                "invitation_id": inv_id,
+                "revision": inv.get("revision", 0),
+                "group_id": group_id,
+                "group_name": thread.get("displayName") or group_id,
+                "caller_id": caller_id,
+                "caller_name": caller_name,
+                "status_text": "🔔 邀请中…",
+                "live": True,
+                "chat_id": None,
+                "msg_id": None,
+            }
+            text, buttons = self._render_invite(entry)
+            res = await self._send_call_tg_msg(thread, text, buttons=buttons)
             if res:
-                self._conf_invites[inv_id] = {
-                    "invitation_id": inv_id,
-                    "group_id": group_id,
-                    "caller_name": caller_name,
-                    "chat_id": res[0],
-                    "msg_id": res[1],
-                    "status_text": "🔔 邀请中…",
-                }
+                entry["chat_id"], entry["msg_id"] = res
+                self._conf_invites[inv_id] = entry
 
     async def _on_call_reject_callback(self, event, token: str) -> None:
         if event.sender_id != self.owner_id:
@@ -2064,16 +2160,43 @@ class Bridge(LoginMixin):
             if entry:
                 await self._sync_call_msg(entry)
             return
-        if entry["rejecting"]:
-            await event.answer("正在拒接中…")
+        if entry["rejecting"] or entry.get("answering"):
+            await event.answer("正在处理中…")
             return
         sock = self._calls_sock
         if sock is None or sock.closed:
             await event.answer("通话信令未连接，无法拒接", alert=True)
             return
-
-        entry["rejecting"] = True
+        entry["rejecting"] = True  # before the first await: a double tap must not reject twice
         await event.answer("正在拒接…")
+        await self._reject_call(entry)
+
+    async def _on_call_hangup_callback(self, event, token: str) -> None:
+        if event.sender_id != self.owner_id:
+            await event.answer("只有桥接账号本人可以操作", alert=True)
+            return
+        call_id = self._call_tokens.get(token)
+        entry = self._active_calls.get(call_id) if call_id else None
+        if not entry or entry["terminal"] or self.call_web is None:
+            await event.answer("通话已结束")
+            if entry:
+                await self._sync_call_msg(entry)
+            return
+        await event.answer("正在挂断…")
+        try:
+            await self.call_web.hangup(entry)
+        except CallActionError as e:
+            await self._report_call_reject_failure(entry, str(e))
+
+    async def _reject_call(self, entry: dict) -> None:
+        """Reject a pending/offered incoming call; failures are reported in the call's Telegram chat."""
+        sock = self._calls_sock
+        if sock is None or sock.closed:
+            entry["rejecting"] = False
+            await self._report_call_reject_failure(entry, "通话信令未连接，无法拒接")
+            return
+        call_id = entry["call_id"]
+        entry["rejecting"] = True
         readied = False
         try:
             if entry["stage"] == "pending":
@@ -2135,14 +2258,17 @@ class Bridge(LoginMixin):
         finally:
             entry["rejecting"] = False
             if readied and not sock.closed:
-                try:
-                    await sock.command({
-                        "type": "call.ready",
-                        "ready": False,
-                        "format": self._calls_audio_format,
-                    })
-                except Exception:
-                    pass
+                if self.call_web is not None:
+                    await self.call_web.withdraw_readiness()
+                else:
+                    try:
+                        await sock.command({
+                            "type": "call.ready",
+                            "ready": False,
+                            "format": self._calls_audio_format,
+                        })
+                    except Exception:
+                        pass
 
     async def _finish_reject_error(self, entry: dict, code: str) -> None:
         reasons = {

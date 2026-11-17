@@ -52,6 +52,13 @@ create_interval_seconds = 20
 max_media_mb = 200
 # 实时转发微信语音/视频来电通知，并提供一键拒接按钮（需 agent-wechat >= 2.4.0）
 call_notifications = true
+# 在 Telegram 里接听微信语音通话（环境变量 CALL_WEB_URL / CALL_WEB_LISTEN / CALL_WEB_APP）：
+#   call_web_url    通话页面的公网 HTTPS 地址（反向代理到 call_web_listen），留空 = 关闭接听，只保留拒接
+#   call_web_listen 通话页面在本机监听的地址
+#   call_web_app    可选：@BotFather /newapp 创建的 Mini App 短名称，填了以后按钮以 Mini App 方式打开
+# call_web_url = "https://call.example.com"
+# call_web_listen = "127.0.0.1:8780"
+# call_web_app = ""
 # 将微信链接分享（小红书、公众号、网页等）渲染为微信风格卡片图并附带直达按钮
 link_card_images = true
 # 将 Telegram 发送的 GIF 动图转为微信表情包发送（需 agent-wechat >= 2.4.0，失败时自动回退为视频）
