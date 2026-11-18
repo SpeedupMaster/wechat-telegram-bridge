@@ -1076,6 +1076,129 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(s3.file)
         self.assertIn("[视频，无法获取：", s3.text)
 
+    async def test_voice_download_accepts_voice_kind_and_prefers_normal_wav(self):
+        import io
+        import wave
+        from unittest.mock import patch
+        from bridge import stickers
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 1600)
+        wav_bytes = buf.getvalue()
+        silk_bytes = b"#!SILK_V3" + b"\x00" * 32
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1001, "Bob")
+
+        # 1) Already-available normal voice asset (agent-wechat uses kind="voice", not "audio")
+        self.daemon.add_message("vo1", "wxid_bob", "[Voice]", type_=34)
+        self.daemon.media["vo1"] = [
+            {"id": "vo1-norm", "kind": "voice", "variant": "normal", "actualVariant": "normal",
+             "state": "available", "contentType": "audio/wav", "byteLength": len(wav_bytes), "filename": None},
+            {"id": "vo1-enc", "kind": "voice", "variant": "encoded", "actualVariant": None,
+             "state": "pending", "contentType": None, "advertisedByteLength": len(silk_bytes)},
+        ]
+        self.daemon.media_bytes["vo1-norm"] = (wav_bytes, "audio/wav")
+        transfers_before = len(self.daemon.media_transfers)
+        await self.event("vo1", "wxid_bob")
+        self.assertEqual(len(self.daemon.media_transfers), transfers_before)
+        s1 = self.b.bot.sent[-1]
+        self.assertIsNotNone(s1.file)
+        if stickers.find_ffmpeg():
+            self.assertEqual(s1.file.name, "voice.ogg")
+            self.assertTrue(s1.file.read().startswith(b"OggS"))
+            self.assertTrue(s1.kwargs["voice_note"])
+        else:
+            self.assertEqual(s1.file.read(), wav_bytes)
+        self.assertFalse(s1.kwargs["force_document"])
+
+        # 2) Pending normal + available encoded SILK -> still transfers normal WAV instead of picking SILK
+        self.daemon.add_message("vo2", "wxid_bob", "[Voice]", type_=34)
+        self.daemon.media["vo2"] = [
+            {"id": "vo2-norm", "kind": "voice", "variant": "normal", "actualVariant": None,
+             "state": "pending", "contentType": None, "advertisedByteLength": len(silk_bytes)},
+            {"id": "vo2-enc", "kind": "voice", "variant": "encoded", "actualVariant": "encoded",
+             "state": "available", "contentType": "audio/silk", "byteLength": len(silk_bytes)},
+        ]
+        self.daemon.media_bytes["vo2-norm"] = (wav_bytes, "audio/wav")
+        self.daemon.media_bytes["vo2-enc"] = (silk_bytes, "audio/silk")
+
+        orig_handler = self.daemon.handler
+
+        def voice_handler(request: httpx.Request) -> httpx.Response:
+            resp = orig_handler(request)
+            if request.url.path.endswith("/media-transfers") and request.method == "POST":
+                for a in self.daemon.media.get("vo2", []):
+                    if a["id"] == "vo2-norm" and a["state"] == "available":
+                        a["contentType"] = "audio/wav"
+                        a["byteLength"] = len(wav_bytes)
+            return resp
+
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(voice_handler),
+                                           headers={"Authorization": "Bearer secret-token"})
+        await self.event("vo2", "wxid_bob")
+        self.assertEqual(self.daemon.media_transfers[-1], (
+            "vo2", {"messageId": "vo2", "assetId": "vo2-norm", "quality": "normal"},
+        ))
+        s2 = self.b.bot.sent[-1]
+        self.assertIsNotNone(s2.file)
+        self.assertFalse(s2.kwargs["force_document"])
+        if stickers.find_ffmpeg():
+            self.assertEqual(s2.file.name, "voice.ogg")
+            self.assertTrue(s2.kwargs["voice_note"])
+
+        # 3) Normal transfer fails while encoded SILK is available -> report failure, never send raw SILK
+        self.daemon.add_message("vo3", "wxid_bob", "[Voice]", type_=34)
+        self.daemon.media["vo3"] = [
+            {"id": "vo3-norm", "kind": "voice", "variant": "normal", "actualVariant": None,
+             "state": "pending", "contentType": None, "advertisedByteLength": len(silk_bytes)},
+            {"id": "vo3-enc", "kind": "voice", "variant": "encoded", "actualVariant": "encoded",
+             "state": "available", "contentType": "audio/silk", "byteLength": len(silk_bytes)},
+        ]
+        self.daemon.transfer_fail_reasons["normal"] = "cdn_download_failed"
+        await self.event("vo3", "wxid_bob")
+        self.daemon.transfer_fail_reasons.clear()
+        s3 = self.b.bot.sent[-1]
+        self.assertIsNone(s3.file)
+        self.assertEqual(s3.text, "[语音，无法获取：微信 CDN 下载失败]")
+
+        # 4) Expired normal while encoded is pending -> report expired without extra transfer
+        self.daemon.add_message("vo4", "wxid_bob", "[Voice]", type_=34)
+        self.daemon.media["vo4"] = [
+            {"id": "vo4-norm", "kind": "voice", "variant": "normal", "actualVariant": None,
+             "state": "expired", "reason": "media_expired"},
+            {"id": "vo4-enc", "kind": "voice", "variant": "encoded", "actualVariant": None,
+             "state": "pending"},
+        ]
+        transfers_before = len(self.daemon.media_transfers)
+        await self.event("vo4", "wxid_bob")
+        self.assertEqual(len(self.daemon.media_transfers), transfers_before)
+        self.assertEqual(self.b.bot.sent[-1].text, "[语音，无法获取：已过期]")
+
+        # 5) If a job finishes with state="available" but no eligible asset exists, never surface "available"
+        self.daemon.add_message("vo5", "wxid_bob", "[Voice]", type_=34)
+        self.daemon.media["vo5"] = []
+        await self.event("vo5", "wxid_bob")
+        self.assertEqual(self.b.bot.sent[-1].text, "[语音，无法获取：下载失败]")
+
+        # 6) Without ffmpeg, legacy/custom kind="audio" still forwards WAV audio cleanly
+        self.daemon.add_message("vo6", "wxid_bob", "[Voice]", type_=34)
+        self.daemon.media["vo6"] = [
+            {"id": "vo6-norm", "kind": "audio", "variant": "normal", "actualVariant": "normal",
+             "state": "available", "contentType": "audio/wav", "byteLength": len(wav_bytes)},
+        ]
+        self.daemon.media_bytes["vo6-norm"] = (wav_bytes, "audio/wav")
+        with patch("bridge.stickers.find_ffmpeg", return_value=None):
+            await self.event("vo6", "wxid_bob")
+        s6 = self.b.bot.sent[-1]
+        self.assertEqual((s6.file.read(), s6.kwargs["voice_note"], s6.kwargs["force_document"]),
+                         (wav_bytes, False, False))
+
     async def test_large_video_streamed_to_temp_file_and_removed_after_forward(self):
         import os
         from unittest.mock import patch

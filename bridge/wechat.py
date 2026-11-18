@@ -652,10 +652,12 @@ class WeChatClient:
         variant_order = (
             ("original", "standard", "thumbnail") if mtype == IMAGE
             else ("normal", "original") if mtype == VIDEO
+            else ("normal",) if mtype == VOICE
             else ()
         )
         if variant_order and items:
-            # Prefer full-resolution `original` for images and actual video variants over cached thumbnails:
+            # Prefer full-resolution `original` for images, playable `normal` WAV for voice,
+            # and actual video variants over cached thumbnails:
             # `agent-wechat` may already hold a cached thumbnail/preview while the full media is `not_cached`.
             for variant in variant_order:
                 cands = [
@@ -707,14 +709,16 @@ class WeChatClient:
             if eligible_items and len(big) == len(eligible_items):
                 return "文件太大"
             if last_job:
-                return last_job.get("reason") or last_job.get("state") or "下载失败"
+                reason = last_job.get("reason") or last_job.get("state")
+                return reason if reason and reason != "available" else "下载失败"
             job = await self._req("POST", self._a(f"messages/{_id(mid)}/media-transfers"),
                                   json={"messageId": mid, "assetId": None, "quality": quality})
             job = await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 300)
             items = await assets()
             asset = _pick([a for a in items if eligible(a)], mtype)
             if not asset:
-                return job.get("reason") or job.get("state") or "下载失败"
+                reason = job.get("reason") or job.get("state")
+                return reason if reason and reason != "available" else "下载失败"
         if (asset.get("byteLength") or 0) > max_bytes:
             return "文件太大"
         mime = (asset.get("contentType") or "application/octet-stream").split(";")[0].strip().lower()
@@ -825,7 +829,13 @@ def _eligible_asset(asset: dict, mtype: int) -> bool:
         if variant == "thumbnail" or (kind is not None and kind != "video") or ct.startswith("image/"):
             return False
     elif mtype == VOICE:
-        if variant == "thumbnail" or (kind is not None and kind != "audio") or ct.startswith("image/"):
+        # agent-wechat exposes MediaKind::Voice as "voice" (with "normal" audio/wav and "encoded" audio/silk).
+        if (
+            variant in ("thumbnail", "encoded")
+            or (kind is not None and kind not in ("voice", "audio"))
+            or ct.startswith("image/")
+            or ct == "audio/silk"
+        ):
             return False
     return True
 

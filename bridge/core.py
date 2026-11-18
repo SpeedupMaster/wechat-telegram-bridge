@@ -7,7 +7,6 @@ import io
 import logging
 import re
 import secrets
-import shutil
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -72,7 +71,7 @@ TOPIC_COLOR_GROUP = 0x8EEE98
 
 async def wav_to_ogg(data: bytes) -> bytes | None:
     """Convert WeChat voice (WAV) to OGG/Opus so Telegram shows it as a voice note. Needs ffmpeg."""
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = stickers.find_ffmpeg()
     if not ffmpeg:
         return None
     proc = await asyncio.create_subprocess_exec(
