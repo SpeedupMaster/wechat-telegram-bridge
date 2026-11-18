@@ -4356,6 +4356,7 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
             "callerId": "wxid_alice", "phase": "waiting_for_ready"}})
         msg = self.b.bot.sent[-1]
         self.assertEqual(_button_texts(msg), ["📞 接听", "📵 拒接"])
+        self.assertEqual([len(row) for row in msg.kwargs["buttons"]], [1, 1])  # stacked, full width
         url = _button_urls(msg)[0]
         self.assertTrue(url.startswith("http://127.0.0.1/wxcall/call/"))
         token = url.rsplit("/", 1)[1]
@@ -4371,7 +4372,15 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((st["phase"], st["name"], st["answerable"]), ("ringing", "Alice", True))
 
         await ws.send_json({"type": "answer"})
-        st = await self._next(ws, pred=lambda m: m["phase"] == "active")
+        await ws.send_json({"type": "answer"})  # double tap: ignored without an error on the page
+        seen = []
+        while True:
+            m = json.loads((await asyncio.wait_for(ws.receive(), timeout=2)).data)
+            seen.append(m["type"])
+            if m["type"] == "state" and m["phase"] == "active":
+                st = m
+                break
+        self.assertNotIn("error", seen)
         self.assertTrue(st["mine"])
         self.assertEqual(st["rate"], 16000)
         self.assertEqual([c["type"] for c in self.sock.commands[:2]], ["call.ready", "call.answer"])
@@ -4491,7 +4500,7 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         await self.b.handle_call_event({"type": "conference.invitations", "invitations": [
             {"invitationId": "inv-1", "revision": 4, "groupId": "123@chatroom", "callerId": "wxid_a"}]})
         msg = self.b.bot.sent[-1]
-        self.assertEqual(_button_texts(msg), ["🎧 加入"])
+        self.assertEqual(_button_texts(msg), ["📞 加入"])
         token = _button_urls(msg)[0].rsplit("/", 1)[1]
 
         ws = await self._page(token)

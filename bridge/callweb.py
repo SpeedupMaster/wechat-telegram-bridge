@@ -58,6 +58,10 @@ class CallActionError(Exception):
     """A user-facing reason why answering / joining / hanging up failed."""
 
 
+class CallPending(CallActionError):
+    """The same action is already in flight (e.g. a double tap); the page just gets the current state back."""
+
+
 def verify_init_data(init_data: str, bot_token: str, *, max_age: float = INIT_DATA_MAX_AGE,
                      now: float | None = None) -> int | None:
     """Check Telegram Mini App initData (HMAC-SHA256 keyed by the bot token); return the user id or None."""
@@ -375,12 +379,12 @@ class CallWeb:
             pass
 
     async def answer(self, entry: dict, ws: web.WebSocketResponse | None) -> None:
+        if entry.get("answering") or entry.get("rejecting") or self.has_session(entry["call_id"]):
+            raise CallPending("正在处理中…")
         if entry["terminal"] or entry["stage"] not in ("pending", "offered"):
             raise CallActionError("来电已结束或已在其他设备处理")
         if not self.can_answer(entry):
             raise CallActionError("当前 agent-wechat 不支持接听该通话（仅支持单聊语音来电）")
-        if entry.get("answering") or entry.get("rejecting"):
-            raise CallActionError("正在处理中…")
         entry["answering"] = True
         readied = False
         claimed = False
@@ -440,12 +444,10 @@ class CallWeb:
         await self.bridge._sync_call_msg(entry)
 
     async def join(self, inv: dict, ws: web.WebSocketResponse | None) -> None:
-        if inv.get("joined_call"):
-            raise CallActionError("已经加入该群通话")
+        if inv.get("joining") or inv.get("joined_call"):
+            raise CallPending("正在加入中…")
         if not self.can_join():
             raise CallActionError("当前 agent-wechat 不支持加入群语音通话")
-        if inv.get("joining"):
-            raise CallActionError("正在加入中…")
         inv["joining"] = True
         readied = False
         claimed = False
@@ -700,10 +702,10 @@ class CallWeb:
             if action == "answer":
                 await self.answer(entry, ws)
             elif action == "reject":
+                if entry.get("rejecting") or entry.get("answering"):
+                    raise CallPending("正在处理中…")
                 if entry["terminal"] or entry["stage"] not in ("pending", "offered"):
                     raise CallActionError("来电已结束或已处理")
-                if entry.get("rejecting") or entry.get("answering"):
-                    raise CallActionError("正在处理中…")
                 await self.bridge._reject_call(entry)
             elif action == "attach":
                 if sess is None:
@@ -714,11 +716,19 @@ class CallWeb:
                     await _safe_send(prev, self._state(token, prev))
                 await self.push_state(entry)
             elif action == "hangup":
-                await self.hangup(entry)
+                if entry.get("hanging_up"):
+                    raise CallPending("正在挂断…")
+                entry["hanging_up"] = True
+                try:
+                    await self.hangup(entry)
+                finally:
+                    entry["hanging_up"] = False
             elif action == "mute":
                 if sess is None:
                     raise CallActionError("通话未由 Telegram 接管或已结束")
                 await self.set_mute(sess, bool(cmd.get("muted")))
+        except CallPending:
+            await _safe_send(ws, self._state(token, ws))
         except CallActionError as e:
             await _safe_send(ws, {"type": "error", "message": str(e)})
             await _safe_send(ws, self._state(token, ws))
@@ -807,106 +817,216 @@ PAGE_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex">
+<meta name="theme-color" content="#14161b">
 <title>微信通话</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{color-scheme:light dark;--bg:var(--tg-theme-bg-color,#1c1c1e);--fg:var(--tg-theme-text-color,#fff);
---hint:var(--tg-theme-hint-color,#9a9aa0);--accent:var(--tg-theme-button-color,#2ea6ff);}
-*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
-font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
-main{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
-padding:32px 20px calc(32px + env(safe-area-inset-bottom));text-align:center}
-.avatar{width:96px;height:96px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-font-size:40px;font-weight:600;background:linear-gradient(135deg,#07c160,#05a050);color:#fff;margin-bottom:8px}
-.avatar.ringing{animation:pulse 1.4s ease-in-out infinite}
-@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(7,193,96,.5)}50%{box-shadow:0 0 0 18px rgba(7,193,96,0)}}
-.title{font-size:14px;color:var(--hint)}.name{font-size:24px;font-weight:600;word-break:break-all}
-.status{font-size:15px;color:var(--hint);min-height:20px}.timer{font-size:17px;font-variant-numeric:tabular-nums;min-height:22px}
-.actions{display:flex;gap:36px;margin-top:36px;flex-wrap:wrap;justify-content:center}
-.btn{display:flex;flex-direction:column;align-items:center;gap:8px;font-size:13px;color:var(--hint);
-background:none;border:0;padding:0;cursor:pointer}
-.btn span{width:68px;height:68px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-font-size:28px;color:#fff;transition:transform .1s}
-.btn:active span{transform:scale(.92)}.btn:disabled{opacity:.5}
-.green span{background:#07c160}.red span{background:#fa5151}.gray span{background:#5a5a60}.gray.on span{background:#fff;color:#000}
-.hint{font-size:13px;color:var(--hint);max-width:320px;line-height:1.5;min-height:18px;margin-top:16px}
-.hint a{color:var(--accent)}
-.err{color:#fa5151}
+:root{color-scheme:dark;--bg:#14161b;--fg:#f4f5f7;--hint:#8d929c;--glass:rgba(255,255,255,.12);
+--green:#07c160;--red:#f2484b;--amber:#f5a524;--gray:#7b808a}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);overflow:hidden;
+font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+-webkit-user-select:none;user-select:none}
+body{background:radial-gradient(130% 70% at 50% -10%,#1f3a2b 0%,rgba(20,22,27,0) 60%),var(--bg)}
+main{height:100%;display:flex;flex-direction:column;align-items:center;text-align:center;
+padding:max(48px,env(safe-area-inset-top)) 24px calc(40px + env(safe-area-inset-bottom))}
+.info{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;width:100%;
+padding-bottom:6vh}
+.avatar{position:relative;width:112px;height:112px;border-radius:50%;display:flex;align-items:center;
+justify-content:center;font-size:46px;font-weight:600;color:#fff;margin-bottom:14px;
+background:linear-gradient(145deg,#10d673,#06a352);box-shadow:0 10px 30px rgba(7,193,96,.28)}
+.avatar svg{width:52px;height:52px}
+.avatar::before,.avatar::after{content:"";position:absolute;inset:0;border-radius:50%;border:2px solid var(--green);
+opacity:0;pointer-events:none}
+.ringing .avatar::before{animation:ring 2s ease-out infinite}
+.ringing .avatar::after{animation:ring 2s ease-out 1s infinite}
+@keyframes ring{0%{transform:scale(1);opacity:.55}100%{transform:scale(1.55);opacity:0}}
+.ended .avatar{filter:grayscale(.85);opacity:.7;box-shadow:none}
+.title{font-size:14px;color:var(--hint);letter-spacing:.5px}
+.name{font-size:28px;font-weight:600;line-height:1.25;max-width:100%;overflow-wrap:anywhere}
+.status{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;
+background:rgba(255,255,255,.07);font-size:14px;color:#c9ccd2;min-height:32px;max-width:100%}
+.status:empty{visibility:hidden}
+.dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--gray)}
+.tone-ring .dot{background:var(--amber);animation:blink 1s ease-in-out infinite}
+.tone-wait .dot{background:var(--amber);animation:blink 1.4s ease-in-out infinite}
+.tone-live .dot{background:var(--green)}
+.tone-err .dot{background:var(--red)}
+@keyframes blink{50%{opacity:.25}}
+.timer{font-size:20px;font-variant-numeric:tabular-nums;color:var(--fg);min-height:26px;letter-spacing:1px}
+.hint{font-size:13px;color:var(--hint);max-width:320px;line-height:1.55;min-height:20px}
+.hint.err{color:#ff7b7d}
+.hint a{color:#5eb5f7;text-decoration:none;font-weight:500}
+.actions{display:flex;justify-content:center;gap:clamp(40px,16vw,72px);min-height:104px;width:100%}
+.btn{display:flex;flex-direction:column;align-items:center;gap:10px;font-size:13px;color:#c9ccd2;
+background:none;border:0;padding:0;font-family:inherit;cursor:pointer;touch-action:manipulation}
+.btn .c{position:relative;width:72px;height:72px;border-radius:50%;display:flex;align-items:center;
+justify-content:center;color:#fff;transition:transform .12s ease,opacity .2s,background .2s}
+.btn svg{width:32px;height:32px}
+.btn:active:not(:disabled) .c{transform:scale(.9)}
+.btn:disabled{cursor:default}
+.btn:disabled:not(.busy) .c{opacity:.45}
+.green .c{background:var(--green);box-shadow:0 8px 22px rgba(7,193,96,.35)}
+.red .c{background:var(--red);box-shadow:0 8px 22px rgba(242,72,75,.3)}
+.glass .c{background:var(--glass);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px)}
+.glass.on .c{background:#f4f5f7;color:#14161b}
+.busy .c svg{opacity:.35}
+.busy .c::after{content:"";position:absolute;inset:-6px;border-radius:50%;border:3px solid rgba(255,255,255,.25);
+border-top-color:#fff;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
-<main>
-  <div class="avatar" id="avatar">☎</div>
-  <div class="title" id="title">微信通话</div>
-  <div class="name" id="name">正在连接…</div>
-  <div class="status" id="status"></div>
-  <div class="timer" id="timer"></div>
-  <div class="actions" id="actions"></div>
-  <div class="hint" id="hint"></div>
+<main id="main">
+  <section class="info">
+    <div class="avatar" id="avatar"></div>
+    <div class="title" id="title">微信通话</div>
+    <div class="name" id="name">正在连接…</div>
+    <div class="status" id="status"></div>
+    <div class="timer" id="timer"></div>
+    <div class="hint" id="hint"></div>
+  </section>
+  <section class="actions" id="actions"></section>
 </main>
 <script>
 (function () {
   const CFG = __CFG__;
   const WORKLET = __WORKLET__;
-  const W = window.Telegram && window.Telegram.WebApp;
-  const tg = W && W.initData ? W : null;
-  if (tg) { try { tg.ready(); tg.expand(); tg.disableVerticalSwipes && tg.disableVerticalSwipes(); } catch (e) {} }
+  const PENDING_MS = 30000;
   const $ = (id) => document.getElementById(id);
+
+  // Minimal Telegram Mini App bridge: reads the signed initData from the URL fragment and talks to the client
+  // directly, so the page does not wait for telegram-web-app.js from telegram.org before it can render.
+  const tg = (function () {
+    const hp = {};
+    try {
+      location.hash.slice(1).split('&').forEach((kv) => {
+        const i = kv.indexOf('=');
+        if (i > 0) hp[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
+      });
+    } catch (e) {}
+    let initData = hp.tgWebAppData || '';
+    try {
+      if (initData) sessionStorage.setItem('tgWebAppData', initData);
+      else initData = sessionStorage.getItem('tgWebAppData') || '';
+    } catch (e) {}
+    if (!initData) return null;
+    function post(type, data) {
+      try {
+        if (window.TelegramWebviewProxy && window.TelegramWebviewProxy.postEvent) {
+          window.TelegramWebviewProxy.postEvent(type, JSON.stringify(data || ''));
+        } else if (window.external && 'notify' in window.external) {
+          window.external.notify(JSON.stringify({eventType: type, eventData: data || ''}));
+        } else if (window.parent !== window) {
+          window.parent.postMessage(JSON.stringify({eventType: type, eventData: data || ''}), '*');
+        }
+      } catch (e) {}
+    }
+    return {initData: initData, startParam: new URLSearchParams(initData).get('start_param') || hp.tgWebAppStartParam || '',
+            post: post};
+  })();
+  if (tg) {
+    tg.post('web_app_set_header_color', {color: '#14161b'});
+    tg.post('web_app_set_background_color', {color: '#14161b'});
+    tg.post('web_app_setup_swipe_behavior', {allow_vertical_swipe: false});
+    tg.post('web_app_expand');
+    tg.post('web_app_ready');
+  }
+  const haptic = (style) => tg && tg.post('web_app_trigger_haptic_feedback', {type: 'impact', impact_style: style || 'medium'});
+
+  const ICON = {
+    phone: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.62 10.79a15.1 15.1 0 0 0 6.59 6.59l2.2-2.2a1 1 0 0 1 1.02-.24c1.12.37 2.33.57 3.57.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1.02l-2.2 2.2z"/></svg>',
+    hangup: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.96.96 0 0 1-.29-.7c0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71s-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28a11.3 11.3 0 0 0-2.67-1.85 1 1 0 0 1-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>',
+    mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2.5" width="6" height="12" rx="3"/><path d="M5 10.5v.5a7 7 0 0 0 14 0v-.5M12 18v3.5"/></svg>',
+    micOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 9.3V5.5a3 3 0 0 0-5.7-1.3M9 9v2.5a3 3 0 0 0 4.9 2.3M5 10.5v.5a7 7 0 0 0 11.9 5M19 10.5v.5a7 7 0 0 1-.5 2.6M12 18v3.5M3 3l18 18"/></svg>',
+    headset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 18v-5.5a8.5 8.5 0 0 1 17 0V18"/><path d="M20.5 18.5a2 2 0 0 1-2 2H17v-6.5h3.5zM3.5 18.5a2 2 0 0 0 2 2H7v-6.5H3.5z"/></svg>',
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+    group: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.2a6.5 6.5 0 0 1 3.5 5.8"/></svg>',
+  };
+  const PENDING_TEXT = {answer: '正在接听…', join: '正在加入…', reject: '正在拒接…', hangup: '正在挂断…',
+                        attach: '正在切换到此设备…'};
 
   function findToken() {
     const m = location.pathname.match(/\/call\/([A-Za-z0-9_-]{8,})\/?$/);
     if (m) return m[1];
-    if (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) return tg.initDataUnsafe.start_param;
+    if (tg && tg.startParam) return tg.startParam;
     const q = new URLSearchParams(location.search);
     return q.get('tgWebAppStartParam') || q.get('t') || '';
   }
   const token = findToken();
   const pageUrl = location.origin + CFG.base + '/call/' + token;
+  const workletUrl = URL.createObjectURL(new Blob([WORKLET], {type: 'application/javascript'}));
 
-  let ws = null, st = null, audio = null, ended = false, fatal = false, retry = 0;
-  let timerBase = null, timerId = null, wakeLock = null, busy = false;
+  let ws = null, st = null, audio = null, audioStarting = null, ended = false, fatal = false, retry = 0, reattach = false;
+  let timerBase = null, timerId = null, wakeLock = null, pending = null, lastPhase = null, micGranted = false;
+  let closingConfirm = null;
 
-  function hint(text, isErr, html) {
+  try {
+    navigator.permissions.query({name: 'microphone'}).then((p) => {
+      micGranted = p.state === 'granted';
+      p.onchange = () => { micGranted = p.state === 'granted'; };
+    }).catch(() => {});
+  } catch (e) {}
+
+  function hint(text, isErr) {
     const h = $('hint');
     h.className = 'hint' + (isErr ? ' err' : '');
-    if (html) h.innerHTML = html; else h.textContent = text || '';
+    h.textContent = text || '';
   }
 
   function browserFallback() {
     if (!tg) return;
-    const h = $('hint');
     const a = document.createElement('a');
-    a.href = '#'; a.textContent = '在浏览器中打开';
-    a.onclick = (e) => { e.preventDefault(); try { tg.openLink(pageUrl); } catch (_) { location.href = pageUrl; } };
+    a.href = pageUrl; a.textContent = '在浏览器中打开';
+    a.onclick = (e) => { e.preventDefault(); tg.post('web_app_open_link', {url: pageUrl}); };
+    const h = $('hint');
     h.appendChild(document.createTextNode(' '));
     h.appendChild(a);
   }
 
-  async function startAudio(rate, frame) {
+  // Creates the AudioContext synchronously (inside the tap) so iOS lets it play, then loads the
+  // microphone and the audio worklet in parallel.
+  function startAudio(rate, frame) {
     if (audio) {
       if (audio.rate !== rate) { audio.node.port.postMessage({t: 'rate', net: rate, frame: frame}); audio.rate = rate; }
-      return audio;
+      return Promise.resolve(audio);
     }
-    if (!window.isSecureContext) throw new Error('页面必须通过 HTTPS 打开才能使用麦克风');
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('当前环境不支持麦克风');
-    const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
-      autoGainControl: true, channelCount: 1}, video: false});
+    if (audioStarting) return audioStarting;
+    if (!window.isSecureContext) return Promise.reject(new Error('页面必须通过 HTTPS 打开才能使用麦克风'));
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('当前环境不支持麦克风'));
     const AC = window.AudioContext || window.webkitAudioContext;
     const ctx = new AC({latencyHint: 'interactive'});
-    if (!ctx.audioWorklet) { stream.getTracks().forEach((t) => t.stop()); throw new Error('当前浏览器不支持 AudioWorklet'); }
-    const url = URL.createObjectURL(new Blob([WORKLET], {type: 'application/javascript'}));
-    await ctx.audioWorklet.addModule(url);
-    const node = new AudioWorkletNode(ctx, 'bridge-io', {numberOfInputs: 1, numberOfOutputs: 1,
-      outputChannelCount: [1], processorOptions: {net: rate, frame: frame}});
-    ctx.createMediaStreamSource(stream).connect(node);
-    node.connect(ctx.destination);
-    node.port.onmessage = (e) => {
-      if (st && st.mine && !st.muted && ws && ws.readyState === 1 && ws.bufferedAmount < 64000) ws.send(e.data);
-    };
-    await ctx.resume();
-    audio = {ctx, stream, node, rate};
-    try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
-    return audio;
+    const resumed = ctx.resume().catch(() => {});
+    if (!ctx.audioWorklet) { ctx.close(); return Promise.reject(new Error('当前浏览器不支持 AudioWorklet')); }
+    const gum = navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
+      autoGainControl: true, channelCount: 1}, video: false});
+    const mod = ctx.audioWorklet.addModule(workletUrl);
+    audioStarting = (async () => {
+      let stream = null;
+      try {
+        stream = await gum;
+        await mod;
+        const node = new AudioWorkletNode(ctx, 'bridge-io', {numberOfInputs: 1, numberOfOutputs: 1,
+          outputChannelCount: [1], processorOptions: {net: rate, frame: frame}});
+        ctx.createMediaStreamSource(stream).connect(node);
+        node.connect(ctx.destination);
+        node.port.onmessage = (e) => {
+          if (st && st.mine && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 64000) ws.send(e.data);
+        };
+        await resumed;
+        if (ctx.state !== 'running') await ctx.resume();
+        audio = {ctx: ctx, stream: stream, node: node, rate: rate};
+        micGranted = true;
+        try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+        return audio;
+      } catch (e) {
+        gum.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
+        try { ctx.close(); } catch (_) {}
+        throw e;
+      } finally {
+        audioStarting = null;
+      }
+    })();
+    return audioStarting;
   }
 
   function stopAudio() {
@@ -918,32 +1038,64 @@ font-size:28px;color:#fff;transition:transform .1s}
     wakeLock = null;
   }
 
-  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+  function send(obj) {
+    if (ws && ws.readyState === 1) { ws.send(JSON.stringify(obj)); return true; }
+    return false;
+  }
+
+  function isMuted() { return pending && pending.action === 'mute' ? pending.muted : !!(st && st.muted); }
+
+  // Show the tap at once: the agent-wechat round trip (it drives the real WeChat client) can take seconds.
+  function begin(action, extra) {
+    if (pending || !st) return false;
+    pending = Object.assign({action: action, phase: st.phase, at: Date.now()}, extra || {});
+    const mine = pending;
+    setTimeout(() => { if (pending === mine) { pending = null; render(); } }, PENDING_MS);
+    haptic(action === 'hangup' || action === 'reject' ? 'heavy' : 'medium');
+    hint('');
+    render();
+    return true;
+  }
+
+  function settle() {
+    if (!pending || !st) return;
+    const p = st.phase;
+    if (pending.action === 'mute') { if (!!st.muted === pending.muted || !(p === 'active' || p === 'connecting')) pending = null; }
+    else if (pending.action === 'attach') { if (st.mine || !(p === 'active' || p === 'connecting')) pending = null; }
+    else if (p !== pending.phase) pending = null;
+  }
+
+  function act(action, extra) {
+    if (!begin(action, extra)) return;
+    if (!send(Object.assign({type: action}, extra || {}))) { pending = null; hint('连接已断开，正在重连…', true); render(); }
+  }
 
   async function withAudio(action) {
-    if (busy) return;
-    busy = true;
-    hint('');
+    if (!st || !begin(action)) return;
+    const early = !!audio || micGranted;
+    const started = startAudio(st.rate || 16000, st.frame || 320);
+    if (early) send({type: action});
     try {
-      await startAudio((st && st.rate) || 16000, (st && st.frame) || 320);
-      send({type: action});
+      await started;
+      if (!early && !send({type: action})) { pending = null; hint('连接已断开，正在重连…', true); render(); }
     } catch (e) {
       const name = e && e.name;
       let msg = (e && e.message) || String(e);
       if (name === 'NotAllowedError' || name === 'SecurityError') msg = '没有麦克风权限，请允许 Telegram / 浏览器使用麦克风';
       else if (name === 'NotFoundError') msg = '没有找到麦克风';
+      if (!early) pending = null;
+      render();
       hint(msg, true);
       browserFallback();
-    } finally {
-      busy = false;
     }
   }
 
-  function button(cls, icon, label, onClick, disabled) {
+  function button(cls, icon, label, onClick, action) {
     const b = document.createElement('button');
-    b.className = 'btn ' + cls;
-    b.disabled = !!disabled;
-    b.innerHTML = '<span>' + icon + '</span>';
+    const busy = pending && pending.action === action;
+    b.className = 'btn ' + cls + (busy ? ' busy' : '');
+    b.disabled = !!pending;
+    b.innerHTML = '<span class="c">' + icon + '</span>';
     b.appendChild(document.createTextNode(label));
     b.onclick = onClick;
     return b;
@@ -951,21 +1103,53 @@ font-size:28px;color:#fff;transition:transform .1s}
 
   function fmt(sec) {
     const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
-    return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+    return (h ? h + ':' + String(m).padStart(2, '0') : String(m).padStart(2, '0')) + ':' + String(s).padStart(2, '0');
+  }
+  function tick() { $('timer').textContent = timerBase == null ? '' : fmt(Math.floor((Date.now() - timerBase) / 1000)); }
+
+  const EMOJI = /^[\s\u2190-\u2BFF\uFE0F\u200D]*(?:[\uD83C-\uD83E][\uDC00-\uDFFF][\uFE0F\u200D\s]*)*/;
+  function cleanStatus(s) { return String(s || '').replace(EMOJI, '').trim(); }
+
+  function setStatus(text, tone) {
+    const el = $('status');
+    el.className = 'status tone-' + tone;
+    el.innerHTML = '';
+    if (!text) return;
+    const d = document.createElement('i'); d.className = 'dot';
+    el.appendChild(d);
+    el.appendChild(document.createTextNode(text));
   }
 
-  function tick() { $('timer').textContent = timerBase == null ? '' : fmt(Math.floor((Date.now() - timerBase) / 1000)); }
+  function setClosingConfirmation(on) {
+    if (!tg || closingConfirm === on) return;
+    closingConfirm = on;
+    tg.post('web_app_setup_closing_behavior', {need_confirmation: on});
+  }
 
   function render() {
     if (!st) return;
-    $('title').textContent = st.title || '微信通话';
-    $('name').textContent = st.name || st.caller || '';
-    $('avatar').textContent = (st.name || st.caller || '☎').trim().slice(0, 1) || '☎';
-    $('avatar').className = 'avatar' + (st.phase === 'ringing' || st.phase === 'invite' ? ' ringing' : '');
-    let status = st.status || '';
-    if (st.phase === 'invite' && st.caller) status = '发起人：' + st.caller + ' · ' + status;
-    $('status').textContent = status;
-    if (st.elapsed != null && st.phase !== 'ended') {
+    const p = st.phase;
+    if (p !== lastPhase) { if (lastPhase !== null) hint(''); lastPhase = p; }
+    const person = st.name || st.caller || '';
+    let title = st.title || '微信通话';
+    if ((p === 'connecting' || p === 'active') && title === '微信语音来电') title = '微信语音通话';
+    $('title').textContent = title;
+    $('name').textContent = person;
+    const av = $('avatar');
+    const first = Array.from(person.trim())[0];
+    if (st.phase === 'invite' || !first) av.innerHTML = st.phase === 'invite' ? ICON.group : ICON.phone;
+    else av.textContent = first.toUpperCase();
+    $('main').className = (p === 'ringing' || p === 'invite') ? 'ringing' : (p === 'ended' ? 'ended' : '');
+
+    let text = cleanStatus(st.status), tone = 'off';
+    if (p === 'ringing' || p === 'invite') tone = 'ring';
+    else if (p === 'connecting') tone = 'wait';
+    else if (p === 'active') tone = st.elapsed != null ? 'live' : 'wait';
+    if (p === 'invite' && st.caller) text = '发起人：' + st.caller + ' · ' + text;
+    if (pending && PENDING_TEXT[pending.action]) { text = PENDING_TEXT[pending.action]; tone = 'wait'; }
+    setStatus(text, tone);
+
+    if (st.elapsed != null && p !== 'ended') {
       timerBase = Date.now() - st.elapsed * 1000;
       if (!timerId) timerId = setInterval(tick, 1000);
     } else {
@@ -973,33 +1157,33 @@ font-size:28px;color:#fff;transition:transform .1s}
       if (timerId) { clearInterval(timerId); timerId = null; }
     }
     tick();
+
     const a = $('actions');
     a.innerHTML = '';
-    const p = st.phase;
     if (p === 'ringing') {
-      a.appendChild(button('red', '✕', '拒接', () => send({type: 'reject'})));
-      if (st.answerable) a.appendChild(button('green', '✆', '接听', () => withAudio('answer'), busy));
-      else hint('当前 agent-wechat 不支持在网页接听此通话');
+      a.appendChild(button('red', ICON.hangup, '拒接', () => act('reject'), 'reject'));
+      if (st.answerable) a.appendChild(button('green', ICON.phone, '接听', () => withAudio('answer'), 'answer'));
+      else if (!$('hint').textContent) hint('当前 agent-wechat 不支持在网页接听此通话');
     } else if (p === 'invite') {
-      if (st.joinable) a.appendChild(button('green', '✆', '加入', () => withAudio('join'), busy));
-      else hint('当前 agent-wechat 不支持加入群语音通话');
+      if (st.joinable) a.appendChild(button('green', ICON.phone, '加入', () => withAudio('join'), 'join'));
+      else if (!$('hint').textContent) hint('当前 agent-wechat 不支持加入群语音通话');
     } else if (p === 'connecting' || p === 'active') {
       if (st.mine) {
-        if (p === 'active') {
-          a.appendChild(button('gray' + (st.muted ? ' on' : ''), st.muted ? '🔇' : '🎙', st.muted ? '取消静音' : '静音',
-            () => send({type: 'mute', muted: !st.muted})));
-        }
+        const muted = isMuted();
+        a.appendChild(button('glass' + (muted ? ' on' : ''), muted ? ICON.micOff : ICON.mic, muted ? '已静音' : '静音',
+          () => act('mute', {muted: !muted}), 'mute'));
       } else {
-        a.appendChild(button('green', '🎧', '在此继续通话', () => withAudio('attach'), busy));
+        a.appendChild(button('green', ICON.headset, '在此接听', () => withAudio('attach'), 'attach'));
       }
-      a.appendChild(button('red', '✕', '挂断', () => send({type: 'hangup'})));
+      a.appendChild(button('red', ICON.hangup, '挂断', () => act('hangup'), 'hangup'));
       if (audio && st.rate && audio.rate !== st.rate) startAudio(st.rate, st.frame);
+    } else if (tg) {
+      a.appendChild(button('glass', ICON.close, '关闭', () => tg.post('web_app_close'), 'close'));
     }
-    const inCall = (p === 'connecting' || p === 'active') && st.mine;
-    if (tg) { try { inCall ? tg.enableClosingConfirmation() : tg.disableClosingConfirmation(); } catch (e) {} }
-    if (p === 'ended' || p === 'elsewhere' || (!st.mine && audio && (p === 'connecting' || p === 'active'))) {
+    setClosingConfirmation((p === 'connecting' || p === 'active') && !!st.mine);
+    if (p === 'ended' || p === 'elsewhere') {
       if (p === 'ended') ended = true;
-      if (p !== 'connecting' && p !== 'active') stopAudio();
+      stopAudio();
     }
   }
 
@@ -1023,26 +1207,29 @@ font-size:28px;color:#fff;transition:transform .1s}
       let m; try { m = JSON.parse(e.data); } catch (_) { return; }
       if (m.type === 'state') {
         const wasMine = st && st.mine;
-        st = m; render();
+        st = m; settle(); render();
         if (!m.mine && !wasMine && audio && (m.phase === 'connecting' || m.phase === 'active') && reattach) {
           reattach = false; send({type: 'attach'});
         }
       } else if (m.type === 'error') {
+        pending = null; render();
         hint(m.message, true);
+        haptic('rigid');
       } else if (m.type === 'drop') {
         audio && audio.node.port.postMessage({t: 'drop', id: m.trackId});
       } else if (m.type === 'fatal') {
-        fatal = true; $('name').textContent = ''; $('status').textContent = m.message; $('actions').innerHTML = '';
+        fatal = true; pending = null;
+        $('name').textContent = ''; setStatus(m.message, 'err'); $('actions').innerHTML = '';
       }
     };
     ws.onclose = () => {
       if (fatal || ended) return;
       if (audio) reattach = true;
-      $('status').textContent = '连接中断，正在重连…';
-      setTimeout(connect, Math.min(5000, 500 * Math.pow(2, retry++)));
+      pending = null;
+      setStatus('连接中断，正在重连…', 'wait');
+      setTimeout(connect, Math.min(5000, 300 * Math.pow(2, retry++)));
     };
   }
-  let reattach = false;
   connect();
 })();
 </script>

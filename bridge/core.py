@@ -1898,17 +1898,14 @@ class Bridge(LoginMixin):
         rows: list[list] = []
         web = self.call_web
         if not entry["terminal"]:
+            # One button per row: full-width buttons are much easier to hit on a phone.
             if entry["stage"] in ("pending", "offered"):
-                row = []
                 if web is not None and web.can_answer(entry):
-                    row.append(Button.url("📞 接听", web.link(web.token_for_call(entry))))
-                row.append(Button.inline("📵 拒接", f"callrej:{entry['token']}".encode()))
-                rows.append(row)
+                    rows.append([Button.url("📞 接听", web.link(web.token_for_call(entry)))])
+                rows.append([Button.inline("📵 拒接", f"callrej:{entry['token']}".encode())])
             elif web is not None and entry.get("answered_by_tg") and web.has_session(entry["call_id"]):
-                rows.append([
-                    Button.url("🎧 通话界面", web.link(web.token_for_call(entry))),
-                    Button.inline("📴 挂断", f"callhup:{entry['token']}".encode()),
-                ])
+                rows.append([Button.url("🎧 通话界面", web.link(web.token_for_call(entry)))])
+                rows.append([Button.inline("📴 挂断", f"callhup:{entry['token']}".encode())])
         return text, rows or None
 
     @staticmethod
@@ -2099,7 +2096,7 @@ class Bridge(LoginMixin):
         )
         web = self.call_web
         if web is not None and inv.get("live") and web.can_join():
-            return text, [[Button.url("🎧 加入", web.link(web.token_for_invite(inv)))]]
+            return text, [[Button.url("📞 加入", web.link(web.token_for_invite(inv)))]]
         return text, None
 
     async def _on_conf_invitations(self, invitations: list[dict]) -> None:
