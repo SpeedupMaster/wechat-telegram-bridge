@@ -35,6 +35,10 @@ log = logging.getLogger(__name__)
 DETACH_GRACE_SECONDS = 20.0
 # How long to wait for an answered call to reach "connected".
 CONNECT_TIMEOUT_SECONDS = 45.0
+# How long an outgoing call may ring before we give up (WeChat itself stops ringing after about a minute).
+OUTGOING_CONNECT_TIMEOUT_SECONDS = 90.0
+# How long a /call link stays usable before the call is placed.
+DIAL_REQUEST_TTL = 600.0
 INIT_DATA_MAX_AGE = 24 * 3600
 MAX_PCM_CHUNK = 65536
 
@@ -122,14 +126,18 @@ class CallSession:
         bridge = self.web.bridge
         try:
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + CONNECT_TIMEOUT_SECONDS
+            outgoing = self.entry.get("direction") == "outgoing"
+            deadline = loop.time() + (OUTGOING_CONNECT_TIMEOUT_SECONDS if outgoing else CONNECT_TIMEOUT_SECONDS)
             while self.entry["stage"] != "connected":
                 if self.entry["terminal"] or self.closed:
                     return
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    await self.web.report(self.entry, "通话长时间未接通，已挂断")
-                    await self.web.hangup(self.entry, quiet=True)
+                    if outgoing:
+                        await self.web.hangup(self.entry, quiet=True, status="⚪ 对方长时间未接听，已取消呼叫")
+                    else:
+                        await self.web.report(self.entry, "通话长时间未接通，已挂断")
+                        await self.web.hangup(self.entry, quiet=True)
                     return
                 self.changed.clear()
                 try:
@@ -277,7 +285,8 @@ class CallWeb:
         self.host = host.strip("[]")
         self.port = int(port)
         self.app_name = app_name
-        self.tokens: dict[str, tuple[str, str]] = {}  # web token -> ("call", call_id) | ("invite", invitation_id)
+        # web token -> ("call", call_id) | ("invite", invitation_id) | ("dial", dial_id)
+        self.tokens: dict[str, tuple[str, str]] = {}
         self.clients: dict[str, set[web.WebSocketResponse]] = {}  # web token -> open pages
         self.sessions: dict[str, CallSession] = {}  # call_id -> session
         self._tasks: set[asyncio.Task] = set()
@@ -300,7 +309,8 @@ class CallWeb:
         if len(self.tokens) < 300:
             return
         for token, (kind, ref) in list(self.tokens.items()):
-            live = (self.bridge._active_calls.get(ref) if kind == "call" else self.bridge._conf_invites.get(ref))
+            live = (self.bridge._active_calls.get(ref) if kind == "call" else
+                    self.bridge._dial_requests.get(ref) if kind == "dial" else self.bridge._conf_invites.get(ref))
             if live is None and token not in self.clients:
                 self.tokens.pop(token, None)
 
@@ -313,6 +323,14 @@ class CallWeb:
         if not inv.get("web_token"):
             inv["web_token"] = self._new_token("invite", inv["invitation_id"])
         return inv["web_token"]
+
+    def token_for_dial(self, req: dict) -> str:
+        if not req.get("web_token"):
+            req["web_token"] = self._new_token("dial", req["dial_id"])
+        return req["web_token"]
+
+    def can_dial(self) -> bool:
+        return bool(self.bridge._calls_caps.get("directAudio"))
 
     def can_answer(self, entry: dict) -> bool:
         caps = self.bridge._calls_caps
@@ -345,6 +363,10 @@ class CallWeb:
     async def on_invite_changed(self, inv: dict) -> None:
         if inv.get("web_token"):
             await self._push_token(inv["web_token"])
+
+    async def on_dial_changed(self, req: dict) -> None:
+        if req.get("web_token") and not req.get("call_id"):
+            await self._push_token(req["web_token"])
 
     async def report(self, entry: dict, text: str) -> None:
         token = entry.get("web_token")
@@ -484,6 +506,52 @@ class CallWeb:
                 await self.withdraw_readiness()
         await self.bridge._sync_call_msg(entry)
 
+    async def dial(self, req: dict, ws: web.WebSocketResponse | None) -> None:
+        """Place the outgoing one-to-one voice call a /call request asked for; this page then owns its audio."""
+        if req.get("dialing") or req.get("call_id"):
+            raise CallPending("正在呼叫…")
+        if not req.get("live"):
+            raise CallActionError("呼叫已取消或已过期，请重新发送 /call")
+        if not self.can_dial():
+            raise CallActionError("当前 agent-wechat 不支持发起微信语音通话")
+        req["dialing"] = True
+        readied = False
+        claimed = False
+        entry = None
+        try:
+            res = await self._ready({"kind": "outgoing"})
+            if res.get("status") == "error":
+                raise CallActionError(_err_text(res.get("code"), "呼叫失败"))
+            readied = True
+            res = await self._command({"type": "call.dial", "callType": "voice",
+                                       "target": {"kind": "direct", "contactId": req["contact_id"]}})
+            if res.get("status") not in ("accepted", "replayed") or not res.get("callId"):
+                raise CallActionError(_err_text(res.get("code"), "呼叫失败"))
+            owner_token = res.get("ownerToken")
+            if not owner_token:
+                raise CallActionError("agent-wechat 未返回通话凭证，无法接管音频")
+            claimed = True
+            call_id = res["callId"]
+            entry = self.bridge._new_call_entry(
+                call_id, kind="direct", call_type="voice", caller_id=req["contact_id"],
+                caller_name=req.get("name") or req["contact_id"], thread_id=req["thread_id"],
+                stage="dialing", revision=0,
+            )
+            entry.update(direction="outgoing", chat_id=req.get("chat_id"), msg_id=req.get("msg_id"),
+                         answered_by_tg=True, status_text="📞 正在呼叫…")
+            token = self.token_for_dial(req)
+            entry["web_token"] = token
+            self.tokens[token] = ("call", call_id)
+            req["call_id"] = call_id
+            self.bridge._finish_dial_request(req)
+            self._start_session(entry, owner_token, readied, ws)
+            await self.bridge._replay_orphan_call_state(call_id)
+        finally:
+            req["dialing"] = False
+            if readied and not claimed:
+                await self.withdraw_readiness()
+        await self.bridge._sync_call_msg(entry)
+
     def _start_session(self, entry: dict, owner_token: str, readied: bool, ws) -> CallSession:
         sess = CallSession(self, entry, owner_token, readied)
         if ws is not None:
@@ -492,15 +560,24 @@ class CallWeb:
         sess.task = asyncio.create_task(sess.run())
         return sess
 
-    async def hangup(self, entry: dict, *, quiet: bool = False, status: str = "📴 已在 Telegram 挂断") -> None:
+    @staticmethod
+    def _ringing_out(entry: dict) -> bool:
+        """An outgoing call the other side has not picked up yet: it is cancelled, not hung up."""
+        return entry.get("direction") == "outgoing" and entry["stage"] in ("dialing", "ringing")
+
+    async def _end_call(self, entry: dict) -> dict:
+        cmd = "call.cancel" if self._ringing_out(entry) else "call.hangup"
+        return await self._command({"type": cmd, "callId": entry["call_id"], "expectedRevision": entry["revision"]})
+
+    async def hangup(self, entry: dict, *, quiet: bool = False, status: str | None = None) -> None:
         if entry["terminal"]:
             return
+        if status is None:
+            status = "📴 已在 Telegram 取消呼叫" if self._ringing_out(entry) else "📴 已在 Telegram 挂断"
         try:
-            res = await self._command({"type": "call.hangup", "callId": entry["call_id"],
-                                       "expectedRevision": entry["revision"]})
+            res = await self._end_call(entry)
             if res.get("status") == "error" and res.get("code") == "stale" and not entry["terminal"]:
-                res = await self._command({"type": "call.hangup", "callId": entry["call_id"],
-                                           "expectedRevision": entry["revision"]})
+                res = await self._end_call(entry)
         except CallActionError:
             if quiet:
                 return
@@ -528,7 +605,14 @@ class CallWeb:
         kind, ref = self.tokens.get(token, ("", ""))
         st: dict = {"type": "state", "phase": "ended", "title": "微信通话", "name": "", "status": "通话已结束或链接已失效",
                     "mine": False, "muted": False, "elapsed": None, "rate": 16000, "frame": 320,
-                    "answerable": False, "joinable": False}
+                    "answerable": False, "joinable": False, "dialable": False}
+        if kind == "dial":
+            req = self.bridge._dial_requests.get(ref)
+            if req is not None:
+                st.update(title="微信语音通话", name=req.get("name") or "", status=req.get("status_text") or "")
+                if req.get("live"):
+                    st.update(phase="dial", dialable=self.can_dial())
+            return st
         if kind == "invite":
             inv = self.bridge._conf_invites.get(ref)
             if inv is not None:
@@ -540,15 +624,21 @@ class CallWeb:
         if entry is None:
             return st
         conf = entry["kind"] == "conference"
-        st.update(title="微信群语音通话" if conf else ("微信视频来电" if entry.get("call_type") == "video" else "微信语音来电"),
-                  name=entry.get("caller_name") or "", status=entry.get("status_text") or "")
+        if conf:
+            title = "微信群语音通话"
+        elif entry.get("direction") == "outgoing":
+            title = "微信语音通话"
+        else:
+            title = "微信视频来电" if entry.get("call_type") == "video" else "微信语音来电"
+        st.update(title=title, name=entry.get("caller_name") or "", status=entry.get("status_text") or "")
         if entry.get("connected_at"):
             st["elapsed"] = max(0, int(time.time() - entry["connected_at"]))
         sess = self.sessions.get(entry["call_id"])
         if entry["terminal"]:
             st["phase"] = "ended"
         elif sess is not None and not sess.closed:
-            st.update(phase="active" if sess.attached else "connecting", mine=ws is not None and sess.active_ws is ws,
+            phase = "calling" if self._ringing_out(entry) else ("active" if sess.attached else "connecting")
+            st.update(phase=phase, mine=ws is not None and sess.active_ws is ws,
                       muted=sess.muted, rate=sess.rate, frame=sess.frame)
         elif entry["stage"] in ("pending", "offered"):
             st.update(phase="ringing", answerable=self.can_answer(entry))
@@ -694,6 +784,13 @@ class CallWeb:
                     raise CallActionError("邀请已结束或已过期")
                 if action == "join":
                     await self.join(inv, ws)
+                return
+            if kind == "dial":
+                req = self.bridge._dial_requests.get(ref)
+                if req is None:
+                    raise CallActionError("呼叫已取消或已过期，请重新发送 /call")
+                if action == "dial":
+                    await self.dial(req, ws)
                 return
             entry = self.bridge._active_calls.get(ref) if kind == "call" else None
             if entry is None:
@@ -943,7 +1040,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     group: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.2a6.5 6.5 0 0 1 3.5 5.8"/></svg>',
   };
   const PENDING_TEXT = {answer: '正在接听…', join: '正在加入…', reject: '正在拒接…', hangup: '正在挂断…',
-                        attach: '正在切换到此设备…'};
+                        attach: '正在切换到此设备…', dial: '正在呼叫…'};
+  // Phases in which this browser may own the call's audio.
+  const LIVE = {calling: true, connecting: true, active: true};
 
   function findToken() {
     const m = location.pathname.match(/\/call\/([A-Za-z0-9_-]{8,})\/?$/);
@@ -1061,7 +1160,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     if (!pending || !st) return;
     const p = st.phase;
     if (pending.action === 'mute') { if (!!st.muted === pending.muted || !(p === 'active' || p === 'connecting')) pending = null; }
-    else if (pending.action === 'attach') { if (st.mine || !(p === 'active' || p === 'connecting')) pending = null; }
+    else if (pending.action === 'attach') { if (st.mine || !LIVE[p]) pending = null; }
     else if (p !== pending.phase) pending = null;
   }
 
@@ -1139,14 +1238,17 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const first = Array.from(person.trim())[0];
     if (st.phase === 'invite' || !first) av.innerHTML = st.phase === 'invite' ? ICON.group : ICON.phone;
     else av.textContent = first.toUpperCase();
-    $('main').className = (p === 'ringing' || p === 'invite') ? 'ringing' : (p === 'ended' ? 'ended' : '');
+    $('main').className = (p === 'ringing' || p === 'invite' || p === 'calling') ? 'ringing' : (p === 'ended' ? 'ended' : '');
 
     let text = cleanStatus(st.status), tone = 'off';
-    if (p === 'ringing' || p === 'invite') tone = 'ring';
+    if (p === 'ringing' || p === 'invite' || p === 'calling') tone = 'ring';
     else if (p === 'connecting') tone = 'wait';
     else if (p === 'active') tone = st.elapsed != null ? 'live' : 'wait';
     if (p === 'invite' && st.caller) text = '发起人：' + st.caller + ' · ' + text;
-    if (pending && PENDING_TEXT[pending.action]) { text = PENDING_TEXT[pending.action]; tone = 'wait'; }
+    if (pending && PENDING_TEXT[pending.action]) {
+      text = pending.action === 'hangup' && p === 'calling' ? '正在取消…' : PENDING_TEXT[pending.action];
+      tone = 'wait';
+    }
     setStatus(text, tone);
 
     if (st.elapsed != null && p !== 'ended') {
@@ -1167,6 +1269,12 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     } else if (p === 'invite') {
       if (st.joinable) a.appendChild(button('green', ICON.phone, '加入', () => withAudio('join'), 'join'));
       else if (!$('hint').textContent) hint('当前 agent-wechat 不支持加入群语音通话');
+    } else if (p === 'dial') {
+      if (st.dialable) a.appendChild(button('green', ICON.phone, '呼叫', () => withAudio('dial'), 'dial'));
+      else if (!$('hint').textContent) hint('当前 agent-wechat 不支持发起微信语音通话');
+    } else if (p === 'calling') {
+      if (!st.mine) a.appendChild(button('green', ICON.headset, '切换到此设备', () => withAudio('attach'), 'attach'));
+      a.appendChild(button('red', ICON.hangup, '取消', () => act('hangup'), 'hangup'));
     } else if (p === 'connecting' || p === 'active') {
       if (st.mine) {
         const muted = isMuted();
@@ -1180,7 +1288,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     } else if (tg) {
       a.appendChild(button('glass', ICON.close, '关闭', () => tg.post('web_app_close'), 'close'));
     }
-    setClosingConfirmation((p === 'connecting' || p === 'active') && !!st.mine);
+    setClosingConfirmation(!!LIVE[p] && !!st.mine);
     if (p === 'ended' || p === 'elsewhere') {
       if (p === 'ended') ended = true;
       stopAudio();
@@ -1208,7 +1316,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       if (m.type === 'state') {
         const wasMine = st && st.mine;
         st = m; settle(); render();
-        if (!m.mine && !wasMine && audio && (m.phase === 'connecting' || m.phase === 'active') && reattach) {
+        if (!m.mine && !wasMine && audio && LIVE[m.phase] && reattach) {
           reattach = false; send({type: 'attach'});
         }
       } else if (m.type === 'error') {

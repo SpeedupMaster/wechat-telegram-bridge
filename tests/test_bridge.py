@@ -3551,6 +3551,14 @@ class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertIn("已在 Telegram 拒接", call_msg.text)
 
+    async def test_call_command_needs_call_page(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.b.store.link("wxid_alice", -700, "Alice")
+        self.b.wx_ready = True
+        self.assertIsNone(self.b.call_web)
+        await self.b.on_tg_message(tg_event(-700, 10, "/call"))
+        self.assertIn("CALL_WEB_URL", self.b.bot.sent[-1].text)
+
     async def test_call_lifecycle_updates_and_pending_cancelled(self):
         self.daemon.add_thread("wxid_bob", "Bob")
         sock = _FakeCallsSocket()
@@ -4637,6 +4645,182 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("call.hangup", [c["type"] for c in self.sock.commands])
         self.assertTrue(self.b.call_web.has_session("c-9"))
         await ws2.close()
+
+    # ---------------------------------------------------------------- outgoing calls
+    def _link_alice(self) -> int:
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.b.store.link("wxid_alice", -700, "Alice")
+        self.b.wx_ready = True
+        return -700
+
+    def _on_dial(self, call_id: str, *states: str):
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.dial":
+                # The daemon reports the new call before the command result reaches us
+                for i, state in enumerate(states):
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": call_id, "revision": i + 1, "kind": "direct", "callType": "voice",
+                        "direction": "outgoing", "state": state, "ownedByThisClient": True}})
+                return {"type": "command.result", "status": "accepted", "callId": call_id, "ownerToken": "own-" + call_id}
+            return None
+        self.sock.on_command = on_cmd
+
+    async def _call_card(self, chat: int):
+        await self.b.on_tg_message(tg_event(chat, 10, "/call"))
+        msg = self.b.bot.sent[-1]
+        return msg, _button_urls(msg)[0].rsplit("/", 1)[1]
+
+    async def test_dial_ring_and_cancel_from_page(self):
+        chat = self._link_alice()
+        self._on_dial("out-1", "dialing")
+        msg, token = await self._call_card(chat)
+        self.assertIn("微信语音通话", msg.text)
+        self.assertIn("呼叫：<b>Alice</b>", msg.text)
+        self.assertEqual(_button_texts(msg), ["📞 开始呼叫", "✖️ 取消"])
+        self.assertEqual(self.sock.commands, [])  # nothing is dialled until the page asks for it
+
+        ws = await self._page(token, _init_data("123:abc", 999))
+        st = await self._next(ws)
+        self.assertEqual((st["phase"], st["dialable"], st["name"], st["title"]), ("dial", True, "Alice", "微信语音通话"))
+        await ws.send_json({"type": "dial"})
+        await ws.send_json({"type": "dial"})  # double tap: dialled once
+        st = await self._next(ws, pred=lambda m: m["phase"] == "calling")
+        self.assertTrue(st["mine"])
+        self.assertEqual([c["type"] for c in self.sock.commands], ["call.ready", "call.dial"])
+        self.assertEqual(self.sock.commands[0]["scope"], {"kind": "outgoing"})
+        self.assertEqual(self.sock.commands[1]["target"], {"kind": "direct", "contactId": "wxid_alice"})
+        self.assertEqual(self.sock.commands[1]["callType"], "voice")
+        await self._until(lambda: "正在呼叫" in msg.text)
+        self.assertEqual(_button_texts(msg), ["🎧 通话界面", "📴 取消呼叫"])
+        self.assertEqual(_button_urls(msg)[0].rsplit("/", 1)[1], token)  # same link keeps working
+
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "out-1", "revision": 2, "kind": "direct", "callType": "voice",
+            "direction": "outgoing", "state": "ringing", "ownedByThisClient": True}})
+        self.assertIn("对方响铃中", msg.text)
+
+        await ws.send_json({"type": "hangup"})
+        await self._until(lambda: self.sock.commands[-1]["type"] == "call.cancel")
+        self.assertEqual(self.sock.commands[-1]["expectedRevision"], 2)
+        await self._until(lambda: "已在 Telegram 取消呼叫" in msg.text)
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "out-1", "revision": 3, "kind": "direct", "callType": "voice",
+            "direction": "outgoing", "state": "ended", "ownedByThisClient": True}})
+        await self._next(ws, pred=lambda m: m["phase"] == "ended")
+        self.assertIn("已在 Telegram 取消呼叫", msg.text)
+        self.assertIsNone(msg.kwargs["buttons"])
+        self.assertEqual(self.media_calls, [])
+        self.assertFalse(self.sock.commands[-1]["ready"])  # readiness withdrawn
+        await ws.close()
+
+    async def test_dial_connects_relays_audio_and_hangs_up(self):
+        chat = self._link_alice()
+        self._on_dial("out-2", "dialing", "ringing")
+        msg, token = await self._call_card(chat)
+        ws = await self._page(token)
+        await self._next(ws)
+        await ws.send_json({"type": "dial"})
+        await self._next(ws, pred=lambda m: m["phase"] == "calling")
+        await self._until(lambda: "对方响铃中" in msg.text)  # state that arrived before the command result
+
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "out-2", "revision": 3, "kind": "direct", "callType": "voice",
+            "direction": "outgoing", "state": "connected", "ownedByThisClient": True}})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "active")
+        self.assertTrue(st["mine"])
+        self.assertEqual(self.media_calls, [("out-2", "ctl-1", "own-out-2")])
+        self.assertIn("通话中（Telegram 发起）", msg.text)
+        self.assertEqual(_button_texts(msg), ["🎧 通话界面", "📴 挂断"])
+
+        await self.b.on_bot_callback(_CallbackEvent(999, f"callhup:{self.b._active_calls['out-2']['token']}".encode()))
+        self.assertEqual(self.sock.commands[-1]["type"], "call.hangup")
+        self.assertIn("已在 Telegram 挂断", msg.text)
+        await ws.close()
+
+    async def test_dial_unanswered_busy_cancel_and_expiry(self):
+        import bridge.callweb as callweb
+        chat = self._link_alice()
+
+        # The other side never picks up
+        self._on_dial("out-3", "dialing", "ringing", "ended")
+        msg, token = await self._call_card(chat)
+        ws = await self._page(token)
+        await self._next(ws)
+        await ws.send_json({"type": "dial"})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "ended")
+        self.assertIn("呼叫未接通", st["status"])
+        await self._until(lambda: msg.kwargs["buttons"] is None)
+        self.assertIn("呼叫未接通", msg.text)
+        await ws.close()
+
+        # Busy: the error is shown and the card stays usable
+        async def busy(cmd):
+            if cmd["type"] == "call.dial":
+                return {"type": "command.result", "status": "error", "code": "busy"}
+            return None
+        self.sock.on_command = busy
+        self.sock.commands.clear()
+        msg, token = await self._call_card(chat)
+        ws = await self._page(token)
+        await self._next(ws)
+        await ws.send_json({"type": "dial"})
+        err = await self._next(ws, "error")
+        self.assertIn("其他未结束的通话", err["message"])
+        self.assertEqual([c["type"] for c in self.sock.commands], ["call.ready", "call.dial", "call.ready"])
+        self.assertFalse(self.sock.commands[-1]["ready"])
+        self.assertEqual(_button_texts(msg), ["📞 开始呼叫", "✖️ 取消"])
+
+        # Cancel button on the card: only the owner, then the page shows it ended
+        data = next(d for row in msg.kwargs["buttons"] for b in row
+                    if (d := getattr(getattr(b, "type", None), "data", None) or getattr(b, "data", None)))
+        self.assertTrue(data.startswith(b"dialx:"))
+        intruder = _CallbackEvent(111, data)
+        await self.b.on_bot_callback(intruder)
+        self.assertEqual(intruder.answers, [("只有桥接账号本人可以操作", True)])
+        await self.b.on_bot_callback(_CallbackEvent(999, data))
+        self.assertIn("已取消", msg.text)
+        self.assertIsNone(msg.kwargs["buttons"])
+        st = await self._next(ws, pred=lambda m: m["phase"] == "ended")
+        self.assertIn("已取消", st["status"])
+        await ws.send_json({"type": "dial"})
+        err = await self._next(ws, "error")
+        self.assertIn("已取消或已过期", err["message"])
+        await ws.close()
+
+        # A new /call retires the previous live card; an unused card expires
+        callweb.DIAL_REQUEST_TTL, saved = 0.5, callweb.DIAL_REQUEST_TTL
+        try:
+            first, _ = await self._call_card(chat)
+            second, _ = await self._call_card(chat)
+            self.assertIn("此链接已失效", first.text)
+            self.assertIsNone(first.kwargs["buttons"])
+            await self._until(lambda: "已过期" in second.text)
+            self.assertIsNone(second.kwargs["buttons"])
+        finally:
+            callweb.DIAL_REQUEST_TTL = saved
+
+    async def test_call_command_refused_when_unavailable(self):
+        chat = self._link_alice()
+        self.daemon.add_thread("123@chatroom", "Team", kind="group")
+        self.b.store.link("123@chatroom", -701, "Team")
+        await self.b.on_tg_message(tg_event(-701, 10, "/call"))
+        self.assertIn("暂不支持", self.b.bot.sent[-1].text)
+
+        self.b._calls_caps = {}
+        await self.b.on_tg_message(tg_event(chat, 11, "/call"))
+        self.assertIn("不支持发起微信语音通话", self.b.bot.sent[-1].text)
+
+        self.b._calls_caps = {"directAudio": True}
+        self.b._calls_sock = None
+        await self.b.on_tg_message(tg_event(chat, 12, "/call"))
+        self.assertIn("通话信令未连接", self.b.bot.sent[-1].text)
+
+        self.b._calls_sock = self.sock
+        self.b.wx_ready = False
+        await self.b.on_tg_message(tg_event(chat, 13, "/call"))
+        self.assertIn("微信尚未登录", self.b.bot.sent[-1].text)
+        self.assertEqual(self.sock.commands, [])
+        self.assertEqual(self.b._dial_requests, {})
 
 
 class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
