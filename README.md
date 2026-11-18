@@ -1,109 +1,103 @@
 # wechat-telegram-bridge
 
-在 Telegram 中收发微信消息的双向桥接工具：**每个微信私聊/群聊自动对应一个 Telegram 群**。
+基于 [agent-wechat](https://github.com/thisnick/agent-wechat) 与 [Telethon](https://github.com/LonamiWebs/Telethon)（MTProto 协议）构建的 **微信 ↔ Telegram 双向桥接服务**。
 
-- 微信收到新消息时，程序通过你的 Telegram 账号自动建群（群名 = 微信备注/群名，群头像 = 微信头像），并把你的 Bot 拉进群；后续消息由 Bot 发送到对应群中，保留正常的 Telegram 通知体验。
-- 你在 Telegram 桥接群里发送的消息会实时转发到对应的微信会话。
-- 微信侧依赖 [agent-wechat](https://github.com/thisnick/agent-wechat) 的本地守护进程（`wx serve`）及其 HTTP/SSE API。
+它将每个微信私聊或群聊自动映射为独立的 **Telegram 群组**（或同一个超级群内的**独立话题**），让你在 Telegram 中获得接近原生的微信收发、引用回复、原生表情互通、群内 `@` 提醒、消息撤回以及语音通话接听体验。
 
 ```text
-微信服务器 ⇄ agent-wechat (wx serve) ⇄ telegram-bridge ⇄ Telegram（你的账号 + 机器人）
+微信服务器 ⇄ agent-wechat (127.0.0.1:6174) ⇄ telegram-bridge (MTProto) ⇄ Telegram（你的账号 + Bot）
+                                                    │
+                                     (可选) CallWeb (127.0.0.1:8780)
+                                                    ⇅
+                                     HTTPS 反代 / Cloudflare Tunnel ⇄ Telegram Mini App 语音通话
 ```
 
-### 两种使用方式（环境变量 `BRIDGE_MODE` 切换）
+---
 
-| `BRIDGE_MODE` | 形式 | 需要 | 体验 | 风险 |
-|---|---|---|---|---|
-| `groups`（默认） | 每个微信会话一个 Telegram 群 | 机器人 + 登录你的 Telegram 账号（自动建群） | 最像原生聊天，各自有通知和置顶 | 中（建群频率限制、群数量上限） |
-| `topics` | 一个话题群，每个微信会话一个话题 | **只用机器人**，不登录你的 Telegram 账号 | 都在一个群里，切换稍麻烦 | 低 |
+## 目录
 
-- 两种模式的绑定分开保存，来回切换不会丢失另一种模式的绑定。
-- 话题没有头像，`topics` 模式下不同步微信头像（话题图标用颜色区分：蓝色 = 联系人，绿色 = 微信群）。
-- 修改 `.env` 里的 `BRIDGE_MODE` 后执行 `docker compose up -d --no-deps telegram-bridge` 生效。
+- [核心特性](#核心特性)
+- [运行模式：群组模式 vs 话题模式](#运行模式群组模式-vs-话题模式)
+- [快速开始（Docker Compose）](#快速开始docker-compose)
+- [日常使用与机器人命令](#日常使用与机器人命令)
+- [在 Telegram 接听微信语音通话（可选）](#在-telegram-接听微信语音通话可选)
+- [配置说明](#配置说明)
+- [运维与数据管理](#运维与数据管理)
+- [本地运行与开发](#本地运行与开发)
+- [常见问题 (FAQ)](#常见问题-faq)
 
 ---
 
-## 功能特性
+## 核心特性
 
-### 双向消息支持
+### 1. 两种会话组织模式
+- **群组模式（`groups`，默认）**：每个微信会话自动创建一个 Telegram 群（群名 = 微信备注/群名，群头像 = 微信头像），拥有独立的通知、置顶与归档体验。
+- **话题模式（`topics`）**：所有微信会话集中在同一个开启了「话题 (Topics)」的 Telegram 群内，每个会话对应一个独立话题，**只需机器人即可运行，无需登录个人 Telegram 账号**。
+- **无损切换**：两种模式的绑定关系在数据库中分开保存，随时修改 `BRIDGE_MODE` 切换不会丢失已有绑定。
 
-| 微信 → Telegram | Telegram → 微信 |
-|---|---|
-| 文字消息（自动将 `#话题#` 转为 Telegram 可高亮 `#话题`，常用 `[捂脸]` 等微信表情转为 Emoji） | 文字消息 |
-| 图片、视频、文件（优先拉取微信**原图**，支持 wxid/wxgf 头像解码） | 图片、视频、文件（默认以**原图**发送；在 Telegram 选择「**作为文件发送**」的图片也会绕过 Telegram 压缩并在微信端以**原图**接收，而非文件附件） |
-| 表情：**静态/WXGF 预览表情转为 Telegram 静态贴纸（`.webp`），GIF 动图表情转为动态贴纸（`.webm`）** | **贴纸**：静态贴纸（`.webp`）、动态贴纸（`.tgs`/`.webm`）转为透明 GIF 直接发送为**微信原生表情**（`agent-wechat >= 2.5.0` 下静态最高 512 px、动态最高 384 px 且发送提速约 4 倍；`< 2.5.0` 自动兼容 240 px，`< 2.4.0` 自动回退为图片/短视频） |
-| 语音（容器自带 `ffmpeg` 时自动转为 Telegram 语音条） | 语音条（发送为微信语音） |
-| **链接卡片**（小红书、公众号等自动绘制横向图文卡片并配直达按钮，隐藏冗长跟踪参数）、**视频号卡片**（自动清理低版本升级占位提示）、位置（含地图坐标）、聊天记录、系统提示 | |
-| 微信群聊显示发送者名称 | **群内 `@` 提醒**：发送 `@成员名` 或 `@所有人` / `@all` 触发微信真实 `@` 提醒 |
-| 引用回复对照还原为 Telegram 回复 | 回复某条消息 → 微信引用回复 |
-| 撤回提示、手机端已发消息静音同步（可关闭） | **双向撤回**：在 Telegram 删除单条已发消息，或回复该消息发送 `/recall`，即可撤回微信消息（2 分钟内有效；清空历史或批量删除不会触发）；以 `//` 开头的内容只留在 Telegram |
-| **实时来电通知与一键拒接**（`agent-wechat >= 2.4.0`）：单聊语音/视频来电推送到对应群并提供「📵 拒接」按钮，群语音通话邀请同步提醒及状态更新 | **在 Telegram 接听微信语音通话**（可选，需 HTTPS 域名）：点「📞 接听」在 Mini App 网页里通话，支持静音/挂断；群语音邀请可点「🎧 加入」；也可一键「📵 拒接」 |
+### 2. 全类型消息双向互通
+- **文字与富文本**：自动将微信 `#话题#` 转换为 Telegram 可点击高亮标签，将 `[捂脸]`、`[破涕为笑]` 等百余种微信内置表情转换为对应 Emoji。
+- **原图、视频与大文件直传**：
+  - **突破 Bot API 体积限制**：直连 Telegram MTProto 协议（协议层最高支持 2 GB，桥接默认限制 `max_media_mb = 200`）。
+  - **流式下载与断点续传**：微信附件采用流式分块下载（`≤ 8 MiB` 留存内存，超出部分自动落盘至临时文件并支持 HTTP `Range` 断点续传，转发后自动清理），传输大视频/大文件不会撑爆内存。
+  - **双向原图清晰度**：微信端收发图片默认拉取并发送 `original` 原图；在 Telegram 选择「**作为文件发送**」的静态图片（≤ 25 MB）也会自动以**微信原图**形式送达，而非变成文件附件。
+- **原生表情包互通**：
+  - **微信 → Telegram**：静态表情及 WXGF 预览自动转为 Telegram 静态贴纸（`.webp`），GIF 动图表情自动转为 Telegram 动态贴纸（`.webm`）。
+  - **Telegram → 微信**：静态贴纸（`.webp`）、动态贴纸（`.tgs` / `.webm`）以及 GIF 动图自动转换为透明通道 GIF 并作为**微信原生表情**发送（静态最高 512 px、动态最高 384 px，内置转换缓存）。
+- **语音条自动转码**：容器内置 `ffmpeg`，微信语音自动转为 Telegram 原生语音条（OGG/Opus），Telegram 发送的语音条直接作为微信语音发出。
+- **分享卡片与特色消息**：
+  - **横向图文链接卡片**：公众号、小红书、哔哩哔哩、知乎、GitHub 等分享链接自动渲染为微信风格的紧凑图文卡片，附带平台品牌标识与直达按钮（自动剔除冗长追踪参数）。
+  - **丰富消息类型**：支持视频号卡片（含视频自动下载）、地理位置（渲染为 Telegram 原生 Venue 地标卡片）、合并转发聊天记录、微信系统提示等。
 
-### 文件大小与上游限制
+### 3. 聊天交互深度对齐
+- **双向引用回复**：在 Telegram 中回复某条消息，微信端即显示为对该消息的引用回复，反之亦然。
+- **群聊真实 `@` 提醒**：在 Telegram 群内输入 `@成员名` 或 `@所有人` / `@all`，自动解析并触发微信群内的原生 `@` 强提醒；配合 `/members` 命令可一键点按复制群成员 `@` 标签。
+- **双向撤回**：手机端撤回消息实时同步提示；在 Telegram 中**删除单条已发消息**或回复消息发送 `/recall`，即可撤回 2 分钟内的微信消息（批量删除或清空历史不会误触撤回）。
+- **多端静音同步与已读联动**：在手机微信发出的消息会自动静音同步至对应 Telegram 会话（标记为 `我（手机端）`）；在 Telegram 回复消息后自动将对应微信会话标为已读。
+- **Telegram 内部备注**：以 `//` 开头的消息仅保留在 Telegram 群/话题内，不会转发到微信。
 
-- **不受 HTTP Bot API 20 MB / 50 MB 限制**：本桥接使用 Telethon 直连 Telegram **MTProto 协议**，Telegram 协议层单文件最高支持 2 GB。
-- **默认媒体上限 `200 MB`**：由 `config.toml` 中的 `max_media_mb = 200` 控制（双向均检查）。由于收发媒体需先读入内存再转发，如需调大请确保服务器内存充足，同时微信侧本身也有文件大小上限。
-- **原图清晰度**：依赖 `agent-wechat >= 2.4.0`，发送图片默认附带 `imageQuality = "original"`（JPEG 保留原字节，PNG/WebP/静态 GIF 按全分辨率转换），接收微信图片也会优先触发并下载 `original` 副本而非仅取已缓存的缩略图/标准图；在 Telegram 中以「**作为文件发送**」发送静态图片（≤ 25 MB、JPEG ≤ 8192 px / PNG 等 ≤ 4096 px，超出 4096 px 的非 JPEG 静态图会自动转为高质量 JPEG），微信端会以**原图**接收（动图 GIF 或超过 25 MB / 8192 px 的超大图片仍作为文件发送）。视频默认发送 720p 播放版及原始文件。
-- **表情格式限制**：WXGF 格式的微信动图表情受限于上游 `agent-wechat` 仅解码单帧预览，转发到 Telegram 时会作为静态贴纸展示；无 CDN 下载地址的加密/特殊表情仍无法获取。
-- **通话限制**：接听依赖上游 `agent-wechat` 的通话 API，目前只支持**语音**（视频来电只能通知和拒接），不支持从 Telegram 发起呼叫；上游单次通话最长 20 分钟。详见下文「在 Telegram 接听微信通话」。
-
----
-
-## 机器人命令
-
-Bot 启动时会自动向 Telegram 注册斜杠 `/` 菜单（私聊和群聊菜单分开展示，无需手动去 `@BotFather` 配置）。
-
-### 私聊机器人命令
-
-| 命令 | 说明 |
-|---|---|
-| `/find [关键词]` | 搜索微信联系人和微信群（不填显示最近会话，可点按钮直接建群） |
-| `/open [关键词]` | 为微信联系人或群聊新建对应的 Telegram 群（支持关键词与点选，无需查 ID） |
-| `/chats [关键词]` | 查看当前已绑定的所有会话（别名 `/list`） |
-| `/link [关键词]` | 交互式选择绑定现有的 Telegram 群与微信会话（无需查 ID；也兼容 `/link 微信ID TG群ID`） |
-| `/status` | 查看运行时长、转发统计、已连接会话数与微信在线状态 |
-| `/wxlogin` | 重新登录微信（支持手机确认或扫码；掉线通知也自带登录按钮） |
-| `/help` | 查看使用帮助 |
-
-### 桥接群内命令
-
-| 命令 | 说明 |
-|---|---|
-| `/link [关键词]` | 在任意 Telegram 群内直接发送，将该群绑定或切换绑定到微信会话（无需查群 ID） |
-| `/wx` | 查看当前群对应的微信名称与会话 ID |
-| `/members [关键词]` | 列出微信群成员（点击代码块即可复制 `@名字`，别名 `/at`） |
-| `/recall` | 回复某条自己发的消息并发送此命令，撤回微信消息 |
-| `/avatar` | 重新拉取微信头像并更新 Telegram 群头像 |
-| `/rename` | 同步最新微信备注/群名到 Telegram 群标题（别名 `/title`） |
-| `/unlink` | 解除当前 Telegram 群与微信会话的绑定 |
-| `/help` | 查看群内可用命令帮助 |
-
-> **话题模式**：以上群内命令在对应**话题**里发送即可（`/rename` 改的是话题标题，`/link`、`/unlink` 作用于当前话题），另有 `/forum`（把当前群设为桥接话题群）；没有 `/avatar`。私聊里的 `/link` 改为提示到话题里操作。
+### 4. 微信来电通知与实时语音通话
+- **实时来电提醒与拒接**：微信单聊语音/视频来电、群语音通话邀请实时推送到对应会话，支持点击「**📵 拒接**」一键挂断。
+- **在 Telegram 内接听语音（可选）**：配置 HTTPS 域名（支持内置 Cloudflare Tunnel 免公网端口或 Caddy/Nginx 反代）后，可点击「**📞 接听**」或「**🎧 加入**」在 Telegram Mini App 网页中使用麦克风直接通话，支持静音与挂断。
 
 ---
 
-## 部署指南（Docker Compose，Linux VPS）
+## 运行模式：群组模式 vs 话题模式
 
-`agent-wechat` 与 `telegram-bridge` 运行在同一台 Linux VPS 上（支持 x86_64 / ARM64），`agent-wechat` 仅监听 `127.0.0.1:6174`，不对外暴露端口。
+通过 `.env` 中的 `BRIDGE_MODE`（或 `config.toml` 中的 `bridge.mode`）切换：
 
-### 1. 准备工作
+| 对比维度 | `groups`（群组模式，默认） | `topics`（话题模式） |
+| :--- | :--- | :--- |
+| **展现形式** | 每个微信私聊/群聊对应一个独立的 Telegram 群 | 所有会话集中在同一个话题群内，每个微信会话对应一个话题 |
+| **所需凭证** | Telegram Bot + **登录你的个人 Telegram 账号**（用于自动建群） | **仅需 Telegram Bot**（无需登录个人 Telegram 账号） |
+| **头像与标识** | 自动将微信好友/群聊头像同步为 Telegram 群头像 | 话题不支持自定义头像，使用话题图标颜色区分（蓝色 = 私聊，绿色 = 群聊） |
+| **使用体验** | 最接近原生聊天软件，可独立设置每个会话的通知、置顶与归档 | 聊天列表集中在单群内，列表清爽，但会话间切换需进入话题列表 |
+| **平台限制** | 短时间大量建群受 Telegram `FLOOD_WAIT` 频率限制（内置间隔保护） | 几乎无建群风控风险；需将 Bot 设为话题群管理员并授予「管理话题」权限 |
 
-开始前请准备以下 3 项凭证（其余 token、守护进程配置、数据库目录都会自动生成）：
+> 修改 `.env` 中的 `BRIDGE_MODE` 后，执行 `docker compose up -d --no-deps telegram-bridge` 即可切换生效。
 
-1. **`TG_API_ID` 与 `TG_API_HASH`**：登录 <https://my.telegram.org> → *API development tools* 创建应用获取。
-2. **`TG_BOT_TOKEN`**：在 Telegram 找 [@BotFather](https://t.me/BotFather) 发送 `/newbot` 创建机器人获取。
+---
 
-### 2. 安装与启动
+## 快速开始（Docker Compose）
 
-GitHub Actions 会在推送到 `main` 分支后自动构建并发布多架构镜像到 `ghcr.io/speedupmaster/wechat-telegram-bridge`。
+本方案将 `agent-wechat` 守护进程与 `telegram-bridge` 部署在同一台 Linux VPS 上（支持 `x86_64` 与 `ARM64`）。容器采用 Host 网络模式，`agent-wechat` 仅监听本机回环地址 `127.0.0.1:6174`，不向公网暴露任何端口。
 
-如果仓库/镜像为私有，先在 VPS 登录一次 GHCR（Token 只需勾选 `read:packages`）：
+### 第一步：准备 Telegram 凭证
+
+部署前只需准备以下 3 项参数（其余守护进程配置、API Token 与数据库目录均由容器在启动时自动初始化）：
+
+1. **`TG_API_ID` 与 `TG_API_HASH`**：登录 [https://my.telegram.org](https://my.telegram.org) → 进入 *API development tools* 创建应用获取。
+2. **`TG_BOT_TOKEN`**：在 Telegram 中私聊 [@BotFather](https://t.me/BotFather) 发送 `/newbot` 创建机器人获取。
+
+### 第二步：一键初始化与启动
+
+如果使用私有 GHCR 镜像，请先在 VPS 上登录一次容器镜像仓库（Personal Access Token 仅需勾选 `read:packages` 权限；若未登录，脚本会自动回退为本地构建镜像）：
 
 ```bash
 echo <GITHUB_PAT> | docker login ghcr.io -u SpeedupMaster --password-stdin
 ```
 
-拉取代码并运行一键脚本：
+克隆仓库并运行一键引导脚本：
 
 ```bash
 git clone https://github.com/SpeedupMaster/wechat-telegram-bridge.git
@@ -111,166 +105,360 @@ cd wechat-telegram-bridge
 sh setup.sh
 ```
 
-脚本会引导填写 `.env` 中的必需变量、创建 `./data/` 持久化目录、拉取/构建镜像并启动容器，随后打印配对码：
+`setup.sh` 会交互式引导你填写 `.env` 配置、创建 `./data/` 持久化目录、启动全部服务，并在终端打印一次性配对码：
 
 ```text
+在 Telegram 里打开你的机器人，发送：
+
     /login 3f9a1c07
 ```
 
-> 也可以手动部署：`cp .env.example .env` 并填写配置 → `docker compose up -d` → `docker compose logs telegram-bridge | grep "PAIRING CODE"` 查看配对码。
+<details>
+<summary><b>💡 手动部署方式（不使用 setup.sh）</b></summary>
 
-### 3. 在机器人内完成登录
+```bash
+cp .env.example .env
+# 编辑 .env 填入 TG_API_ID、TG_API_HASH、TG_BOT_TOKEN
+docker compose up -d
+# 从日志中获取配对码
+docker compose logs telegram-bridge | grep "PAIRING CODE"
+```
+</details>
 
-1. **配对**：在 Telegram 私聊你的机器人，发送 `/login 配对码`（仅持有服务器日志的人可配对）。
-2. **登录 Telegram 账号**：按机器人按钮二选一（用于自动建群与收发账号状态，两种方式可随时切换）：
-   - **验证码登录（单台手机推荐）**：
-     - 点底部「**📱 一键使用当前手机号**」直接授权手机号（或手动输入带国家码的号码如 `+8613800000000`）；
-     - 收到验证码后，直接在机器人消息下方的**内联数字键盘**逐位点按并点「**✅ 确认登录**」——全程不发送聊天消息，避免被 Telegram 判定验证码泄露而作废（也兼容直接回复空格隔开的数字，如 `1 2 3 4 5`）；
-     - 如开启了两步验证，再按提示发送密码（机器人读取后会立即删除敏感消息）。
-   - **扫码登录**：适合另有一台设备（电脑版或网页版打开本对话），用手机 Telegram「设置 → 设备 → 关联桌面设备」扫描机器人发来的二维码。
-3. **登录微信**：Telegram 登录后机器人会自动发起微信登录——若已绑定手机信任登录，会直接向手机微信推送确认请求，在手机上点「登录」即可（也可点按钮「📷 改用扫码登录」）；首次或需要扫码时机器人会发送微信登录二维码。看到「✅ 微信已登录」即部署完成；后续若微信掉线，通知消息也会自带一键重登按钮。
+### 第三步：在机器人内完成配对与登录
 
-#### 话题模式（`BRIDGE_MODE=topics`）的登录与设置
+根据你选择的 `BRIDGE_MODE`，在 Telegram 中私聊你的机器人完成后续步骤：
 
-1. **配对**：同上，私聊机器人发送 `/login 配对码`。话题模式只用机器人，配对后**不需要登录 Telegram 账号**，发配对码的人就是桥接的主人（从群模式切换过来时自动沿用原账号，无需重新配对）。
-2. **准备话题群**：新建一个 Telegram 群 → 群设置里开启「话题」(Topics) → 把机器人拉进群并设为**管理员**，勾选「**管理话题**」权限（机器人必须是管理员才能看到你在群里发的消息）。
-3. **指定话题群**：在该群里发送 `/forum`（或在 `.env` 中设置 `TG_FORUM_CHAT=-100...` 固定）。之后每个微信会话收到新消息时会自动建一个话题；私聊机器人 `/open` 可主动新建话题，在某个话题里发 `/link` 可把该话题绑定到指定微信会话。
-4. **登录微信**：同上。
+#### 方式 A：群组模式（`BRIDGE_MODE=groups`，默认）
 
-> 话题被删除后，下一条微信消息会自动重建话题。在「General」话题里发的普通消息不会转发到微信。
+1. **安全配对**：向机器人发送 `/login 配对码`（仅能查看服务器日志的人可完成配对）。
+2. **登录个人 Telegram 账号**（二选一，可随时点击按钮切换）：
+   - **💬 验证码登录（单设备推荐）**：
+     1. 点击底部「**📱 一键使用当前手机号**」按钮授权号码（或手动输入带国家码的手机号，如 `+8613800000000`）。
+     2. 收到验证码后，直接在机器人消息下方的**内联数字键盘**上逐位点按并点击「**✅ 确认登录**」——全程不通过聊天框发送明文验证码，防止被 Telegram 判定为验证码泄露而强制注销。
+     3. 若开启了两步验证（2FA），按提示发送密码（机器人验证后会立即自动删掉你的密码消息）。
+   - **📷 扫码登录**：适合已在电脑版或网页版打开该对话的场景，使用手机 Telegram「设置 → 设备 → 关联桌面设备」扫描机器人发出的二维码。
+3. **登录微信**：
+   - Telegram 登录成功后，机器人会自动请求微信登录。
+   - 若此前已登录过，会优先向手机微信推送**免扫码确认请求**，在手机上点击「登录」即可（也可点击「📷 改用扫码登录」）；首次登录则会直接将微信二维码图片发到对话中。
+   - 看到「**✅ 微信已登录**」即代表部署完成！后续若微信意外掉线，机器人推送的通知中也会自带一键重登按钮。
 
-> **手机确认/扫码卡住提示**：部分微信设备确认登录需要手机直连服务器 TCP `8050-8100` 端口；若在手机点确认后久未响应（约 90 秒后机器人也会自动提醒），可临时在 VPS 安全组/防火墙放行该端口段，登录成功后再关闭。
+#### 方式 B：话题模式（`BRIDGE_MODE=topics`）
 
+1. **安全配对**：向机器人发送 `/login 配对码`。话题模式无需登录个人 Telegram 账号，发送配对码的用户即自动成为桥接主人（若从群组模式切换而来，会自动沿用原账号，无需重新配对）。
+2. **配置话题群**：
+   1. 新建一个 Telegram 群组，在群设置中开启「**话题 (Topics)**」。
+   2. 将你的机器人拉入群中并设为**管理员**，确保勾选「**管理话题 (Manage Topics)**」权限（机器人必须是管理员才能接收群内普通消息并创建话题）。
+   3. 在该群内发送 `/forum`（或在 `.env` 中设置 `TG_FORUM_CHAT=-100...` 固定）。
+3. **登录微信**：同上，按机器人提示在手机确认或扫码登录微信。
 
-### 4. 在 Telegram 接听微信通话（可选）
-
-来电通知下方会多一个「**📞 接听**」按钮：点开是一个通话网页（Telegram Mini App），点「接听」后用手机/电脑麦克风和对方通话，可静音、挂断；群语音通话邀请会显示「**🎧 加入**」。不配置时只保留「📵 拒接」。
-
-浏览器只允许 **HTTPS** 页面使用麦克风，所以需要一个域名，把 HTTPS 流量转到通话页面（它只监听本机 `127.0.0.1:8780`）。下面第 1、2 步二选一：**自建反向代理**，或者 **Cloudflare Tunnel**。
-
-1. **域名**：添加一条 DNS 记录，例如 `call.example.com` → VPS 公网 IP，并在防火墙放行 `80`/`443`。（用 Cloudflare Tunnel 时跳过这一步，见下方）
-2. **反向代理**：以 [Caddy](https://caddyserver.com/) 为例（自动申请证书，WebSocket 无需额外配置）：
-   ```text
-   call.example.com {
-       reverse_proxy 127.0.0.1:8780
-   }
-   ```
-   nginx 需要额外转发 WebSocket（`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`），并把 `proxy_read_timeout` 调到 `3600s`。也可以用子路径，例如 `https://example.com/wxcall`（代理时保留路径前缀）。
-
-   **或者用 Cloudflare Tunnel**（域名托管在 Cloudflare 即可；VPS 不用开放任何端口、不用装证书，Compose 里已带可选的 `cloudflared` 服务）：
-   1. 打开 Cloudflare 控制台 → **Zero Trust → Networks → Tunnels → Create a tunnel**，类型选 **Cloudflared**，起个名字后复制安装命令里的 token（`eyJ...` 那一长串）。
-   2. 在该隧道的 **Public Hostname** 里添加：子域名 `call`、域名 `example.com`，Service 选 `HTTP`，URL 填 `127.0.0.1:8780`。DNS 记录会自动创建。
-   3. 在 `.env` 中设置：
-      ```bash
-      COMPOSE_PROFILES=cloudflare
-      CF_TUNNEL_TOKEN=eyJ...
-      ```
-      然后 `docker compose up -d cloudflared`，隧道状态变成 **HEALTHY** 即可。
-
-   注意：不要给这个子域名开 Cloudflare Access 登录、Bot Fight Mode 或质询页面，否则 Mini App 打不开或 WebSocket 连不上；不要用 `trycloudflare.com` 临时隧道（每次重启地址都会变）。音频经 Cloudflare 中转，延迟会比直连略高一些。
-3. **启用**：在 `.env` 中设置 `CALL_WEB_URL=https://call.example.com`，然后 `docker compose up -d --no-deps telegram-bridge`。
-4. **（推荐）注册为 Mini App**：找 [@BotFather](https://t.me/BotFather) 发 `/newapp`，选择你的机器人，Web App URL 填上面的地址，记下短名称（如 `call`），再在 `.env` 中设置 `CALL_WEB_APP=call` 并重启。这样「接听」按钮会直接在 Telegram 内以 Mini App 打开，并校验 Telegram 身份（只有桥接账号本人能接听）。不注册时按钮是普通链接，会用 Telegram 内置浏览器打开，凭链接里的一次性随机令牌鉴权。
-
-使用说明与限制：
-
-- 首次接听时需允许 Telegram / 浏览器使用麦克风；如果 Mini App 里无法使用麦克风，页面会提示「在浏览器中打开」。
-- 建议戴耳机，避免外放回声。通话中请保持页面在前台：关掉页面后 20 秒内重新打开（通知里的「🎧 通话界面」按钮）可以继续通话，否则自动挂断；也可以直接点通知里的「📴 挂断」。
-- 只支持语音：视频来电不显示「接听」按钮。上游 `agent-wechat` 单次通话最长 20 分钟。
-- 需要 `call_notifications = true`（默认开启）。
+> [!TIP]
+> **手机点确认后卡住？**
+> 部分微信环境在进行设备确认登录时，需要手机客户端直连服务器的 TCP `8050-8100` 端口。若在手机微信点击「登录」后久未响应（约 90 秒后机器人也会自动提示），请在 VPS 防火墙/安全组中临时放行 TCP `8050-8100` 端口，登录成功后再关闭即可。
 
 ---
 
-## 日常维护与更新
+## 日常使用与机器人命令
 
-### 只更新 `telegram-bridge`（保持微信不断线）
+### 实用聊天技巧
 
-由于 [compose.yaml](compose.yaml) 中 `telegram-bridge` 对 `agent-wechat` 有 `depends_on` 依赖，更新桥接镜像时请务必加上 `--no-deps`，这样不会重启 `agent-wechat`：
+- **引用回复**：在 Telegram 中长按/右键**回复**某条消息，发到微信即为引用回复。
+- **群内 `@` 提醒**：在群内发送 `@群成员名称` 或 `@所有人` / `@all` 即可触发微信原生 `@` 提醒；不确定成员名字时可发 `/members` 点按复制。
+- **撤回微信消息**：在消息发出 **2 分钟内**，直接在 Telegram **删除该单条消息**，或回复该消息发送 `/recall`，即可同步撤回微信端的消息。
+- **发送不进微信的备注**：以 `//` 开头的消息（例如 `// 稍后跟进`）只会留在 Telegram 群/话题中，不会转发到微信。
+- **发送无损原图**：直接发图或勾选「**作为文件发送**」的静态图片（≤ 25 MB），到达微信端均会作为高清原图展示。
 
-- **拉取 GitHub Actions 构建好的最新镜像**：
+### 机器人命令速查
+
+机器人启动时会自动向 Telegram 注册斜杠 `/` 菜单（私聊与群聊菜单独立展示，无需手动前往 `@BotFather` 配置）。
+
+#### 私聊机器人命令
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `/find [关键词]` | 搜索微信联系人与微信群（不填关键词则列出最近会话，可点击按钮直接创建群/话题） |
+| `/open [关键词]` | 为指定微信联系人或群聊新建 Telegram 群/话题并主动发起会话 |
+| `/chats [关键词]` | 查看当前已绑定的所有微信会话列表（别名 `/list`） |
+| `/link [关键词]` | 交互式点选绑定现有的 Telegram 群与微信会话（仅 `groups` 模式；也支持 `/link 微信ID TG群ID`） |
+| `/status` | 查看桥接运行时长、收发统计、已绑定会话数与微信在线状态 |
+| `/wxlogin` | 手动触发微信重新登录（支持手机确认或扫码） |
+| `/help` | 查看完整使用指南 |
+
+#### 桥接群 / 话题内命令
+
+| 命令 | 适用模式 | 说明 |
+| :--- | :---: | :--- |
+| `/wx` | 通用 | 查看当前群/话题绑定的微信名称与原始会话 ID |
+| `/members [关键词]` | 通用 | 列出当前微信群成员，点击代码块即可复制 `@名字`（别名 `/at`） |
+| `/recall` | 通用 | 回复自己发出的某条消息并发送此命令，撤回对应微信消息（2 分钟内有效） |
+| `/rename` | 通用 | 重新拉取最新微信备注名/群名并更新到当前群/话题标题（别名 `/title`） |
+| `/link [关键词]` | 通用 | 将当前群或当前话题绑定（或改绑）到指定的微信会话 |
+| `/unlink` | 通用 | 解除当前群或当前话题与微信会话的绑定 |
+| `/avatar` | 仅 `groups` | 重新拉取微信头像并同步为当前 Telegram 群头像 |
+| `/forum` | 仅 `topics` | 将当前开启了话题的超级群设为桥接主群 |
+| `/help` | 通用 | 查看群内命令帮助 |
+
+> **话题模式补充说明**：在话题群的 `General` 主话题中发送的普通聊天消息不会转发到微信；若某个子话题被手动删除，当该微信会话收到下一条消息时会自动重建新话题。
+
+---
+
+## 在 Telegram 接听微信语音通话（可选）
+
+默认情况下，收到微信语音/视频来电或群语音邀请时，对应群/话题会收到实时通知并提供「**📵 拒接**」按钮。
+
+如果进一步为通话服务（默认仅监听本机 `127.0.0.1:8780`）配置一个公网 **HTTPS** 地址，来电通知下方会额外出现「**📞 接听**」（单聊语音）或「**🎧 加入**」（群语音）按钮，点开即可通过 Telegram Mini App 网页使用手机/电脑麦克风与微信端实时通话。
+
+> 由于浏览器安全策略仅允许在 **HTTPS** 页面下调用麦克风，请选择以下**方案一**或**方案二**配置 HTTPS 接入：
+
+### 方案一：使用内置 Cloudflare Tunnel（免开公网端口、免配证书，推荐）
+
+只需拥有一个托管在 Cloudflare 的域名，VPS 无需开放任何入站端口，也无需安装 Caddy/Nginx：
+
+1. 登录 Cloudflare 控制台 → 进入 **Zero Trust → Networks → Tunnels** → 点击 **Create a tunnel**，类型选择 **Cloudflared**，命名后复制安装命令中的 Token（以 `eyJ...` 开头的长字符串）。
+2. 在该隧道的 **Public Hostname** 标签页添加一条记录：
+   - **Subdomain**：例如 `call`
+   - **Domain**：选择你的域名（如 `example.com`）
+   - **Service Type**：选择 `HTTP`，**URL** 填写 `127.0.0.1:8780`
+3. 在项目的 `.env` 文件中添加：
+   ```ini
+   CALL_WEB_URL=https://call.example.com
+   COMPOSE_PROFILES=cloudflare
+   CF_TUNNEL_TOKEN=eyJ...
+   ```
+4. 启动并应用配置：
+   ```bash
+   docker compose up -d cloudflared
+   docker compose up -d --no-deps telegram-bridge
+   ```
+
+> [!WARNING]
+> 请勿对该子域名启用 Cloudflare Access 访问鉴权、Bot Fight Mode 或交互式质询页面，否则会导致 Mini App 无法加载或音频 WebSocket 连接失败；也不要使用每次重启都会变更域名的 `trycloudflare.com` 临时隧道。
+
+### 方案二：使用自建反向代理（Caddy / Nginx）
+
+1. 将域名（如 `call.example.com`）解析至 VPS 公网 IP，并在防火墙放行 `80` / `443` 端口。
+2. 配置反向代理转发至 `127.0.0.1:8780`：
+   - **Caddy 配置示例**（自动签发证书并原生支持 WebSocket）：
+     ```caddyfile
+     call.example.com {
+         reverse_proxy 127.0.0.1:8780
+     }
+     ```
+   - **Nginx 注意事项**：需显式开启 WebSocket 升级头（`proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`）并将 `proxy_read_timeout` 调大至 `3600s`。支持挂载在子路径下（如 `https://example.com/wxcall`，转发时需保留路径前缀）。
+3. 在 `.env` 中设置 `CALL_WEB_URL=https://call.example.com`，并执行 `docker compose up -d --no-deps telegram-bridge`。
+
+### 注册为 Telegram Mini App（推荐）
+
+配置好 `CALL_WEB_URL` 后，推荐在 [@BotFather](https://t.me/BotFather) 处注册 Mini App，以获得最佳的内嵌打开体验与双重身份校验：
+
+1. 私聊 `@BotFather` 发送 `/newapp`，选择你的机器人，按提示填写标题与简介，**Web App URL** 填入你的 `CALL_WEB_URL`（如 `https://call.example.com`），最后设置一个短名称（short name，例如 `call`）。
+2. 在 `.env` 中填入该短名称并重启桥接容器：
+   ```ini
+   CALL_WEB_APP=call
+   ```
+   ```bash
+   docker compose up -d --no-deps telegram-bridge
+   ```
+- **注册后**：「📞 接听」按钮会直接在 Telegram 内以原生 Mini App 弹出，并额外通过 Telegram 签名校验访问者是否为桥接主人本人。
+- **不注册时**：「📞 接听」按钮作为普通链接在内置浏览器中打开，依靠链接内的一次性高强度随机令牌进行鉴权。
+
+### 通话使用说明与限制
+
+- **麦克风权限**：首次接听时需授权 Telegram 或浏览器使用麦克风；若部分客户端内置 WebView 不支持麦克风采集，页面会自动提示「在浏览器中打开」。
+- **前后台保持**：建议佩戴耳机以避免外放回声。通话期间请保持页面处于前台；若意外关闭页面，**20 秒内**通过来电消息上的「🎧 通话界面」按钮重新进入即可无缝恢复通话，超过 20 秒未连接页面则自动挂断（也可直接点击消息下方的「📴 挂断」按钮）。
+- **上游限制**：目前仅支持**语音通话**（视频来电仅支持通知与一键拒接），不支持从 Telegram 主动发起呼叫；受上游 `agent-wechat` 限制，单次通话最长持续 20 分钟。
+
+---
+
+## 配置说明
+
+本项目的配置分为两层：**环境变量（`.env`）** 与可选的 **高级配置文件（`config/config.toml`）**。同名配置项下，环境变量优先级高于 `config.toml`。
+
+### 环境变量（`.env`）
+
+| 变量名 | 必填 | 默认值 | 说明 |
+| :--- | :---: | :--- | :--- |
+| `TG_API_ID` | 是 | — | Telegram API ID（在 `my.telegram.org` 申请） |
+| `TG_API_HASH` | 是 | — | Telegram API Hash |
+| `TG_BOT_TOKEN` | 是 | — | Telegram 机器人 Token（在 `@BotFather` 申请） |
+| `TG_PROXY` | 否 | 空 | 连接 Telegram 的代理地址，如 `socks5://127.0.0.1:7890`（海外 VPS 留空） |
+| `BRIDGE_MODE` | 否 | `groups` | 运行模式：`groups`（一会话一群）或 `topics`（单群多话题） |
+| `TG_FORUM_CHAT` | 否 | `0` | `topics` 模式下的话题群 ID（`-100...`），留空可在群内发 `/forum` 指定 |
+| `CALL_WEB_URL` | 否 | 空 | 微信语音接听页面的公网 HTTPS 地址，留空则关闭网页接听 |
+| `CALL_WEB_LISTEN` | 否 | `127.0.0.1:8780` | 语音接听页面在容器/宿主机本机监听的地址与端口 |
+| `CALL_WEB_APP` | 否 | 空 | `@BotFather` `/newapp` 注册的 Mini App 短名称 |
+| `COMPOSE_PROFILES` | 否 | 空 | 设为 `cloudflare` 时随 Compose 启动内置的 `cloudflared` 隧道容器 |
+| `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
+| `AGENT_WECHAT_VERSION` | 否 | `v2.6.0` | 上游 `agent-wechat` 镜像版本标签 |
+
+### 高级配置（`config/config.toml`）
+
+如需微调桥接行为，可将模板复制为 `config/config.toml` 并按需修改，修改后执行 `docker compose restart telegram-bridge` 生效：
+
+```bash
+cp config.example.toml config/config.toml
+```
+
+| 配置项 (`[bridge]`) | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `title_direct` | `"{name}"` | 微信私聊对应的群名/话题名模板（`{name}` 为微信备注或昵称） |
+| `title_group` | `"👥 {name}"` | 微信群聊对应的群名/话题名模板 |
+| `bridge_groups` | `true` | 是否桥接微信群聊消息 |
+| `bridge_official_accounts` | `false` | 是否桥接微信公众号/服务号推送 |
+| `forward_outgoing` | `true` | 是否将你在手机/电脑微信上发出的消息同步到 Telegram |
+| `outgoing_silent` | `true` | 同步手机端自发消息时是否静音发送（不触发 Telegram 通知） |
+| `sync_avatar` | `true` | 自动建群时是否将微信头像设为 Telegram 群头像（仅 `groups` 模式有效） |
+| `mark_read_on_reply` | `true` | 在 Telegram 回复消息后，是否自动将该微信会话标记为已读 |
+| `create_interval_seconds` | `20` | 两次自动建群之间的最小间隔秒数，防止触发 Telegram 限流 |
+| `max_media_mb` | `200` | 单个媒体文件的收发体积上限（MB） |
+| `call_notifications` | `true` | 是否推送微信语音/视频来电通知与一键拒接按钮 |
+| `link_card_images` | `true` | 是否将微信分享链接渲染为横向图文卡片 |
+| `gif_as_sticker` | `true` | 是否将 Telegram 发送的 GIF 动图转为微信原生表情发送 |
+| `skip_threads` | `["weixin"]` | 忽略不桥接的微信会话 ID 列表（如 `["filehelper", "weixin"]`） |
+
+---
+
+## 运维与数据管理
+
+### 无感更新 `telegram-bridge`（保持微信不断线）
+
+在 [compose.yaml](compose.yaml) 中，`telegram-bridge` 声明了对 `agent-wechat` 的启动依赖。日常更新桥接程序时，**请务必带上 `--no-deps` 参数**，这样只会重建桥接容器，不会重启 `agent-wechat`，从而保证微信登录态与长连接完全不中断：
+
+- **拉取预构建的最新镜像更新**：
   ```bash
   docker compose pull telegram-bridge
   docker compose up -d --no-deps telegram-bridge
   ```
-- **或直接在服务器拉代码本地重新构建**：
+- **或者拉取最新源码在本地重新构建**：
   ```bash
   git pull
   docker compose up -d --no-deps --build telegram-bridge
   ```
 
-### 其他常用操作
+### 常用运维命令
 
-| 操作 | 命令 |
-|---|---|
-| 查看桥接日志 | `docker compose logs -f --tail 100 telegram-bridge` |
-| 查看微信守护进程日志 | `docker compose logs -f agent-wechat` |
-| 清理旧镜像 | `docker image prune -f` |
-| 停止服务 | `docker compose down`（数据保存在 `./data/` 中不会丢失） |
-| 指定桥接镜像版本 | 在 `.env` 中设置 `BRIDGE_IMAGE=ghcr.io/speedupmaster/wechat-telegram-bridge:sha-xxxxxxx` |
-| 更新 `agent-wechat` | 在 `.env` 中修改 `AGENT_WECHAT_VERSION=v2.x.x`，再 `docker compose pull agent-wechat && docker compose up -d` |
-| 高级配置 | `cp config.example.toml config/config.toml`，按需修改后执行 `docker compose restart telegram-bridge` |
-| 更换 Telegram 账号 | `docker compose down`，删除 `data/bridge-data/`，重新 `docker compose up -d` 并配对 |
+| 操作场景 | 执行命令 |
+| :--- | :--- |
+| 查看桥接实时日志 | `docker compose logs -f --tail 100 telegram-bridge` |
+| 查看微信守护进程日志 | `docker compose logs -f --tail 100 agent-wechat` |
+| 停止所有服务 | `docker compose down`（持久化数据保存在 `./data/` 中不会丢失） |
+| 升级 `agent-wechat` 版本 | 修改 `.env` 中的 `AGENT_WECHAT_VERSION` 后执行 `docker compose pull agent-wechat && docker compose up -d` |
+| 更换绑定的 Telegram 账号 | `docker compose down` → `rm -rf data/bridge-data/` → `docker compose up -d` 并重新配对 |
+| 清理无用旧镜像 | `docker image prune -f` |
 
-### 数据目录与备份
+### 持久化目录与备份建议
 
-所有持久化状态均以 bind mount 保存在项目下的 `./data/` 目录中（已加入 `.gitignore`）：
+所有运行状态均通过 Bind Mount 保存在项目根目录下的 `./data/` 中（已加入 `.gitignore`）：
 
-- **建议定期备份**：`.env`、`config/`、`data/bridge-data`（含 Telegram `user.session` 与绑定数据库 `bridge.db`）、`data/wechat-data`（微信登录态）、`data/wechat-token`。
-- **无需备份**：`data/wechat-config`（每次启动由 `token-init` 自动重写）、`data/wechat-scratch`（临时缓存）。
+| 路径 | 建议备份 | 内容说明 |
+| :--- | :---: | :--- |
+| `.env` 与 `config/` | **是** | 环境变量密钥与自定义高级配置 |
+| `data/bridge-data/` | **是** | SQLite 数据库 `bridge.db`（会话绑定、话题映射、消息 ID 映射、事件游标）及 Telegram 登录会话 `user.session` |
+| `data/wechat-data/` | **是** | `agent-wechat` 持久化的微信设备信息与登录态 |
+| `data/wechat-token/` | **是** | 容器间通信的守护进程 API Token |
+| `data/wechat-config/` | 否 | 每次启动时由 `token-init` 自动生成的守护进程配置文件 |
+| `data/wechat-scratch/` | 否 | 微信媒体与表情处理的临时缓存目录 |
 
 ---
 
-## 本地运行（不用 Docker）
+## 本地运行与开发
 
-要求 Python 3.11+、运行中的 `agent-wechat`（`wx serve`），推荐安装 [ffmpeg](https://ffmpeg.org/) 以支持语音条与动态贴纸转码。
+如果不使用 Docker，也可以直接在宿主机运行 `telegram-bridge`（需自行启动 `agent-wechat` 的 `wx serve` 守护进程）。
+
+### 环境要求
+- **Python 3.11+**
+- 运行中的 `agent-wechat`（默认监听 `http://127.0.0.1:6174`）
+- 推荐安装系统级依赖：`ffmpeg` 与 `gifsicle`（用于语音条转码与动态贴纸转换优化）、中文字体与 Emoji 字体（如 `fonts-noto-cjk`、`fonts-noto-color-emoji`，用于渲染分享卡片）
+
+### 启动与测试
 
 ```bash
+# 1. 创建虚拟环境并安装依赖
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
 
-通过环境变量（或 `config.toml`）提供 `TG_API_ID`、`TG_API_HASH`、`TG_BOT_TOKEN`、`WECHAT_TOKEN`（或 `WECHAT_TOKEN_FILE`），国内网络可加 `TG_PROXY=socks5://127.0.0.1:7890`，然后启动：
+# 2. 配置环境变量（或复制 config.example.toml 为 config.toml 填写）
+export TG_API_ID=123456
+export TG_API_HASH="your_api_hash"
+export TG_BOT_TOKEN="123456:ABC-DEF..."
+export WECHAT_TOKEN="your_agent_wechat_token"
 
-```bash
+# 3. 启动桥接服务（加 -v 可输出详细调试日志）
 python -m bridge
-```
 
-运行全部单元测试：
-
-```bash
+# 4. 运行离线单元测试套件
 python -m unittest discover -s tests -v
 ```
 
----
-
-## 项目结构
+### 项目结构
 
 ```text
-bridge/
-  __main__.py   程序入口（python -m bridge [config.toml]）
-  config.py     环境变量与可选 config.toml 配置加载
-  login.py      Bot 内引导登录（配对码、Telegram 内联键盘验证码/扫码登录、微信确认/扫码与一键重登）
-  wechat.py     agent-wechat HTTP / SSE 客户端与群成员/媒体接口封装
-  core.py       双向桥接主逻辑、链接卡片/视频号/话题/表情渲染、@提及解析、机器人命令与菜单注册
-  callweb.py    在 Telegram Mini App 网页中接听微信通话（aiohttp 页面 + 通话音频中转）
-  cards.py      微信分享链接横向图文卡片生成与平台品牌识别（基于 Pillow）
-  stickers.py   Telegram 贴纸转微信图片/短视频（基于 Pillow / ffmpeg）
-  store.py      SQLite 持久化（事件游标、会话映射、消息映射）
-tests/          基于模拟客户端的离线单元测试
-Dockerfile      桥接服务镜像构建文件（内置 ffmpeg）
-compose.yaml    token-init + agent-wechat + telegram-bridge 编排文件
-setup.sh        VPS 一键初始化脚本
-config.example.toml  高级配置模板
+.
+├── bridge/
+│   ├── __main__.py        # CLI 入口（python -m bridge [config.toml] [-v]）
+│   ├── config.py          # 环境变量与 config.toml 配置解析及校验
+│   ├── core.py            # 双向桥接核心逻辑、消息转换、@提及解析、命令与菜单注册
+│   ├── login.py           # Bot 交互式引导配对、Telegram 内联键盘/扫码登录、微信重登逻辑
+│   ├── wechat.py          # agent-wechat HTTP/SSE 异步客户端、流式媒体下载与断点续传
+│   ├── callweb.py         # Telegram Mini App 微信语音通话页面与实时 PCM 音频 WebSocket 中转
+│   ├── cards.py           # 微信链接分享横向图文卡片渲染与平台品牌识别（基于 Pillow）
+│   ├── stickers.py        # Telegram 贴纸与微信原生表情双向转换及缓存（基于 Pillow / ffmpeg / rlottie）
+│   └── store.py           # SQLite 状态存储（事件游标、群组/话题映射、双向消息 ID 映射）
+├── tests/                 # 基于 Mock 客户端的完整离线单元测试
+├── compose.yaml           # Docker Compose 编排（token-init + agent-wechat + telegram-bridge + cloudflared）
+├── Dockerfile             # 桥接服务镜像构建文件（内置 ffmpeg、gifsicle 与 Noto CJK/Emoji 字体）
+├── setup.sh               # VPS 一键交互式初始化与启动脚本
+├── .env.example           # 环境变量模板
+└── config.example.toml    # 高级配置模板
 ```
 
 ---
 
-## 注意事项与常见问题
+## 常见问题 (FAQ)
 
-- **微信风控提示**：`agent-wechat` 属于非官方协议客户端，登录时会显示为新设备，请勿用于高频群发或营销，建议先用测试账号验证。
-- **Telegram 建群限流**：短时间批量新建群组会触发 `FLOOD_WAIT`，程序会自动等待；可通过 `config.toml` 中的 `create_interval_seconds`（默认 `20` 秒）控制间隔。默认创建的是普通群（不占用 500 个超级群上限），若你手动升级为超级群，桥接会自动迁移群 ID。
-- **为什么只转发新消息**：首次启动会记录当前事件游标，不会把历史微信消息灌入 Telegram。
-- **找不到配对码 / 配对失效**：执行 `docker compose logs telegram-bridge | grep "PAIRING CODE"`；容器重启会生成新配对码，连续输错 10 次将锁定，重启容器即可刷新。
-- **提示 `needs_review`**：表示微信侧发送状态未确认，请在手机微信上核对是否发出，避免重复发送。
-- **微信表情显示 `[表情，无法获取：…]`**：加密/部分自定义表情没有可下载 CDN 地址，属于 `agent-wechat` 协议限制；可以在日志中看到具体原因。
-- **开启详细调试日志**：在 `compose.yaml` 的 `telegram-bridge` 下加 `command: ["-v"]`，或本地运行 `python -m bridge -v`。
+<details>
+<summary><b>1. 微信账号有什么安全注意事项？</b></summary>
+
+`agent-wechat` 属于非官方协议客户端，首次登录在微信设备管理中会显示为新设备登录。建议仅用于个人日常消息收发，切勿用于高频群发、自动拉群或营销行为；初次使用可先用小号验证稳定性。
+</details>
+
+<details>
+<summary><b>2. 为什么首次启动后没有同步之前的微信历史消息？</b></summary>
+
+为了避免首次启动时将成百上千条旧消息瞬间灌入 Telegram 触发建群限流，桥接在初次连接时会记录当前最新的事件游标（Cursor），仅从启动时刻起转发新收到的消息。若你想主动找某个尚未发来新消息的联系人聊天，私聊机器人发送 `/find` 或 `/open` 即可。
+</details>
+
+<details>
+<summary><b>3. 自动建群会触发 Telegram 频率限制或达到群上限吗？</b></summary>
+
+- **频率限制**：短时间内新建大量群组可能触发 Telegram 的 `FLOOD_WAIT`，程序内置了自动等待重试以及 `create_interval_seconds = 20`（默认每 20 秒最多建一个群）的限速保护。
+- **群数量上限**：桥接在 `groups` 模式下默认创建的是 Telegram **普通群（Basic Group）**，不占用账号 500 个超级群/频道的上限；如果你手动将某个普通群升级为超级群（Supergroup），桥接会自动捕获迁移事件并无缝更新数据库中的群 ID。
+- 如果你的微信群非常多、不想创建大量群组，推荐将 `BRIDGE_MODE` 设为 `topics` 使用话题模式。
+</details>
+
+<details>
+<summary><b>4. 找不到配对码，或者配对码输错多次被锁定怎么办？</b></summary>
+
+- 查看当前配对码：`docker compose logs telegram-bridge | grep "PAIRING CODE"`
+- 为防止暴力枚举，配对码连续输错 10 次后将自动锁定。执行 `docker compose restart telegram-bridge` 重启容器即可生成新的配对码。
+</details>
+
+<details>
+<summary><b>5. 发送消息后机器人提示 <code>needs_review</code> 是什么意思？</b></summary>
+
+表示 `agent-wechat` 守护进程已提交该发送请求，但未在预期时间内收到微信服务器的明确回执。为防止自动重试导致在微信里重复发送，桥接会提示你打开手机微信核对该条消息是否已发出。
+</details>
+
+<details>
+<summary><b>6. 为什么个别微信表情显示为静态图或提示 <code>[表情，无法获取：…]</code>？</b></summary>
+
+- **WXGF 动图表情**：受限于上游 `agent-wechat` 目前仅对 WXGF 编码表情提供单帧预览解码，这类表情转发到 Telegram 时会作为高清静态贴纸展示（普通 GIF 微信表情则为动态贴纸）。
+- **无法获取的表情**：极少数商城加密表情或特殊自定义表情在微信消息体中不携带可下载的 CDN 链接，属于上游协议限制。
+</details>
+
+<details>
+<summary><b>7. 如何开启 Debug 级别的详细日志？</b></summary>
+
+在 `compose.yaml` 的 `telegram-bridge` 服务下添加 `command: ["-v"]` 并执行 `docker compose up -d --no-deps telegram-bridge`，或本地运行时使用 `python -m bridge -v`。
+</details>
