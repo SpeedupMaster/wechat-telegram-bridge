@@ -656,13 +656,20 @@ class CallWeb:
                 st.update(title="微信群语音通话" if conf else "微信语音通话", name=req.get("name") or "",
                           status=req.get("status_text") or "", group=conf)
                 if req.get("live"):
+                    # The request's own status is the Telegram card's instruction; the page says it its own way.
                     st["phase"] = "dial"
                     if conf:
                         n = len(req.get("selected") or ())
-                        st["status"] = f"将邀请 {n} 人" if n else "请先在 Telegram 消息里勾选要邀请的成员"
+                        st["status"] = f"将邀请 {n} 人" if n else "尚未选择成员"
                         st["dialable"] = self.can_dial(True) and 0 < n <= MAX_INVITEES
+                        st["note"] = ("当前 agent-wechat 不支持发起群语音通话" if not self.can_dial(True)
+                                      else "点击「呼叫」并允许使用麦克风后发起群通话" if st["dialable"]
+                                      else "请回到 Telegram 消息里勾选要邀请的成员")
                     else:
+                        st["status"] = "准备就绪"
                         st["dialable"] = self.can_dial()
+                        st["note"] = ("点击「呼叫」并允许使用麦克风后才会拨出" if st["dialable"]
+                                      else "当前 agent-wechat 不支持发起微信语音通话")
             return st
         if kind == "invite":
             inv = self.bridge._conf_invites.get(ref)
@@ -992,8 +999,9 @@ opacity:0;pointer-events:none}
 .ended .avatar{filter:grayscale(.85);opacity:.7;box-shadow:none}
 .title{font-size:14px;color:var(--hint);letter-spacing:.5px}
 .name{font-size:28px;font-weight:600;line-height:1.25;max-width:100%;overflow-wrap:anywhere}
-.status{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;
-background:rgba(255,255,255,.07);font-size:14px;color:#c9ccd2;min-height:32px;max-width:100%}
+.status{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:16px;
+background:rgba(255,255,255,.07);font-size:14px;line-height:20px;color:#c9ccd2;min-height:32px;max-width:100%;
+text-align:left}
 .status:empty{visibility:hidden}
 .dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--gray)}
 .tone-ring .dot{background:var(--amber);animation:blink 1s ease-in-out infinite}
@@ -1297,6 +1305,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     if (p === 'ringing' || p === 'invite' || p === 'calling') tone = 'ring';
     else if (p === 'connecting') tone = 'wait';
     else if (p === 'active') tone = st.elapsed != null ? 'live' : 'wait';
+    else if (p === 'dial' && st.dialable) tone = 'live';
+    $('timer').hidden = p === 'dial';  // nothing to time yet: keep the hint right under the status
     if (p === 'invite' && st.caller) text = '发起人：' + st.caller + ' · ' + text;
     if (pending && PENDING_TEXT[pending.action]) {
       text = pending.action === 'hangup' && p === 'calling' ? '正在取消…' : PENDING_TEXT[pending.action];
@@ -1324,7 +1334,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       else if (!$('hint').textContent) hint('当前 agent-wechat 不支持加入群语音通话');
     } else if (p === 'dial') {
       if (st.dialable) a.appendChild(button('green', ICON.phone, '呼叫', () => withAudio('dial'), 'dial'));
-      else if (!$('hint').textContent) hint('当前 agent-wechat 不支持发起微信语音通话');
+      if (!$('hint').classList.contains('err')) hint(st.note || '');
     } else if (p === 'calling') {
       if (!st.mine) a.appendChild(button('green', ICON.headset, '切换到此设备', () => withAudio('attach'), 'attach'));
       a.appendChild(button('red', ICON.hangup, '取消', () => act('hangup'), 'hangup'));

@@ -2462,6 +2462,8 @@ class Bridge(ContactsMixin, LoginMixin):
     # ---------------------------------------------------------------- outgoing calls (/call)
     def _dial_unavailable(self, thread_id: str) -> str:
         conf = thread_id.endswith("@chatroom")
+        if thread_id == "filehelper" or thread_id.startswith("gh_"):
+            return "文件传输助手和公众号不能接听微信电话。"
         if self.call_web is None:
             return ("没有配置通话页面（<code>CALL_WEB_URL</code>），无法在 Telegram 打微信电话。"
                     "配置方法见 README「在 Telegram 接听与拨打微信语音通话」。")

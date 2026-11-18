@@ -5017,6 +5017,11 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         await self.b.on_tg_message(tg_event(-701, 10, "/call"))
         self.assertIn("不支持发起微信群语音通话", self.b.bot.sent[-1].text)  # no conferenceCreate
 
+        self.daemon.add_thread("filehelper", "文件传输助手")
+        self.b.store.link("filehelper", -702, "文件传输助手")
+        await self.b.on_tg_message(tg_event(-702, 10, "/call"))
+        self.assertIn("文件传输助手和公众号不能接听微信电话", self.b.bot.sent[-1].text)
+
         self.b._calls_caps = {}
         await self.b.on_tg_message(tg_event(chat, 11, "/call"))
         self.assertIn("不支持发起微信语音通话", self.b.bot.sent[-1].text)
