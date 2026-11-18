@@ -101,7 +101,7 @@ HELP = (
     "• <code>/link</code> [关键词] — 在任意群内直接发，把当前群绑定到微信会话\n"
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
-    "• <code>/call</code> — 给当前微信好友打语音电话（需配置通话页面）\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
     "• <code>/avatar</code> — 同步微信头像为群头像\n"
@@ -120,7 +120,7 @@ GROUP_HELP = (
     "<b>桥接群命令</b>\n"
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
-    "• <code>/call</code> — 给当前微信好友打语音电话\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
     "• <code>/avatar</code> — 同步微信头像为群头像\n"
@@ -149,7 +149,7 @@ TOPIC_HELP = (
     "• <code>/link</code> [关键词] — 在某个话题里发，把该话题绑定到微信会话\n"
     "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
-    "• <code>/call</code> — 给当前微信好友打语音电话（需配置通话页面）\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
     "• <code>/rename</code> — 同步微信备注/群名为话题标题（别名 <code>/title</code>）\n"
@@ -166,7 +166,7 @@ TOPIC_GROUP_HELP = (
     "<b>话题群命令</b>\n"
     "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
-    "• <code>/call</code> — 给当前微信好友打语音电话\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
     "• <code>/rename</code> — 同步最新微信备注/群名为话题标题（别名 <code>/title</code>）\n"
@@ -203,7 +203,7 @@ PRIVATE_BOT_COMMANDS = [
 GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
     ("contact", "查看好友资料与朋友圈权限"),
-    ("call", "给当前微信好友打语音电话"),
+    ("call", "给好友打微信电话或发起群语音通话"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("recall", "回复消息以撤回微信消息"),
     ("avatar", "同步微信头像到群头像"),
@@ -228,7 +228,7 @@ TOPIC_PRIVATE_BOT_COMMANDS = [
 TOPIC_GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
     ("contact", "查看好友资料与朋友圈权限"),
-    ("call", "给当前微信好友打语音电话"),
+    ("call", "给好友打微信电话或发起群语音通话"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("recall", "回复消息以撤回微信消息"),
     ("rename", "同步最新微信名称到话题标题"),
@@ -620,6 +620,16 @@ def _chunks(text: str, size: int = TG_TEXT_LIMIT) -> list[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
 
+# Group-call member picker: members per page (two per row) and names listed in the message text.
+DIAL_PICK_PAGE = 10
+DIAL_PICK_SHOWN = 12
+
+
+def _short(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def _member_label(m: dict) -> str:
     return (
         m.get("mentionName") or m.get("roomDisplayName") or m.get("displayName") or m.get("nickname") or m.get("id") or ""
@@ -715,6 +725,8 @@ class Bridge(ContactsMixin, LoginMixin):
         self._call_tokens: dict[str, str] = {}
         self._conf_invites: dict[str, dict] = {}
         self._dial_requests: dict[str, dict] = {}  # dial_id -> a /call card (kept after cancel/expiry for its page)
+        self._orphan_invite_results: dict[str, list[dict]] = {}  # call_id -> invitation results seen before the call
+        self._self_wxid: str = self.store.get("self_wxid") or ""
         self._calls_retry_sleep: float = 300.0
         self._calls_client_id: str = ""
         self._calls_caps: dict = {}
@@ -875,6 +887,9 @@ class Bridge(ContactsMixin, LoginMixin):
         if data.startswith(b"dialx:"):
             await self._on_dial_cancel_callback(event, data[6:].decode("utf-8", errors="ignore"))
             return
+        if data.startswith(b"dialp:"):
+            await self._on_dial_pick_callback(event, data[6:].decode("utf-8", errors="ignore"))
+            return
         if data.startswith(b"ui:"):
             await self._on_ui_callback(event, data[3:].decode("utf-8", errors="ignore"))
             return
@@ -983,6 +998,15 @@ class Bridge(ContactsMixin, LoginMixin):
             return False
         return created >= getattr(self, "since", 0) - 60  # small allowance for clock differences
 
+    def _note_self_id(self, sender: str | None, thread_id: str) -> None:
+        """agent-wechat has no "who am I" call: learn our own WeChat ID from the sender of our own messages,
+        so the group-call member picker can leave us out."""
+        sender = (sender or "").strip()
+        if not sender or sender == thread_id or sender.endswith("@chatroom") or sender == self._self_wxid:
+            return
+        self._self_wxid = sender
+        self.store.set("self_wxid", sender)
+
     async def on_wx_message(self, message_id: str, origin: str | None) -> None:
         if self.store.seen_wx_msg(message_id):
             return
@@ -990,6 +1014,7 @@ class Bridge(ContactsMixin, LoginMixin):
         thread_id = msg["threadId"]
         outgoing = msg.get("direction") == "outgoing"
         if outgoing:
+            self._note_self_id(msg.get("senderId"), thread_id)
             # Our own sends from Telegram come back as outgoing messages: drop the echo.
             if self.pending_sends.get(thread_id):
                 asyncio.create_task(self._deferred_outgoing(msg, origin))
@@ -1870,6 +1895,8 @@ class Bridge(ContactsMixin, LoginMixin):
                 await self._on_call_state(call)
         elif etype == "conference.invitations":
             await self._on_conf_invitations(event.get("invitations") or [])
+        elif etype == "call.invitation_result":
+            await self._on_invitation_result(event)
         elif etype == "track.updated":
             if self.call_web is not None:
                 await self.call_web.on_track_updated(event)
@@ -1921,7 +1948,9 @@ class Bridge(ContactsMixin, LoginMixin):
 
     def _render_call(self, entry: dict) -> tuple[str, list | None]:
         outgoing = entry.get("direction") == "outgoing"
-        if entry["kind"] == "conference":
+        if entry["kind"] == "conference" and outgoing:
+            title, who = "📞 <b>微信群语音通话</b>", "群"
+        elif entry["kind"] == "conference":
             title, who = "📞 <b>微信群语音通话</b>", "发起人"
         elif outgoing:
             title, who = "📞 <b>微信语音通话</b>", "呼叫"
@@ -1932,7 +1961,8 @@ class Bridge(ContactsMixin, LoginMixin):
         text = (
             f"{title}\n"
             f"{who}：<b>{_esc(entry['caller_name'])}</b>\n"
-            f"状态：{entry['status_text']}"
+            + self._render_group_progress(entry)
+            + f"状态：{entry['status_text']}"
         )
         rows: list[list] = []
         web = self.call_web
@@ -1947,6 +1977,52 @@ class Bridge(ContactsMixin, LoginMixin):
                 label = "📴 取消呼叫" if outgoing and entry["stage"] in ("dialing", "ringing") else "📴 挂断"
                 rows.append([Button.inline(label, f"callhup:{entry['token']}".encode())])
         return text, rows or None
+
+    @staticmethod
+    def _render_group_progress(entry: dict) -> str:
+        """Extra lines for a group call we started: who was invited, who joined, whose invitation failed."""
+        invitees: dict = entry.get("invitees") or {}
+        if not invitees:
+            return ""
+        names = list(invitees.values())
+        shown = "、".join(_esc(n) for n in names[:DIAL_PICK_SHOWN])
+        more = f" 等 {len(names)} 人" if len(names) > DIAL_PICK_SHOWN else ""
+        out = f"邀请（{len(names)} 人）：{shown}{more}\n"
+        joined = [p for p in entry.get("participants") or [] if p.get("membership") == "joined"
+                  and p.get("contactId") in invitees]
+        if joined:
+            out += f"已加入：{len(joined)} 人\n"
+        failed = entry.get("invite_failed") or {}
+        if failed:
+            out += "邀请异常：" + "、".join(f"{_esc(n)}（{why}）" for n, why in failed.values()) + "\n"
+        return out
+
+    async def _on_invitation_result(self, event: dict) -> None:
+        call_id = event.get("callId") or ""
+        entry = self._active_calls.get(call_id)
+        if entry is None:
+            # The results of a group call we are starting can beat the dial command's own result.
+            if call_id:
+                self._orphan_invite_results.setdefault(call_id, []).append(event)
+                while len(self._orphan_invite_results) > 20:
+                    self._orphan_invite_results.pop(next(iter(self._orphan_invite_results)))
+            return
+        invitees = entry.get("invitees") or {}
+        failed = entry.setdefault("invite_failed", {})
+        for r in event.get("results") or []:
+            cid = r.get("contactId") or ""
+            status = r.get("status")
+            if r.get("verificationRequired"):
+                why = "需要验证"
+            elif status == "rejected":
+                why = "被拒绝"
+            elif status in ("unknown", "uncertain"):
+                why = "结果未知"
+            else:
+                failed.pop(cid, None)
+                continue
+            failed[cid] = (invitees.get(cid) or cid, why)
+        await self._sync_call_msg(entry)
 
     @staticmethod
     def _render_key(text: str, buttons: list | None) -> tuple:
@@ -2060,6 +2136,8 @@ class Bridge(ContactsMixin, LoginMixin):
         """A call we just claimed may have reported its state before we knew about it."""
         if call := self._orphan_call_states.pop(call_id, None):
             await self._on_call_state(call)
+        for ev in self._orphan_invite_results.pop(call_id, []):
+            await self._on_invitation_result(ev)
 
     async def _on_call_state(self, call: dict) -> None:
         call_id = call.get("callId")
@@ -2098,25 +2176,31 @@ class Bridge(ContactsMixin, LoginMixin):
             return
         conf = entry["kind"] == "conference"
         outgoing = entry.get("direction") == "outgoing"
+        group_out = conf and outgoing
+        if group_out and isinstance(call.get("participants"), list):
+            entry["participants"] = call["participants"]
         if state == "offered":
             entry["stage"] = "offered"
             entry["status_text"] = "🔔 响铃中…"
             entry["offered_event"].set()
         elif state in ("dialing", "ringing") and outgoing:
             entry["stage"] = state
-            entry["status_text"] = "📞 正在呼叫…" if state == "dialing" else "🔔 对方响铃中…"
+            entry["status_text"] = ("📞 正在发起群通话…" if group_out else
+                                    "📞 正在呼叫…" if state == "dialing" else "🔔 对方响铃中…")
         elif state in ("dialing", "ringing"):
             entry["stage"] = state
             entry["status_text"] = "🟡 正在加入…" if entry.get("answered_by_tg") else "🔔 响铃中…"
         elif state == "connecting":
             entry["stage"] = "connecting"
-            entry["status_text"] = "🟡 正在加入…" if conf and entry.get("answered_by_tg") else "🟡 接通中…"
+            entry["status_text"] = ("🟡 正在发起群通话…" if group_out else
+                                    "🟡 正在加入…" if conf and entry.get("answered_by_tg") else "🟡 接通中…")
             entry["offered_event"].set()
         elif state == "connected":
             entry["stage"] = "connected"
             entry["was_connected"] = True
             entry["connected_at"] = entry.get("connected_at") or time.time()
-            entry["status_text"] = ("🟢 通话中（Telegram 发起）" if outgoing else
+            entry["status_text"] = ("🟢 群通话中（Telegram 发起）" if group_out else
+                                    "🟢 通话中（Telegram 发起）" if outgoing else
                                     "🟢 通话中（Telegram 接听）" if entry.get("answered_by_tg") else "🟢 通话中")
             entry["offered_event"].set()
         elif state in ("ending", "ended"):
@@ -2124,6 +2208,7 @@ class Bridge(ContactsMixin, LoginMixin):
             entry["terminal"] = True
             if not self._call_status_final(entry):
                 entry["status_text"] = ("⚪ 通话已结束" if entry["was_connected"] else
+                                        "⚪ 群通话未能发起" if group_out else
                                         "⚪ 呼叫未接通（对方未接听、已拒绝或忙线）" if outgoing else
                                         "⚪ 来电已结束（未接听或已取消）")
             entry["offered_event"].set()
@@ -2343,8 +2428,7 @@ class Bridge(ContactsMixin, LoginMixin):
 
     # ---------------------------------------------------------------- outgoing calls (/call)
     def _dial_unavailable(self, thread_id: str) -> str:
-        if thread_id.endswith("@chatroom"):
-            return "暂不支持在 Telegram 发起微信群语音通话，只能给单个好友打电话。"
+        conf = thread_id.endswith("@chatroom")
         if self.call_web is None:
             return ("没有配置通话页面（<code>CALL_WEB_URL</code>），无法在 Telegram 打微信电话。"
                     "配置方法见 README「在 Telegram 接听与拨打微信语音通话」。")
@@ -2352,11 +2436,14 @@ class Bridge(ContactsMixin, LoginMixin):
             return "🔐 微信尚未登录，登录后再打电话。"
         if self._calls_sock is None or self._calls_sock.closed:
             return "通话信令未连接（agent-wechat 通话功能不可用或正在重连），请稍后重试。"
-        if not self.call_web.can_dial():
-            return "当前 agent-wechat 不支持发起微信语音通话，请升级到 2.7 或更新版本。"
+        if not self.call_web.can_dial(conf):
+            what = "群语音通话" if conf else "语音通话"
+            return f"当前 agent-wechat 不支持发起微信{what}，请升级到 2.7 或更新版本。"
         return ""
 
     def _render_dial(self, req: dict) -> tuple[str, list | None]:
+        if req.get("kind") == "conference":
+            return self._render_group_dial(req)
         text = (
             "📞 <b>微信语音通话</b>\n"
             f"呼叫：<b>{_esc(req['name'])}</b>\n"
@@ -2368,22 +2455,71 @@ class Bridge(ContactsMixin, LoginMixin):
         return text, [[Button.url("📞 开始呼叫", web.link(web.token_for_dial(req)))],
                       [Button.inline("✖️ 取消", f"dialx:{req['dial_id']}".encode())]]
 
-    async def _start_dial(self, chat_id: int, reply_to: int | None, thread_id: str) -> None:
+    def _render_group_dial(self, req: dict) -> tuple[str, list | None]:
+        selected = req["selected"]
+        names = req["names"]
+        lines = ["📞 <b>微信群语音通话</b>", f"群：<b>{_esc(req['name'])}</b>"]
+        if selected:
+            shown = "、".join(_esc(names.get(cid) or cid) for cid in selected[:DIAL_PICK_SHOWN])
+            more = f" 等 {len(selected)} 人" if len(selected) > DIAL_PICK_SHOWN else ""
+            lines.append(f"邀请（{len(selected)} 人）：{shown}{more}")
+        else:
+            lines.append("邀请：尚未选择")
+        lines.append(f"状态：{req['status_text']}")
+        text = "\n".join(lines)
+        web = self.call_web
+        if not req["live"] or web is None:
+            return text, None
+        did = req["dial_id"]
+        members = req["members"]
+        pages = max(1, -(-len(members) // DIAL_PICK_PAGE))
+        page = min(req["page"], pages - 1)
+        rows: list[list] = []
+        chunk = list(enumerate(members))[page * DIAL_PICK_PAGE:(page + 1) * DIAL_PICK_PAGE]
+        chosen = set(selected)
+        for i in range(0, len(chunk), 2):
+            rows.append([
+                Button.inline(f"{'✅' if m['id'] in chosen else '▫️'} {_short(m['label'], 12)}",
+                              f"dialp:{did}:t{idx}".encode())
+                for idx, m in chunk[i:i + 2]
+            ])
+        if pages > 1:
+            rows.append([Button.inline("◀️", f"dialp:{did}:p{(page - 1) % pages}".encode()),
+                         Button.inline(f"{page + 1}/{pages}", f"dialp:{did}:n".encode()),
+                         Button.inline("▶️", f"dialp:{did}:p{(page + 1) % pages}".encode())])
+        rows.append([Button.inline("☑️ 全选", f"dialp:{did}:a".encode()),
+                     Button.inline("🔄 清空", f"dialp:{did}:c".encode())])
+        if selected:
+            rows.append([Button.url(f"📞 开始呼叫（{len(selected)} 人）", web.link(web.token_for_dial(req)))])
+        rows.append([Button.inline("✖️ 取消", f"dialx:{did}".encode())])
+        return text, rows
+
+    async def _group_dial_members(self, group_id: str) -> list[dict]:
+        members = await self.wx.group_members(group_id)
+        out = []
+        for m in members:
+            cid = m.get("id") or m.get("username")
+            if not cid or cid == self._self_wxid or cid.endswith("@chatroom"):
+                continue
+            out.append({"id": cid, "label": _member_label(m) or cid,
+                        "search": " ".join(str(m.get(k) or "") for k in
+                                           ("mentionName", "roomDisplayName", "displayName", "nickname",
+                                            "alias", "username", "id")).lower()})
+        return out
+
+    async def _start_dial(self, chat_id: int, reply_to: int | None, thread_id: str, query: str = "") -> None:
         if why := self._dial_unavailable(thread_id):
             await self.bot.send_message(chat_id, why, parse_mode="html", reply_to=reply_to)
             return
+        conf = thread_id.endswith("@chatroom")
         name = self._link_title(thread_id) or thread_id
         try:
             name = (await self.wx.thread(thread_id)).get("displayName") or name
         except Exception:
             pass
-        for old in list(self._dial_requests.values()):
-            if old["live"] and old["thread_id"] == thread_id and not old.get("dialing"):
-                await self._close_dial_request(old, "⚪ 已发起新的呼叫，此链接已失效")
-        while len(self._dial_requests) > 50:
-            self._dial_requests.pop(next(iter(self._dial_requests)))
         req = {
             "dial_id": secrets.token_hex(6),
+            "kind": "conference" if conf else "direct",
             "contact_id": thread_id,
             "thread_id": thread_id,
             "name": name,
@@ -2395,14 +2531,104 @@ class Bridge(ContactsMixin, LoginMixin):
             "call_id": None,
             "expire_task": None,
         }
+        if conf:
+            try:
+                members = await self._group_dial_members(thread_id)
+            except WeChatError as e:
+                await self.bot.send_message(chat_id, f"获取群成员失败：{_esc(e.code)}", parse_mode="html",
+                                            reply_to=reply_to)
+                return
+            if not members:
+                await self.bot.send_message(chat_id, "没有拿到群成员，无法发起群语音通话", reply_to=reply_to)
+                return
+            terms = query.lower().split()
+            picked = [m for m in members if any(t in m["search"] for t in terms)] if terms else []
+            if terms and not picked:
+                await self.bot.send_message(chat_id, f"没有匹配「{_esc(query)}」的群成员", parse_mode="html",
+                                            reply_to=reply_to)
+                return
+            picked = picked[:callweb.MAX_INVITEES]
+            ids = {m["id"] for m in picked}
+            req.update(
+                members=picked + [m for m in members if m["id"] not in ids],  # matches first
+                names={m["id"]: m["label"] for m in members},
+                selected=[m["id"] for m in picked],
+                page=0,
+                status_text="勾选要邀请的成员，再点「开始呼叫」，在通话页面授权麦克风后发起",
+            )
+        for old in list(self._dial_requests.values()):
+            if old["live"] and old["thread_id"] == thread_id and not old.get("dialing"):
+                await self._close_dial_request(old, "⚪ 已发起新的呼叫，此链接已失效")
+        while len(self._dial_requests) > 50:
+            self._dial_requests.pop(next(iter(self._dial_requests)))
         text, buttons = self._render_dial(req)
         sent = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons, link_preview=False,
                                            reply_to=reply_to)
         req["msg_id"] = sent.id
+        req["_last_render"] = self._render_key(text, buttons)
         self._dial_requests[req["dial_id"]] = req
         req["expire_task"] = task = asyncio.create_task(self._expire_dial(req))
         self._notice_tasks.add(task)
         task.add_done_callback(self._notice_tasks.discard)
+
+    async def _sync_dial_msg(self, req: dict) -> None:
+        if self.call_web is not None:
+            await self.call_web.on_dial_changed(req)
+        text, buttons = self._render_dial(req)
+        key = self._render_key(text, buttons)
+        if req.get("_last_render") == key:
+            return
+        try:
+            await self.bot.edit_message(req["chat_id"], req["msg_id"], text, parse_mode="html", buttons=buttons,
+                                        link_preview=False)
+            req["_last_render"] = key
+        except errors.MessageNotModifiedError:
+            req["_last_render"] = key
+        except Exception as e:
+            log.info("Could not update call request %s: %s", req["dial_id"], e)
+
+    async def _on_dial_pick_callback(self, event, payload: str) -> None:
+        if event.sender_id != self.owner_id:
+            await event.answer("只有桥接账号本人可以操作", alert=True)
+            return
+        dial_id, _, op = payload.partition(":")
+        req = self._dial_requests.get(dial_id)
+        if req is None or not req["live"] or req.get("kind") != "conference":
+            await event.answer("呼叫已开始或已结束")
+            return
+        if req.get("dialing"):
+            await event.answer("正在发起群通话…")
+            return
+        selected: list[str] = req["selected"]
+        members: list[dict] = req["members"]
+        limit = callweb.MAX_INVITEES
+        note = None
+        if op.startswith("t") and op[1:].isdigit() and int(op[1:]) < len(members):
+            cid = members[int(op[1:])]["id"]
+            if cid in selected:
+                selected.remove(cid)
+            elif len(selected) >= limit:
+                await event.answer(f"一次最多邀请 {limit} 人", alert=True)
+                return
+            else:
+                selected.append(cid)
+        elif op.startswith("p") and op[1:].isdigit():
+            req["page"] = int(op[1:])
+        elif op == "a":
+            chosen = set(selected)
+            for m in members:
+                if len(selected) >= limit:
+                    note = f"一次最多邀请 {limit} 人，已选前 {limit} 人"
+                    break
+                if m["id"] not in chosen:
+                    selected.append(m["id"])
+        elif op == "c":
+            selected.clear()
+        if note:
+            await event.answer(note, alert=True)
+        else:
+            await event.answer()
+        await self._sync_dial_msg(req)
 
     async def _expire_dial(self, req: dict) -> None:
         await asyncio.sleep(callweb.DIAL_REQUEST_TTL)
@@ -2561,7 +2787,7 @@ class Bridge(ContactsMixin, LoginMixin):
                                             reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/call":
-                await self._start_dial(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id)
+                await self._start_dial(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg.strip())
                 return
             if cmd_name == "/avatar" and self.topics:
                 await self.bot.send_message(chat_id, "Telegram 话题不支持设置头像",

@@ -39,6 +39,8 @@ CONNECT_TIMEOUT_SECONDS = 45.0
 OUTGOING_CONNECT_TIMEOUT_SECONDS = 90.0
 # How long a /call link stays usable before the call is placed.
 DIAL_REQUEST_TTL = 600.0
+# agent-wechat accepts 1-100 invitees when starting a group call.
+MAX_INVITEES = 100
 INIT_DATA_MAX_AGE = 24 * 3600
 MAX_PCM_CHUNK = 65536
 
@@ -329,8 +331,11 @@ class CallWeb:
             req["web_token"] = self._new_token("dial", req["dial_id"])
         return req["web_token"]
 
-    def can_dial(self) -> bool:
-        return bool(self.bridge._calls_caps.get("directAudio"))
+    def can_dial(self, conference: bool = False) -> bool:
+        caps = self.bridge._calls_caps
+        if conference:
+            return bool(caps.get("conferenceCreate") and caps.get("conferenceAudio"))
+        return bool(caps.get("directAudio"))
 
     def can_answer(self, entry: dict) -> bool:
         caps = self.bridge._calls_caps
@@ -507,13 +512,24 @@ class CallWeb:
         await self.bridge._sync_call_msg(entry)
 
     async def dial(self, req: dict, ws: web.WebSocketResponse | None) -> None:
-        """Place the outgoing one-to-one voice call a /call request asked for; this page then owns its audio."""
+        """Place the call a /call request asked for (one contact, or a group call); this page then owns its audio."""
         if req.get("dialing") or req.get("call_id"):
             raise CallPending("正在呼叫…")
         if not req.get("live"):
             raise CallActionError("呼叫已取消或已过期，请重新发送 /call")
-        if not self.can_dial():
-            raise CallActionError("当前 agent-wechat 不支持发起微信语音通话")
+        conf = req.get("kind") == "conference"
+        if not self.can_dial(conf):
+            raise CallActionError("当前 agent-wechat 不支持发起微信群语音通话" if conf
+                                  else "当前 agent-wechat 不支持发起微信语音通话")
+        invitees = list(req.get("selected") or ()) if conf else []
+        if conf and not invitees:
+            raise CallActionError("还没有选择要邀请的群成员")
+        if conf and len(invitees) > MAX_INVITEES:
+            raise CallActionError(f"一次最多邀请 {MAX_INVITEES} 人")
+        if conf:
+            target = {"kind": "conference", "groupId": req["thread_id"], "invitees": invitees}
+        else:
+            target = {"kind": "direct", "contactId": req["contact_id"]}
         req["dialing"] = True
         readied = False
         claimed = False
@@ -523,8 +539,7 @@ class CallWeb:
             if res.get("status") == "error":
                 raise CallActionError(_err_text(res.get("code"), "呼叫失败"))
             readied = True
-            res = await self._command({"type": "call.dial", "callType": "voice",
-                                       "target": {"kind": "direct", "contactId": req["contact_id"]}})
+            res = await self._command({"type": "call.dial", "callType": "voice", "target": target})
             if res.get("status") not in ("accepted", "replayed") or not res.get("callId"):
                 raise CallActionError(_err_text(res.get("code"), "呼叫失败"))
             owner_token = res.get("ownerToken")
@@ -533,12 +548,16 @@ class CallWeb:
             claimed = True
             call_id = res["callId"]
             entry = self.bridge._new_call_entry(
-                call_id, kind="direct", call_type="voice", caller_id=req["contact_id"],
-                caller_name=req.get("name") or req["contact_id"], thread_id=req["thread_id"],
-                stage="dialing", revision=0,
+                call_id, kind="conference" if conf else "direct", call_type="voice",
+                caller_id=req["contact_id"], caller_name=req.get("name") or req["contact_id"],
+                thread_id=req["thread_id"], stage="dialing", revision=0,
             )
             entry.update(direction="outgoing", chat_id=req.get("chat_id"), msg_id=req.get("msg_id"),
-                         answered_by_tg=True, status_text="📞 正在呼叫…")
+                         answered_by_tg=True, status_text="📞 正在发起群通话…" if conf else "📞 正在呼叫…")
+            if conf:
+                names = req.get("names") or {}
+                entry["invitees"] = {cid: names.get(cid) or cid for cid in invitees}
+                entry["dial_request_id"] = res.get("requestId") or ""
             token = self.token_for_dial(req)
             entry["web_token"] = token
             self.tokens[token] = ("call", call_id)
@@ -605,13 +624,21 @@ class CallWeb:
         kind, ref = self.tokens.get(token, ("", ""))
         st: dict = {"type": "state", "phase": "ended", "title": "微信通话", "name": "", "status": "通话已结束或链接已失效",
                     "mine": False, "muted": False, "elapsed": None, "rate": 16000, "frame": 320,
-                    "answerable": False, "joinable": False, "dialable": False}
+                    "answerable": False, "joinable": False, "dialable": False, "group": False}
         if kind == "dial":
             req = self.bridge._dial_requests.get(ref)
             if req is not None:
-                st.update(title="微信语音通话", name=req.get("name") or "", status=req.get("status_text") or "")
+                conf = req.get("kind") == "conference"
+                st.update(title="微信群语音通话" if conf else "微信语音通话", name=req.get("name") or "",
+                          status=req.get("status_text") or "", group=conf)
                 if req.get("live"):
-                    st.update(phase="dial", dialable=self.can_dial())
+                    st["phase"] = "dial"
+                    if conf:
+                        n = len(req.get("selected") or ())
+                        st["status"] = f"将邀请 {n} 人" if n else "请先在 Telegram 消息里勾选要邀请的成员"
+                        st["dialable"] = self.can_dial(True) and 0 < n <= MAX_INVITEES
+                    else:
+                        st["dialable"] = self.can_dial()
             return st
         if kind == "invite":
             inv = self.bridge._conf_invites.get(ref)
@@ -630,7 +657,8 @@ class CallWeb:
             title = "微信语音通话"
         else:
             title = "微信视频来电" if entry.get("call_type") == "video" else "微信语音来电"
-        st.update(title=title, name=entry.get("caller_name") or "", status=entry.get("status_text") or "")
+        st.update(title=title, name=entry.get("caller_name") or "", status=entry.get("status_text") or "",
+                  group=conf and entry.get("direction") == "outgoing")
         if entry.get("connected_at"):
             st["elapsed"] = max(0, int(time.time() - entry["connected_at"]))
         sess = self.sessions.get(entry["call_id"])
@@ -1236,7 +1264,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     $('name').textContent = person;
     const av = $('avatar');
     const first = Array.from(person.trim())[0];
-    if (st.phase === 'invite' || !first) av.innerHTML = st.phase === 'invite' ? ICON.group : ICON.phone;
+    const groupIcon = st.phase === 'invite' || st.group;
+    if (groupIcon || !first) av.innerHTML = groupIcon ? ICON.group : ICON.phone;
     else av.textContent = first.toUpperCase();
     $('main').className = (p === 'ringing' || p === 'invite' || p === 'calling') ? 'ringing' : (p === 'ended' ? 'ended' : '');
 

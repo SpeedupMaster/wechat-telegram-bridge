@@ -4799,12 +4799,121 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         finally:
             callweb.DIAL_REQUEST_TTL = saved
 
+    def _team(self) -> int:
+        self.b._calls_caps = {**self.b._calls_caps, "conferenceCreate": True}
+        self.b.wx_ready = True
+        self.daemon.add_thread("123@chatroom", "Team", kind="group")
+        self.b.store.link("123@chatroom", -900, "Team")
+        self.daemon.group_members["123@chatroom"] = (
+            [{"id": "wxid_me", "displayName": "Me"},
+             {"id": "wxid_a", "displayName": "Alice"},
+             {"id": "wxid_b", "displayName": "Bob", "alias": "bobby"},
+             {"id": "wxid_c", "displayName": "Carol"}]
+            + [{"id": f"wxid_m{i:02}", "displayName": f"Member {i:02}"} for i in range(1, 12)])
+        return -900
+
+    async def _press(self, msg, label: str, user: int = 999):
+        data = next(d for row in msg.kwargs["buttons"] for b in row if label in b.text
+                    and (d := getattr(getattr(b, "type", None), "data", None) or getattr(b, "data", None)))
+        ev = _CallbackEvent(user, data)
+        await self.b.on_bot_callback(ev)
+        return ev
+
+    async def test_group_dial_member_picker_and_call(self):
+        chat = self._team()
+        # Our own WeChat ID is learned from a message we sent from the phone, and left out of the picker
+        self.daemon.add_message("o1", "123@chatroom", "hi", direction="outgoing", sender="wxid_me")
+        await self.b.handle_event({"cursor": "1", "kind": "message.committed", "data": {
+            "messageId": "o1", "threadId": "123@chatroom", "origin": "live", "direction": "outgoing"}})
+        self.assertEqual(self.b._self_wxid, "wxid_me")
+        self.assertEqual(self.b.store.get("self_wxid"), "wxid_me")
+
+        await self.b.on_tg_message(tg_event(chat, 10, "/call bobby"))
+        msg = self.b.bot.sent[-1]
+        self.assertIn("微信群语音通话", msg.text)
+        self.assertIn("群：<b>Team</b>", msg.text)
+        self.assertIn("邀请（1 人）：Bob", msg.text)
+        texts = _button_texts(msg)
+        self.assertEqual(texts[:2], ["✅ Bob", "▫️ Alice"])  # matches first, ticked
+        self.assertNotIn("▫️ Me", texts)
+        self.assertIn("1/2", texts)
+        self.assertIn("📞 开始呼叫（1 人）", texts)
+        token = _button_urls(msg)[0].rsplit("/", 1)[1]
+
+        intruder = await self._press(msg, "Alice", user=111)
+        self.assertEqual(intruder.answers, [("只有桥接账号本人可以操作", True)])
+        await self._press(msg, "Alice")
+        self.assertIn("邀请（2 人）：Bob、Alice", msg.text)
+        await self._press(msg, "▶️")
+        self.assertIn("2/2", _button_texts(msg))
+        self.assertIn("▫️ Member 11", _button_texts(msg))
+        await self._press(msg, "◀️")
+
+        ws = await self._page(token)
+        st = await self._next(ws)
+        self.assertEqual((st["phase"], st["group"], st["dialable"], st["status"], st["title"]),
+                         ("dial", True, True, "将邀请 2 人", "微信群语音通话"))
+        await self._press(msg, "清空")
+        self.assertNotIn("开始呼叫", " ".join(_button_texts(msg)))
+        st = await self._next(ws, pred=lambda m: not m["dialable"])
+        await self._press(msg, "全选")
+        self.assertIn("邀请（14 人）", msg.text)
+        await self._press(msg, "清空")
+        await self._press(msg, "Bob")
+        await self._press(msg, "Alice")
+        st = await self._next(ws, pred=lambda m: m["status"] == "将邀请 2 人")
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.dial":
+                await self.b.handle_call_event({"type": "call.invitation_result", "callId": "conf-o",
+                                                "requestId": cmd.get("requestId", "r"), "results": [
+                    {"contactId": "wxid_b", "status": "submitted", "verificationRequired": False},
+                    {"contactId": "wxid_a", "status": "rejected", "verificationRequired": False}]})
+                await self.b.handle_call_event({"type": "call.state", "call": {
+                    "callId": "conf-o", "revision": 2, "kind": "conference", "callType": "voice",
+                    "direction": "outgoing", "state": "connected", "ownedByThisClient": True,
+                    "groupId": "123@chatroom", "participants": [
+                        {"participantId": "p1", "contactId": "wxid_b", "membership": "joined"},
+                        {"participantId": "p2", "contactId": "wxid_a", "membership": "invited"}]}})
+                return {"type": "command.result", "status": "accepted", "callId": "conf-o", "ownerToken": "own-c"}
+            return None
+        self.sock.on_command = on_cmd
+        await ws.send_json({"type": "dial"})
+        st = await self._next(ws, pred=lambda m: m["phase"] == "active")
+        self.assertTrue(st["mine"])
+        self.assertTrue(st["group"])
+        dial = next(c for c in self.sock.commands if c["type"] == "call.dial")
+        self.assertEqual(dial["target"], {"kind": "conference", "groupId": "123@chatroom",
+                                          "invitees": ["wxid_b", "wxid_a"]})
+        self.assertEqual(self.media_calls, [("conf-o", "ctl-1", "own-c")])
+        await self._until(lambda: "群通话中（Telegram 发起）" in msg.text)
+        self.assertIn("邀请（2 人）：Bob、Alice", msg.text)
+        self.assertIn("已加入：1 人", msg.text)
+        self.assertIn("邀请异常：Alice（被拒绝）", msg.text)
+        self.assertEqual(_button_texts(msg), ["🎧 通话界面", "📴 挂断"])
+
+        await ws.send_json({"type": "hangup"})
+        await self._until(lambda: self.sock.commands[-1]["type"] == "call.hangup")  # leave, not cancel
+        await ws.close()
+
+    async def test_group_dial_no_match_and_empty(self):
+        chat = self._team()
+        await self.b.on_tg_message(tg_event(chat, 10, "/call nobody"))
+        self.assertIn("没有匹配「nobody」的群成员", self.b.bot.sent[-1].text)
+        await self.b.on_tg_message(tg_event(chat, 11, "/call"))
+        msg = self.b.bot.sent[-1]
+        self.assertIn("邀请：尚未选择", msg.text)
+        self.assertNotIn("开始呼叫", " ".join(_button_texts(msg)))
+        self.daemon.group_members["123@chatroom"] = []
+        await self.b.on_tg_message(tg_event(chat, 12, "/call"))
+        self.assertIn("没有拿到群成员", self.b.bot.sent[-1].text)
+
     async def test_call_command_refused_when_unavailable(self):
         chat = self._link_alice()
         self.daemon.add_thread("123@chatroom", "Team", kind="group")
         self.b.store.link("123@chatroom", -701, "Team")
         await self.b.on_tg_message(tg_event(-701, 10, "/call"))
-        self.assertIn("暂不支持", self.b.bot.sent[-1].text)
+        self.assertIn("不支持发起微信群语音通话", self.b.bot.sent[-1].text)  # no conferenceCreate
 
         self.b._calls_caps = {}
         await self.b.on_tg_message(tg_event(chat, 11, "/call"))
