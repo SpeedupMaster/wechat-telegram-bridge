@@ -69,6 +69,7 @@ class FakeDaemon:
         self.privacy: dict[str, dict] = {}
         self.relations_supported = True
         self.contact_searches: list[dict] = []
+        self.media_errors: dict[str, str] = {}  # message id -> 409 error code for its media list
 
     def add_thread(self, tid, name, kind="direct"):
         self.threads[tid] = {"id": tid, "accountId": ACC, "peerId": tid, "kind": kind, "displayName": name,
@@ -132,6 +133,8 @@ class FakeDaemon:
                         break
                 self.transfer_jobs[jid] = {"id": jid, "state": "available"}
             return httpx.Response(202, json={"id": jid, "state": "queued"})
+        if rest[0] == "messages" and rest[2] == "media" and rest[1] in self.media_errors:
+            return httpx.Response(409, json={"error": {"code": self.media_errors[rest[1]], "retryable": False}})
         if rest[0] == "messages" and rest[2] == "media" and rest[1] in self.media:
             return httpx.Response(200, json={"items": self.media[rest[1]]})
         if rest[0] == "messages" and rest[2] == "media":
@@ -1539,6 +1542,21 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.b.bot.sent, [])
         await self.event("f1", "wxid_bob")
         self.assertEqual(self.b.bot.sent[-1].file.name, "invoice.pdf")
+
+    async def test_wecom_attachment_failure_explains_upstream_limit(self):
+        self.daemon.add_thread("room@chatroom", "Team", kind="group")
+        self.daemon.add_message("oi1", "room@chatroom", None, type_=3, sender="25984985782492847@openim")
+        self.daemon.add_message("of1", "room@chatroom", "报价单.xlsx", type_=49, appMessageType=6,
+                                sender="25984985782492847@openim", link={"title": "报价单.xlsx"})
+        self.daemon.add_message("wf1", "room@chatroom", "a<b>.pdf", type_=49, appMessageType=6, sender="wxid_bob")
+        self.daemon.media_errors.update(oi1="unsupported_media", of1="unsupported_media", wf1="unsupported_media")
+        for mid in ("oi1", "of1", "wf1"):
+            await self.event(mid, "room@chatroom")
+        img, f, plain = (m.text for m in self.b.bot.sent[-3:])
+        self.assertTrue(img.endswith("[图片，无法获取：企业微信发来的图片/文件，agent-wechat 暂不支持下载，请在手机微信查看]"), img)
+        self.assertTrue(f.endswith("[文件「报价单.xlsx」，无法获取：企业微信发来的图片/文件，agent-wechat 暂不支持下载，请在手机微信查看]"), f)
+        # an ordinary sender keeps the generic reason, and the file name is HTML-escaped
+        self.assertTrue(plain.endswith("[文件「a&lt;b&gt;.pdf」，无法获取：不支持]"), plain)
 
     async def test_unsupported_message_shows_human_type_name(self):
         self.daemon.add_thread("wxid_bob", "Bob")

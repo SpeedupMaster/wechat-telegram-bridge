@@ -473,6 +473,7 @@ python -m unittest discover -s tests -v
 
 - **WXGF 动图表情**：受限于上游 `agent-wechat` 目前仅对 WXGF 编码表情提供单帧预览解码，这类表情转发到 Telegram 时会作为高清静态贴纸展示（普通 GIF 微信表情则为动态贴纸）。
 - **无法获取的表情**：极少数商城加密表情或特殊自定义表情在微信消息体中不携带可下载的 CDN 链接，属于上游协议限制。
+- **企业微信发来的图片/文件**：企业微信联系人（`@openim`）发来的图片和文件不使用普通微信的 CDN 字段，上游 `agent-wechat` 目前无法下载（[thisnick/agent-wechat#467](https://github.com/thisnick/agent-wechat/issues/467)），桥接会显示 `[图片，无法获取：企业微信发来的图片/文件…]` 并附上文件名，请在手机微信查看原文件。
 </details>
 
 <details>

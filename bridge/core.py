@@ -481,6 +481,33 @@ APP_TYPE_NAMES = {
 }
 
 
+# agent-wechat only knows the ordinary WeChat CDN fields; images and files from WeCom (企业微信, `@openim`)
+# senders carry their reference in another shape, so it rejects them with one of these codes
+# (thisnick/agent-wechat#467).
+UNSUPPORTED_TRANSPORT_CODES = {"unsupported_media", "unsupported_media_transport", "unsupported_attachment_transport"}
+OPENIM_MEDIA_NOTE = "企业微信发来的图片/文件，agent-wechat 暂不支持下载，请在手机微信查看"
+
+
+def _is_openim(wx_id: str | None) -> bool:
+    """True for WeCom contacts (`…@openim`) and WeCom customer service (`…@kefu.openim`)."""
+    return bool(wx_id) and wx_id.rsplit("@", 1)[-1].endswith("openim")
+
+
+def _media_failure_text(msg: dict, reason: str) -> str:
+    """The `[图片，无法获取：…]` notice for an attachment that could not be fetched (escaped HTML)."""
+    t = msg.get("type")
+    label = {IMAGE: "图片", VIDEO: "视频", VOICE: "语音", STICKER: "表情"}.get(t, "文件")
+    if t == APP and msg.get("appMessageType") == APP_FILE:
+        name = ((msg.get("link") or {}).get("title") or msg.get("body") or "").strip()
+        if name:
+            label += f"「{name}」"
+    if reason in UNSUPPORTED_TRANSPORT_CODES and (_is_openim(msg.get("senderId")) or _is_openim(msg.get("threadId"))):
+        why = OPENIM_MEDIA_NOTE
+    else:
+        why = MEDIA_REASONS.get(reason, reason)
+    return f"[{_esc(label)}，无法获取：{_esc(why)}]"
+
+
 def _unsupported_label(t: int | None, sub: int | None) -> str:
     if t == APP and sub in APP_TYPE_NAMES:
         return f"[暂不支持的微信消息：{APP_TYPE_NAMES[sub]} ({t}/{sub})]"
@@ -1734,8 +1761,7 @@ class Bridge(ContactsMixin, LoginMixin):
                         raise
                     log.info("Telegram refused venue (%s); falling back to text + geo point", e)
             if isinstance(send_media, str):
-                label = {IMAGE: "图片", VIDEO: "视频", VOICE: "语音", STICKER: "表情"}.get(t, "文件")
-                text = header + prefix + f"[{label}，无法获取：{_esc(MEDIA_REASONS.get(send_media, send_media))}]"
+                text = header + prefix + _media_failure_text(msg, send_media)
                 buttons = None
             elif is_link:
                 buttons = _link_buttons(msg.get("link"), msg.get("appMessageType"))
