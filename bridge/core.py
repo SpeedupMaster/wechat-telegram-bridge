@@ -20,6 +20,7 @@ from . import cards, stickers
 from . import callweb
 from .callweb import CallActionError, CallWeb
 from .contacts import ContactsMixin, friendly as contact_error
+from .groups import GROUP_COMMANDS, GroupsMixin
 from .login import LoginMixin
 from .store import Store
 from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE, LOCATION, SEND_OK, STICKER,
@@ -94,6 +95,7 @@ HELP = (
     "• <code>/link</code> [关键词] — 点选或搜索绑定现有 Telegram 群与微信会话（无需查 ID）\n"
     "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
     "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
+    "• <code>/newgroup</code> 关键词 关键词 [| 群名] — 勾选好友新建微信群\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
@@ -103,6 +105,10 @@ HELP = (
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/group</code> — 微信群资料与管理：免打扰、邀请/移出成员、清空公告、退群\n"
+    "• <code>/invite</code> [关键词] / <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
+    "• <code>/groupname</code> 新群名 · <code>/myname</code> 昵称 — 改微信群名 / 我的群昵称\n"
+    "• <code>/mute</code> · <code>/unmute</code> — 开启/关闭微信消息免打扰；<code>/leave</code> — 退出微信群\n"
     "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
     "• <code>/avatar</code> — 同步微信头像为群头像\n"
     "• <code>/rename</code> — 同步微信备注/群名为群标题（别名 <code>/title</code>）\n"
@@ -122,6 +128,10 @@ GROUP_HELP = (
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/group</code> — 微信群资料与管理（免打扰、邀请/移出成员、清空公告、退群）\n"
+    "• <code>/invite</code> · <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
+    "• <code>/groupname</code> 新群名 · <code>/myname</code> 昵称 — 改微信群名 / 我的群昵称\n"
+    "• <code>/mute</code> · <code>/unmute</code> — 微信免打扰；<code>/leave</code> — 退出微信群\n"
     "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
     "• <code>/avatar</code> — 同步微信头像为群头像\n"
     "• <code>/rename</code> — 同步最新微信备注/群名为群标题（别名 <code>/title</code>）\n"
@@ -141,6 +151,7 @@ TOPIC_HELP = (
     "• <code>/chats</code> [关键词] — 查看已连接的会话列表（别名 <code>/list</code>）\n"
     "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
     "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
+    "• <code>/newgroup</code> 关键词 关键词 [| 群名] — 勾选好友新建微信群\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
@@ -151,6 +162,10 @@ TOPIC_HELP = (
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/group</code> — 微信群资料与管理：免打扰、邀请/移出成员、清空公告、退群\n"
+    "• <code>/invite</code> [关键词] / <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
+    "• <code>/groupname</code> 新群名 · <code>/myname</code> 昵称 — 改微信群名 / 我的群昵称\n"
+    "• <code>/mute</code> · <code>/unmute</code> — 开启/关闭微信消息免打扰；<code>/leave</code> — 退出微信群\n"
     "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
     "• <code>/rename</code> — 同步微信备注/群名为话题标题（别名 <code>/title</code>）\n"
     "• <code>/unlink</code> — 解除当前话题与微信会话的绑定\n"
@@ -168,6 +183,10 @@ TOPIC_GROUP_HELP = (
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
+    "• <code>/group</code> — 微信群资料与管理（免打扰、邀请/移出成员、清空公告、退群）\n"
+    "• <code>/invite</code> · <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
+    "• <code>/groupname</code> 新群名 · <code>/myname</code> 昵称 — 改微信群名 / 我的群昵称\n"
+    "• <code>/mute</code> · <code>/unmute</code> — 微信免打扰；<code>/leave</code> — 退出微信群\n"
     "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
     "• <code>/rename</code> — 同步最新微信备注/群名为话题标题（别名 <code>/title</code>）\n"
     "• <code>/link</code> [关键词] — 把当前话题绑定（或改绑）到微信会话\n"
@@ -195,6 +214,7 @@ PRIVATE_BOT_COMMANDS = [
     ("link", "选择绑定微信会话与TG群"),
     ("requests", "查看待处理的微信好友请求"),
     ("add", "按微信号添加微信好友"),
+    ("newgroup", "勾选好友新建微信群"),
     ("status", "查看运行与微信在线状态"),
     ("wxlogin", "重新登录微信（手机确认或扫码）"),
     ("help", "查看使用指南"),
@@ -205,6 +225,14 @@ GROUP_BOT_COMMANDS = [
     ("contact", "查看好友资料与朋友圈权限"),
     ("call", "给好友打微信电话或发起群语音通话"),
     ("members", "查看群成员（点按复制 @名字）"),
+    ("group", "微信群资料与管理"),
+    ("invite", "邀请好友进微信群"),
+    ("kick", "把成员移出微信群"),
+    ("groupname", "修改微信群名"),
+    ("myname", "修改我在本群的昵称"),
+    ("mute", "开启微信消息免打扰"),
+    ("unmute", "关闭微信消息免打扰"),
+    ("leave", "退出微信群"),
     ("recall", "回复消息以撤回微信消息"),
     ("avatar", "同步微信头像到群头像"),
     ("rename", "同步最新微信名称到群标题"),
@@ -220,6 +248,7 @@ TOPIC_PRIVATE_BOT_COMMANDS = [
     ("chats", "查看已连接的会话列表"),
     ("requests", "查看待处理的微信好友请求"),
     ("add", "按微信号添加微信好友"),
+    ("newgroup", "勾选好友新建微信群"),
     ("status", "查看运行与微信在线状态"),
     ("wxlogin", "重新登录微信（手机确认或扫码）"),
     ("help", "查看使用指南"),
@@ -230,6 +259,14 @@ TOPIC_GROUP_BOT_COMMANDS = [
     ("contact", "查看好友资料与朋友圈权限"),
     ("call", "给好友打微信电话或发起群语音通话"),
     ("members", "查看群成员（点按复制 @名字）"),
+    ("group", "微信群资料与管理"),
+    ("invite", "邀请好友进微信群"),
+    ("kick", "把成员移出微信群"),
+    ("groupname", "修改微信群名"),
+    ("myname", "修改我在本群的昵称"),
+    ("mute", "开启微信消息免打扰"),
+    ("unmute", "关闭微信消息免打扰"),
+    ("leave", "退出微信群"),
     ("recall", "回复消息以撤回微信消息"),
     ("rename", "同步最新微信名称到话题标题"),
     ("link", "绑定或切换当前话题对应的微信会话"),
@@ -715,7 +752,7 @@ def _match_mentions(text: str, members: list[dict]) -> dict | None:
     return {"all": mention_all, "userIds": user_ids}
 
 
-class Bridge(ContactsMixin, LoginMixin):
+class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._init_login()
@@ -754,6 +791,7 @@ class Bridge(ContactsMixin, LoginMixin):
         self._dial_requests: dict[str, dict] = {}  # dial_id -> a /call card (kept after cancel/expiry for its page)
         self._orphan_invite_results: dict[str, list[dict]] = {}  # call_id -> invitation results seen before the call
         self._self_wxid: str = self.store.get("self_wxid") or ""
+        self._group_picks: dict[str, dict] = {}  # pick id -> /invite, /kick or /newgroup member picker
         self._calls_retry_sleep: float = 300.0
         self._calls_client_id: str = ""
         self._calls_caps: dict = {}
@@ -1457,7 +1495,9 @@ class Bridge(ContactsMixin, LoginMixin):
         if outgoing:
             header = "<b>我</b>（手机端）：\n"
         elif thread.get("kind") == "group" and msg.get("senderId"):
-            header = f"<b>{_esc(await self._sender_name(msg))}</b>：\n"
+            mentions = msg.get("mentions") if isinstance(msg.get("mentions"), dict) else {}
+            tag = " 🔔<b>@我</b>" if mentions.get("self") else " 📢<b>@所有人</b>" if mentions.get("all") else ""
+            header = f"<b>{_esc(await self._sender_name(msg))}</b>{tag}：\n"
 
         reply_to = None
         prefix = ""
@@ -2839,7 +2879,7 @@ class Bridge(ContactsMixin, LoginMixin):
         elif cmd_name == "/help":
             await self._send_group_notice(event.chat_id, msg.id, TOPIC_GROUP_HELP)
         elif cmd_name in ("/wx", "/unlink", "/members", "/at", "/recall", "/rename", "/title", "/avatar",
-                          "/contact", "/info", "/call"):
+                          "/contact", "/info", "/call", *GROUP_COMMANDS):
             await self._send_group_notice(event.chat_id, msg.id,
                                           "这个话题还没有绑定微信会话，发送 <code>/link</code> 绑定。")
 
@@ -2949,6 +2989,10 @@ class Bridge(ContactsMixin, LoginMixin):
             if cmd_name == "/help":
                 await self.bot.send_message(chat_id, TOPIC_GROUP_HELP if self.topics else GROUP_HELP, parse_mode="html",
                                             reply_to=await self._bot_reply_id(chat_id, msg.id))
+                return
+            if cmd_name in GROUP_COMMANDS:
+                await self.on_group_command(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id,
+                                            cmd_name, arg.strip())
                 return
             if cmd_name in ("/members", "/at"):
                 await self._send_members(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg.strip())
@@ -3586,6 +3630,9 @@ class Bridge(ContactsMixin, LoginMixin):
         if str(action).startswith(("fr_", "add_", "ct_")):
             await self.on_contact_ui(event, payload)
             return
+        if str(action).startswith("gp_"):
+            await self.on_group_ui(event, payload)
+            return
         if action == "cancel":
             self._link_wait = None
             await self._edit_ui_msg(event, "已取消操作。")
@@ -3757,7 +3804,7 @@ class Bridge(ContactsMixin, LoginMixin):
                     parse_mode="html", buttons=buttons)
             elif cmd == "/wxlogin":
                 await self.request_wechat_login(force_qr=(arg.lower() in ("qr", "scan")))
-            elif cmd in ("/find", "/open", "/requests", "/add") and not self.wx_ready:
+            elif cmd in ("/find", "/open", "/requests", "/add", "/newgroup") and not self.wx_ready:
                 await event.reply(
                     "🔐 微信尚未登录，请先在手机微信上确认登录或扫码登录，也可以点击下方按钮重新发起登录。",
                     buttons=self._wx_login_buttons())
@@ -3765,6 +3812,8 @@ class Bridge(ContactsMixin, LoginMixin):
                 await self.cmd_requests(event)
             elif cmd == "/add":
                 await self.cmd_add(event, arg)
+            elif cmd == "/newgroup":
+                await self.cmd_new_group(event, arg)
             elif cmd == "/find":
                 cands = await self._wx_search_candidates(arg, limit=15 if arg else 10)
                 if not cands:

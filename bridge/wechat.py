@@ -472,6 +472,55 @@ class WeChatClient:
             cursor = str(nxt)
         return items
 
+    # --- group management (needs an admin-scoped daemon token) -------------------
+    async def group(self, room: str) -> dict:
+        return await self._req("GET", self._a(f"groups/{_id(room)}"))
+
+    async def _group_mutation(self, method: str, path: str, key: str, body: dict | None = None,
+                              timeout: float = 90) -> dict:
+        kw: dict[str, Any] = {"headers": {"Idempotency-Key": key}, "timeout": _SEND_TIMEOUT}
+        if body is not None:
+            kw["json"] = body
+        op = await self._req(method, self._a(path), **kw)
+        return await self._wait_operation(op, timeout)
+
+    async def create_group(self, members: list[str], name: str | None, key: str) -> dict:
+        body: dict[str, Any] = {"members": members}
+        if name:
+            body["name"] = name
+        return await self._group_mutation("POST", "groups", key, body)
+
+    async def rename_group(self, room: str, name: str, key: str) -> dict:
+        return await self._group_mutation("PATCH", f"groups/{_id(room)}", key, {"name": name})
+
+    async def leave_group(self, room: str, key: str) -> dict:
+        return await self._group_mutation("POST", f"groups/{_id(room)}/leave", key)
+
+    async def add_group_members(self, room: str, members: list[str], key: str) -> dict:
+        return await self._group_mutation("POST", f"groups/{_id(room)}/members", key, {"members": members})
+
+    async def remove_group_members(self, room: str, members: list[str], key: str) -> dict:
+        return await self._group_mutation("DELETE", f"groups/{_id(room)}/members", key, {"members": members})
+
+    async def set_my_group_name(self, room: str, name: str, key: str) -> dict:
+        return await self._group_mutation("PUT", f"groups/{_id(room)}/my-name", key, {"displayName": name})
+
+    async def clear_group_announcement(self, room: str, key: str) -> dict:
+        return await self._group_mutation("DELETE", f"groups/{_id(room)}/announcement", key)
+
+    async def set_thread_muted(self, thread_id: str, muted: bool, key: str) -> dict:
+        return await self._group_mutation("PUT", f"threads/{_id(thread_id)}/notifications", key,
+                                          {"muted": bool(muted)})
+
+    async def group_mutation_by_key(self, key: str) -> dict:
+        return await self._req("GET", self._a("group-mutations/by-idempotency-key"), params={"key": key})
+
+    async def refresh_group(self, room: str, *, members: bool = False, timeout: float = 45) -> dict:
+        """Ask WeChat for the latest group details (or member list) and wait for the operation."""
+        path = f"groups/{_id(room)}/members/refresh" if members else f"groups/{_id(room)}/refresh"
+        op = await self._req("POST", self._a(path), timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op, timeout)
+
     async def avatar(self, username: str) -> bytes | None:
         try:
             r = await self._req("GET", self._a(f"avatars/{_id(username)}"), raw=True)
