@@ -61,13 +61,28 @@ class FakeDaemon:
         self.recalls: list[tuple[str, dict, str]] = []
         self.recall_error: tuple[int, str] | None = None
         self.recall_op = {"id": "rcop", "state": "succeeded"}
+        # friend requests / contact settings (agent-wechat >= 2.7)
+        self.requests: dict[str, dict] = {}
+        self.request_calls: list[tuple[str, str, dict, str | None]] = []  # (method, path, body, idempotency key)
+        self.contact_op = {"id": "ctop", "state": "succeeded"}
+        self.discovery: dict = {}
+        self.privacy: dict[str, dict] = {}
+        self.relations_supported = True
+        self.contact_searches: list[dict] = []
 
     def add_thread(self, tid, name, kind="direct"):
         self.threads[tid] = {"id": tid, "accountId": ACC, "peerId": tid, "kind": kind, "displayName": name,
                              "unreadCount": 1, "readStateVersion": "v1"}
 
-    def add_contact(self, cid, name):
-        self.contacts[cid] = {"id": cid, "displayName": name}
+    def add_contact(self, cid, name, **extra):
+        self.contacts[cid] = {"id": cid, "displayName": name, **extra}
+
+    def add_request(self, rid, peer, name, message="hi", direction="incoming", actionable=True, **extra):
+        self.requests[rid] = {"id": rid, "peerId": peer, "displayName": name, "direction": direction,
+                              "message": message, "updatedAt": 1, "version": "v1", "isContact": False,
+                              "actionable": actionable, "attention": actionable,
+                              "state": "request_received" if direction == "incoming" else "request_sent",
+                              "history": [], **extra}
 
     def add_message(self, mid, tid, body="hi", type_=1, direction="incoming", sender=None, server=None, **extra):
         self.messages[mid] = {"id": mid, "accountId": ACC, "threadId": tid, "serverId": server, "type": type_,
@@ -179,10 +194,64 @@ class FakeDaemon:
             return httpx.Response(200, json={"items": members, "nextCursor": None})
         if rest[0] == "groups" and rest[2] == "members":
             return httpx.Response(200, json={"state": "present", "member": {"displayName": "Alice in group"}})
+        if rest[0] == "contact-requests" and len(rest) == 1 and m == "GET":
+            params = dict(request.url.params)
+            items = list(self.requests.values())
+            if params.get("direction"):
+                items = [r for r in items if r["direction"] == params["direction"]]
+            if params.get("actionable"):
+                items = [r for r in items if r["actionable"] == (params["actionable"] == "true")]
+            pending = sum(1 for r in self.requests.values() if r["direction"] == "incoming" and r["actionable"])
+            limit = int(params.get("limit", "20"))
+            return httpx.Response(200, json={"items": items[:limit] + [{"id": "gone", "deleted": True}],
+                                             "pendingIncomingCount": pending, "nextCursor": None})
+        if rest[0] in ("contact-requests", "search", "contacts") and m in ("POST", "PATCH", "DELETE"):
+            body = json.loads(request.content) if request.content else {}
+            self.request_calls.append((m, "/".join(rest), body, request.headers.get("idempotency-key")))
+            if rest == ["search", "contacts"]:
+                if isinstance(self.discovery, tuple):
+                    st, code = self.discovery
+                    return httpx.Response(st, json={"error": {"code": code}})
+                return httpx.Response(200, json={"displayName": body["query"], **self.discovery})
+            if rest[0] == "contact-requests" and len(rest) >= 2:
+                req = self.requests.get(rest[1])
+                if req is None:
+                    return httpx.Response(404, json={"error": {"code": "not_found"}})
+                if body.get("expectedVersion") != req["version"]:
+                    return httpx.Response(412, json={"error": {"code": "stale_contact_request"}})
+            if rest[0] == "contacts" and m == "PATCH":
+                cur = self.privacy.get(rest[1]) or {}
+                if body.get("expectedVersion") != cur.get("version"):
+                    return httpx.Response(412, json={"error": {"code": "stale_contact_privacy"}})
+            if self.contact_op["state"] == "succeeded":
+                if rest[0] == "contact-requests" and len(rest) == 3:  # accept
+                    req["state"], req["actionable"], req["isContact"] = "contact", False, True
+                elif rest[0] == "contact-requests" and len(rest) == 2:  # delete
+                    del self.requests[rest[1]]
+                elif rest[0] == "contacts" and m == "PATCH":
+                    self.privacy[rest[1]] = {"privacy": body["privacy"], "version": cur["version"] + "x"}
+                elif rest[0] == "contacts" and m == "DELETE":
+                    self.contacts.setdefault(rest[1], {"id": rest[1]})["relation"] = "non_contact"
+            return httpx.Response(202, json={"id": "ctop", "state": "queued"})
+        if rest[:2] == ["operations", "ctop"]:
+            return httpx.Response(200, json=self.contact_op)
+        if rest[0] == "contact-requests" and len(rest) == 2:
+            req = self.requests.get(rest[1])
+            return httpx.Response(200, json=req) if req else httpx.Response(404, json={"error": {"code": "not_found"}})
+        if rest[0] == "contacts" and len(rest) == 3 and rest[2] == "privacy":
+            if rest[1] not in self.privacy:
+                return httpx.Response(409, json={"error": {"code": "contact_privacy_unresolved"}})
+            return httpx.Response(200, json=self.privacy[rest[1]])
         if rest[0] == "contacts" and len(rest) == 1:
-            q = (request.url.params.get("search") or "").lower()
+            params = dict(request.url.params)
+            self.contact_searches.append(params)
+            if "relation" in params and not self.relations_supported:
+                return httpx.Response(400, json={"error": {"code": "invalid_request"}})
+            q = (params.get("search") or "").lower()
             pool = {**{k: v for k, v in self.threads.items() if v.get("kind") != "group"}, **self.contacts}
             items = [c for c in pool.values() if not q or q in (c.get("displayName") or "").lower() or q in c["id"].lower()]
+            if params.get("relation", "friend") != "all":
+                items = [c for c in items if c.get("relation", "friend") == params.get("relation", "friend")]
             return httpx.Response(200, json={"items": items})
         if rest[0] == "contacts":
             if rest[1] in self.contacts:

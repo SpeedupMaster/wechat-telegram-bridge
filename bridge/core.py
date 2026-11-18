@@ -18,6 +18,7 @@ from telethon import Button, TelegramClient, errors, events, functions, types, u
 from .config import Config
 from . import cards, stickers
 from .callweb import CallActionError, CallWeb
+from .contacts import ContactsMixin, friendly as contact_error
 from .login import LoginMixin
 from .store import Store
 from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE, LOCATION, SEND_OK, STICKER,
@@ -90,12 +91,15 @@ HELP = (
     "• <code>/open</code> [关键词] — 为微信联系人/群建群并主动发起聊天\n"
     "• <code>/chats</code> [关键词] — 查看已连接的会话列表（别名 <code>/list</code>）\n"
     "• <code>/link</code> [关键词] — 点选或搜索绑定现有 Telegram 群与微信会话（无需查 ID）\n"
+    "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
+    "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
     "<b>群内命令</b>\n"
     "• <code>/link</code> [关键词] — 在任意群内直接发，把当前群绑定到微信会话\n"
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
+    "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
     "• <code>/avatar</code> — 同步微信头像为群头像\n"
@@ -106,12 +110,14 @@ HELP = (
     "• 群内发送 <code>@成员名</code> 或 <code>@所有人</code> 可触发微信 @ 提醒\n"
     "• 删除单条已发消息或回复 <code>/recall</code> 可自动撤回微信消息（2 分钟内有效）\n"
     "• 以 <code>//</code> 开头的内容仅留在 Telegram，不会发到微信\n"
+    "• 收到微信好友请求会推送到这里，可直接通过\n"
     "• 图片默认原图收发；发文件选原图也会按原图送达微信；支持贴纸与来电一键拒接"
 )
 
 GROUP_HELP = (
     "<b>桥接群命令</b>\n"
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
+    "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
     "• <code>/avatar</code> — 同步微信头像为群头像\n"
@@ -130,6 +136,8 @@ TOPIC_HELP = (
     "• <code>/find</code> [关键词] — 搜索微信联系人/群（不填显示最近会话，点按钮直接打开）\n"
     "• <code>/open</code> [关键词] — 为微信联系人/群新建话题并主动发起聊天\n"
     "• <code>/chats</code> [关键词] — 查看已连接的会话列表（别名 <code>/list</code>）\n"
+    "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
+    "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
@@ -137,6 +145,7 @@ TOPIC_HELP = (
     "• <code>/forum</code> — 把当前群设为桥接话题群（需先开启话题，并把我设为管理员）\n"
     "• <code>/link</code> [关键词] — 在某个话题里发，把该话题绑定到微信会话\n"
     "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
+    "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
     "• <code>/rename</code> — 同步微信备注/群名为话题标题（别名 <code>/title</code>）\n"
@@ -145,12 +154,14 @@ TOPIC_HELP = (
     "<b>常用技巧</b>\n"
     "• 话题内发送 <code>@成员名</code> 或 <code>@所有人</code> 可触发微信 @ 提醒\n"
     "• 回复 <code>/recall</code> 可撤回微信消息（2 分钟内有效）\n"
-    "• 以 <code>//</code> 开头的内容仅留在 Telegram，不会发到微信"
+    "• 以 <code>//</code> 开头的内容仅留在 Telegram，不会发到微信\n"
+    "• 收到微信好友请求会推送到私聊，可直接通过"
 )
 
 TOPIC_GROUP_HELP = (
     "<b>话题群命令</b>\n"
     "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
+    "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
     "• <code>/rename</code> — 同步最新微信备注/群名为话题标题（别名 <code>/title</code>）\n"
@@ -177,6 +188,8 @@ PRIVATE_BOT_COMMANDS = [
     ("open", "为微信会话建群发起聊天"),
     ("chats", "查看已连接的会话列表"),
     ("link", "选择绑定微信会话与TG群"),
+    ("requests", "查看待处理的微信好友请求"),
+    ("add", "按微信号添加微信好友"),
     ("status", "查看运行与微信在线状态"),
     ("wxlogin", "重新登录微信（手机确认或扫码）"),
     ("help", "查看使用指南"),
@@ -184,6 +197,7 @@ PRIVATE_BOT_COMMANDS = [
 
 GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
+    ("contact", "查看好友资料与朋友圈权限"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("recall", "回复消息以撤回微信消息"),
     ("avatar", "同步微信头像到群头像"),
@@ -198,6 +212,8 @@ TOPIC_PRIVATE_BOT_COMMANDS = [
     ("find", "搜索微信联系人或群（可一键建话题）"),
     ("open", "为微信会话新建话题发起聊天"),
     ("chats", "查看已连接的会话列表"),
+    ("requests", "查看待处理的微信好友请求"),
+    ("add", "按微信号添加微信好友"),
     ("status", "查看运行与微信在线状态"),
     ("wxlogin", "重新登录微信（手机确认或扫码）"),
     ("help", "查看使用指南"),
@@ -205,6 +221,7 @@ TOPIC_PRIVATE_BOT_COMMANDS = [
 
 TOPIC_GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
+    ("contact", "查看好友资料与朋友圈权限"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("recall", "回复消息以撤回微信消息"),
     ("rename", "同步最新微信名称到话题标题"),
@@ -654,7 +671,7 @@ def _match_mentions(text: str, members: list[dict]) -> dict | None:
     return {"all": mention_all, "userIds": user_ids}
 
 
-class Bridge(LoginMixin):
+class Bridge(ContactsMixin, LoginMixin):
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._init_login()
@@ -922,6 +939,12 @@ class Bridge(LoginMixin):
                              data.get("threadId"), origin)
             elif kind == "message.recalled":
                 await self.on_wx_recall(data)
+            elif kind == "friend_request.updated":
+                await self.on_friend_request_event(data)
+            elif kind == "contacts.updated":
+                await self.on_wx_profile_changed(data.get("contactId"))
+            elif kind == "group.updated":
+                await self.on_wx_profile_changed(data.get("groupId"))
         except Exception:
             log.exception("Failed to handle %s event %s", kind, event.get("cursor"))
 
@@ -2330,7 +2353,8 @@ class Bridge(LoginMixin):
                 await self._handle_group_link(event, arg.strip())
         elif cmd_name == "/help":
             await self._send_group_notice(event.chat_id, msg.id, TOPIC_GROUP_HELP)
-        elif cmd_name in ("/wx", "/unlink", "/members", "/at", "/recall", "/rename", "/title", "/avatar"):
+        elif cmd_name in ("/wx", "/unlink", "/members", "/at", "/recall", "/rename", "/title", "/avatar",
+                          "/contact", "/info"):
             await self._send_group_notice(event.chat_id, msg.id,
                                           "这个话题还没有绑定微信会话，发送 <code>/link</code> 绑定。")
 
@@ -2391,6 +2415,18 @@ class Bridge(LoginMixin):
                 head = f"对应微信会话：<b>{_esc(title)}</b>\n" if title else "对应微信会话："
                 await self.bot.send_message(chat_id, f"{head}<code>{_esc(thread_id)}</code>",
                                             parse_mode="html", reply_to=await self._bot_reply_id(chat_id, msg.id))
+                return
+            if cmd_name in ("/contact", "/info"):
+                buttons = None
+                if not self.wx_ready:
+                    card = "🔐 微信尚未登录，登录后再查看联系人资料。"
+                else:
+                    try:
+                        card, buttons = await self.contact_card(thread_id)
+                    except WeChatError as e:
+                        card = f"⚠️ 读取联系人资料失败：{_esc(contact_error(e.code))}"
+                await self.bot.send_message(chat_id, card, parse_mode="html", buttons=buttons, link_preview=False,
+                                            reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/avatar" and self.topics:
                 await self.bot.send_message(chat_id, "Telegram 话题不支持设置头像",
@@ -2813,7 +2849,7 @@ class Bridge(LoginMixin):
             seen.add(tid)
             kind = raw.get("kind") or default_kind or ("group" if tid.endswith("@chatroom") else "direct")
             name = (raw.get("displayName") or raw.get("remark") or raw.get("nickname") or tid).strip()
-            items.append({"id": tid, "name": name, "kind": kind})
+            items.append({"id": tid, "name": name, "kind": kind, "relation": raw.get("relation")})
 
         if not q:
             try:
@@ -2829,7 +2865,10 @@ class Bridge(LoginMixin):
             except WeChatError:
                 pass
         try:
-            for c in await self.wx.search_contacts(q, limit=limit):
+            # agent-wechat >= 2.7 lists only friends by default; also show people you share a group with
+            # (or who removed you), friends first.
+            found = await self.wx.search_contacts(q, limit=limit, relation="all")
+            for c in sorted(found, key=lambda c: c.get("relation") not in (None, "friend")):
                 add(c, "direct")
         except WeChatError as e:
             log.debug("search_contacts failed: %s", e.code)
@@ -3056,6 +3095,9 @@ class Bridge(LoginMixin):
             await event.answer("按钮已过期，请重新发送命令", alert=True)
             return
         action = payload.get("action")
+        if str(action).startswith(("fr_", "add_", "ct_")):
+            await self.on_contact_ui(event, payload)
+            return
         if action == "cancel":
             self._link_wait = None
             await self._edit_ui_msg(event, "已取消操作。")
@@ -3155,6 +3197,13 @@ class Bridge(LoginMixin):
                 if self.topics:
                     forum = f"<code>{self.forum_chat}</code>" if self.forum_chat else "未设置（在群里发 /forum）"
                     mode = f"\n模式：话题群 {forum}"
+                if self.wx_ready:
+                    try:
+                        page = await self.wx.contact_requests(direction="incoming", actionable=True, limit=1)
+                        if pending := int(page.get("pendingIncomingCount") or 0):
+                            mode += f"\n好友请求：{pending} 条待处理（发 /requests 查看）"
+                    except (WeChatError, ValueError, TypeError):
+                        pass  # older daemon or not readable right now
                 await event.reply(f"运行 {up // 3600}h{up % 3600 // 60}m，已转发 {self.forwarded} 条，"
                                   f"已连接 {len(self._link_rows())} 个会话。\n"
                                   f"微信：{state}，账号 <code>{_esc(self.wx.account or '-')}</code>{mode}",
@@ -3220,10 +3269,14 @@ class Bridge(LoginMixin):
                     parse_mode="html", buttons=buttons)
             elif cmd == "/wxlogin":
                 await self.request_wechat_login(force_qr=(arg.lower() in ("qr", "scan")))
-            elif cmd in ("/find", "/open") and not self.wx_ready:
+            elif cmd in ("/find", "/open", "/requests", "/add") and not self.wx_ready:
                 await event.reply(
                     "🔐 微信尚未登录，请先在手机微信上确认登录或扫码登录，也可以点击下方按钮重新发起登录。",
                     buttons=self._wx_login_buttons())
+            elif cmd == "/requests":
+                await self.cmd_requests(event)
+            elif cmd == "/add":
+                await self.cmd_add(event, arg)
             elif cmd == "/find":
                 cands = await self._wx_search_candidates(arg, limit=15 if arg else 10)
                 if not cands:
@@ -3232,6 +3285,8 @@ class Bridge(LoginMixin):
                 for c in cands:
                     icon = "👥" if c["kind"] == "group" else "👤"
                     tag = f"（已建{noun}）" if self._dest_for_thread(c["id"]) is not None else ""
+                    if c.get("relation") == "non_contact":
+                        tag += "（非好友）"
                     lines.append(f"{icon} <b>{_esc(c['name'])}</b>{tag} — <code>{_esc(c['id'])}</code>")
                 buttons = []
                 for c in cands[:8]:

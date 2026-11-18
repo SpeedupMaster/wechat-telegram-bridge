@@ -60,6 +60,12 @@
 - **实时来电提醒与拒接**：微信单聊语音/视频来电、群语音通话邀请实时推送到对应会话，支持点击「**📵 拒接**」一键挂断。
 - **在 Telegram 内接听语音（可选）**：配置 HTTPS 域名（支持内置 Cloudflare Tunnel 免公网端口或 Caddy/Nginx 反代）后，可点击「**📞 接听**」或「**📞 加入**」在 Telegram Mini App 网页中使用麦克风直接通话，支持静音与挂断。
 
+### 5. 微信好友管理（`agent-wechat >= 2.7.0`）
+- **好友请求推送**：新的微信好友请求以卡片推送到机器人私聊，展示验证消息与历史留言，一键「**✅ 通过**」「**💬 通过并聊天**」（同时建好群/话题）或「**🔒 通过（仅聊天）**」；`/requests` 随时查看待处理请求。
+- **主动添加好友**：私聊发送 `/add 微信号 [验证消息]`，先搜索预览，确认后再发送好友请求。
+- **好友资料与朋友圈权限**：在会话里发送 `/contact`，查看微信号、昵称、备注与好友关系，点按切换「仅聊天 / 不让 TA 看我的朋友圈 / 不看 TA 的朋友圈」，或删除好友（聊天记录与绑定保留）。
+- **名称自动同步**：微信备注或群名变化后，自动更新对应 Telegram 群/话题标题。
+
 ---
 
 ## 运行模式：群组模式 vs 话题模式
@@ -176,11 +182,13 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 
 | 命令 | 说明 |
 | :--- | :--- |
-| `/find [关键词]` | 搜索微信联系人与微信群（不填关键词则列出最近会话，可点击按钮直接创建群/话题） |
+| `/find [关键词]` | 搜索微信联系人与微信群（不填关键词则列出最近会话，可点击按钮直接创建群/话题；同群成员等非好友会标注「非好友」） |
 | `/open [关键词]` | 为指定微信联系人或群聊新建 Telegram 群/话题并主动发起会话 |
 | `/chats [关键词]` | 查看当前已绑定的所有微信会话列表（别名 `/list`） |
 | `/link [关键词]` | 交互式点选绑定现有的 Telegram 群与微信会话（仅 `groups` 模式；也支持 `/link 微信ID TG群ID`） |
-| `/status` | 查看桥接运行时长、收发统计、已绑定会话数与微信在线状态 |
+| `/requests` | 查看待处理的微信好友请求，点名字展开卡片后一键通过；没有待处理时显示等待对方通过的请求 |
+| `/add 微信号 [验证消息]` | 按微信号搜索微信用户，预览确认后发送好友请求（可选「仅聊天」）；已是好友时直接给出发起聊天按钮 |
+| `/status` | 查看桥接运行时长、收发统计、已绑定会话数、微信在线状态与待处理好友请求数 |
 | `/wxlogin` | 手动触发微信重新登录（支持手机确认或扫码） |
 | `/help` | 查看完整使用指南 |
 
@@ -189,6 +197,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | 命令 | 适用模式 | 说明 |
 | :--- | :---: | :--- |
 | `/wx` | 通用 | 查看当前群/话题绑定的微信名称与原始会话 ID |
+| `/contact` | 通用 | 查看微信好友资料（微信号、昵称、备注、好友关系），点按切换朋友圈权限或删除好友（别名 `/info`） |
 | `/members [关键词]` | 通用 | 列出当前微信群成员，点击代码块即可复制 `@名字`（别名 `/at`） |
 | `/recall` | 通用 | 回复自己发出的某条消息并发送此命令，撤回对应微信消息（2 分钟内有效） |
 | `/rename` | 通用 | 重新拉取最新微信备注名/群名并更新到当前群/话题标题（别名 `/title`） |
@@ -289,7 +298,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `CALL_WEB_APP` | 否 | 空 | `@BotFather` `/newapp` 注册的 Mini App 短名称 |
 | `COMPOSE_PROFILES` | 否 | 空 | 设为 `cloudflare` 时随 Compose 启动内置的 `cloudflared` 隧道容器 |
 | `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
-| `AGENT_WECHAT_VERSION` | 否 | `v2.6.0` | 上游 `agent-wechat` 镜像版本标签 |
+| `AGENT_WECHAT_VERSION` | 否 | `v2.7.1` | 上游 `agent-wechat` 镜像版本标签 |
 
 ### 高级配置（`config/config.toml`）
 
@@ -313,6 +322,8 @@ cp config.example.toml config/config.toml
 | `max_media_mb` | `200` | 单个媒体文件的收发体积上限（MB） |
 | `call_notifications` | `true` | 是否推送微信语音/视频来电通知与一键拒接按钮 |
 | `link_card_images` | `true` | 是否将微信分享链接渲染为横向图文卡片 |
+| `friend_requests` | `true` | 是否把新的微信好友请求推送到机器人私聊（需 `agent-wechat >= 2.7.0`） |
+| `auto_rename` | `true` | 微信备注/群名变化后是否自动更新 Telegram 群/话题标题（关闭后可发 `/rename` 手动同步） |
 | `gif_as_sticker` | `true` | 是否将 Telegram 发送的 GIF 动图转为微信原生表情发送 |
 | `skip_threads` | `["weixin"]` | 忽略不桥接的微信会话 ID 列表（如 `["filehelper", "weixin"]`） |
 
@@ -398,6 +409,7 @@ python -m unittest discover -s tests -v
 ├── bridge/
 │   ├── __main__.py        # CLI 入口（python -m bridge [config.toml] [-v]）
 │   ├── config.py          # 环境变量与 config.toml 配置解析及校验
+│   ├── contacts.py        # 微信好友请求卡片、/requests、/add、/contact 好友资料与朋友圈权限
 │   ├── core.py            # 双向桥接核心逻辑、消息转换、@提及解析、命令与菜单注册
 │   ├── login.py           # Bot 交互式引导配对、Telegram 内联键盘/扫码登录、微信重登逻辑
 │   ├── wechat.py          # agent-wechat HTTP/SSE 异步客户端、流式媒体下载与断点续传

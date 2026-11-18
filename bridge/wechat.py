@@ -36,6 +36,8 @@ SEND_DONE = {"accepted", "completed", "succeeded", "available", "failed", "needs
 SEND_OK = {"accepted", "completed", "succeeded", "available"}
 JOB_DONE = {"accepted", "completed", "succeeded", "available", "failed", "partial", "cancelled",
             "expired", "needs_review", "unsupported"}
+OP_DONE = {"succeeded", "completed", "failed", "expired", "rejected", "cancelled", "needs_review"}
+OP_OK = {"succeeded", "completed"}
 STICKER_PREP_TTL_SECONDS = 20 * 3600
 STICKER_PREP_MAX_ENTRIES = 512
 _EXPIRED_PREP_CODES = {"sticker_preparation_expired", "sticker_preparation_not_found"}
@@ -351,9 +353,91 @@ class WeChatClient:
     async def contact(self, username: str) -> dict:
         return await self._req("GET", self._a(f"contacts/{_id(username)}"))
 
-    async def search_contacts(self, text: str, limit: int = 20) -> list[dict]:
-        data = await self._req("GET", self._a("contacts"), params={"search": text, "limit": limit})
+    async def search_contacts(self, text: str, limit: int = 20, *, relation: str | None = None) -> list[dict]:
+        """Search cached contacts. agent-wechat >= 2.7 lists only friends unless `relation` says otherwise
+        (`all`, `friend`, `non_contact`, `unknown`); older daemons reject the filter, so it is dropped then."""
+        params: dict[str, Any] = {"search": text, "limit": limit}
+        if relation:
+            params["relation"] = relation
+        try:
+            data = await self._req("GET", self._a("contacts"), params=params)
+        except WeChatError as e:
+            if not relation or e.status not in (400, 422):
+                raise
+            params.pop("relation")
+            data = await self._req("GET", self._a("contacts"), params=params)
         return data.get("items", [])
+
+    # --- friend requests and contact settings (agent-wechat >= 2.7) -----------
+    async def contact_requests(self, *, direction: str | None = None, actionable: bool | None = None,
+                               limit: int = 20, cursor: str | None = None) -> dict:
+        """One page of request conversations: {"items", "pendingIncomingCount", "nextCursor", ...}.
+        Tombstones of rows removed since the list was read are dropped from `items`."""
+        params: dict[str, Any] = {"limit": limit}
+        if direction:
+            params["direction"] = direction
+        if actionable is not None:
+            params["actionable"] = "true" if actionable else "false"
+        if cursor:
+            params["cursor"] = cursor
+        page = await self._req("GET", self._a("contact-requests"), params=params) or {}
+        page["items"] = [i for i in page.get("items") or [] if isinstance(i, dict) and not i.get("deleted")]
+        return page
+
+    async def contact_request(self, request_id: str) -> dict:
+        return await self._req("GET", self._a(f"contact-requests/{_id(request_id)}"))
+
+    async def accept_contact_request(self, request_id: str, version: str, key: str,
+                                     privacy: dict | None = None) -> dict:
+        body: dict[str, Any] = {"expectedVersion": version}
+        if privacy is not None:
+            body["privacy"] = privacy
+        op = await self._req("POST", self._a(f"contact-requests/{_id(request_id)}/accept"), json=body,
+                             headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op)
+
+    async def delete_contact_request(self, request_id: str, version: str, key: str) -> dict:
+        """Delete the local request history only; nothing is rejected or cancelled on WeChat."""
+        op = await self._req("DELETE", self._a(f"contact-requests/{_id(request_id)}"),
+                             json={"expectedVersion": version}, headers={"Idempotency-Key": key})
+        return await self._wait_operation(op)
+
+    async def discover_contact(self, query: str) -> dict:
+        """Look a person up on WeChat by exact WeChat ID. Returns a short-lived `recipientRef`
+        (null when WeChat offers no way to add them), plus `contactId` / `request` when already known."""
+        return await self._req("POST", self._a("search/contacts"), json={"query": query}, timeout=_SEND_TIMEOUT)
+
+    async def send_contact_request(self, recipient_ref: str, message: str, key: str,
+                                   privacy: dict | None = None) -> dict:
+        body: dict[str, Any] = {"recipientRef": recipient_ref, "message": message}
+        if privacy is not None:
+            body["privacy"] = privacy
+        op = await self._req("POST", self._a("contact-requests"), json=body,
+                             headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op)
+
+    async def contact_privacy(self, username: str) -> dict:
+        """{"privacy": {"chatsOnly", "hideMyPosts", "hideTheirPosts"}, "version"}"""
+        return await self._req("GET", self._a(f"contacts/{_id(username)}/privacy"))
+
+    async def update_contact_privacy(self, username: str, privacy: dict, version: str, key: str) -> dict:
+        op = await self._req("PATCH", self._a(f"contacts/{_id(username)}"),
+                             json={"expectedVersion": version, "privacy": privacy},
+                             headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op)
+
+    async def remove_contact(self, username: str, key: str) -> dict:
+        """Remove the friendship; the chat history stays."""
+        op = await self._req("DELETE", self._a(f"contacts/{_id(username)}"), headers={"Idempotency-Key": key},
+                             timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op)
+
+    async def _wait_operation(self, op: Any, timeout: float = 120) -> dict:
+        if not isinstance(op, dict):
+            return {}
+        if not op.get("id") or op.get("state") in OP_DONE:
+            return op
+        return await self._wait(op, lambda o: f"operations/{_id(o['id'])}", OP_DONE, timeout)
 
     async def search_groups(self, text: str, limit: int = 20) -> list[dict]:
         data = await self._req("GET", self._a("groups"), params={"search": text, "limit": limit})

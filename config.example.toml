@@ -61,6 +61,10 @@ call_notifications = true
 # call_web_app = ""
 # 将微信链接分享（小红书、公众号、网页等）渲染为微信风格卡片图并附带直达按钮
 link_card_images = true
+# 把收到的微信好友请求推送到与机器人的私聊，可一键通过（需 agent-wechat >= 2.7.0）
+friend_requests = true
+# 微信备注 / 群名变化后自动更新 Telegram 群或话题标题（关闭后可在群里发 /rename 手动同步）
+auto_rename = true
 # 将 Telegram 发送的 GIF 动图转为微信表情包发送（需 agent-wechat >= 2.4.0，失败时自动回退为视频）
 gif_as_sticker = true
 # 不桥接的微信会话 ID，例如 ["filehelper", "weixin"]

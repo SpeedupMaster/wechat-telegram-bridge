@@ -58,6 +58,8 @@ class BridgeConfig:
     call_web_listen: str = "127.0.0.1:8780"
     call_web_app: str = ""  # optional BotFather Mini App short name: buttons open t.me/<bot>/<app> instead
     link_card_images: bool = True
+    friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
+    auto_rename: bool = True  # follow WeChat remark/group-name changes in Telegram titles
     gif_as_sticker: bool = True
     skip_threads: list[str] = field(default_factory=list)
 
