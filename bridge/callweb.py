@@ -337,6 +337,30 @@ class CallWeb:
             return bool(caps.get("conferenceCreate") and caps.get("conferenceAudio"))
         return bool(caps.get("directAudio"))
 
+    def can_invite(self, entry: dict) -> bool:
+        """More people can be invited into a connected group call this bridge started and still owns."""
+        return (entry["kind"] == "conference" and entry.get("direction") == "outgoing"
+                and entry["stage"] == "connected" and not entry["terminal"]
+                and self.has_session(entry["call_id"])
+                and bool(self.bridge._calls_caps.get("conferenceInvite")))
+
+    async def invite(self, entry: dict, contact_ids: list[str], names: dict[str, str]) -> None:
+        if not self.can_invite(entry):
+            raise CallActionError("群通话已结束，或当前 agent-wechat 不支持追加邀请")
+        if not contact_ids:
+            raise CallActionError("还没有选择要邀请的群成员")
+        if len(contact_ids) > MAX_INVITEES:
+            raise CallActionError(f"一次最多邀请 {MAX_INVITEES} 人")
+        res = await self._command({"type": "call.invite", "callId": entry["call_id"], "contactIds": contact_ids})
+        if res.get("status") not in ("accepted", "replayed"):
+            raise CallActionError(_err_text(res.get("code"), "agent-wechat 拒绝了邀请"))
+        invitees = entry.setdefault("invitees", {})
+        failed = entry.setdefault("invite_failed", {})
+        for cid in contact_ids:
+            invitees[cid] = names.get(cid) or invitees.get(cid) or cid
+            failed.pop(cid, None)  # a new attempt: wait for its own result
+        await self.bridge._sync_call_msg(entry)
+
     def can_answer(self, entry: dict) -> bool:
         caps = self.bridge._calls_caps
         return (entry["kind"] == "direct" and entry.get("call_type", "voice") == "voice"

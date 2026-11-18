@@ -4896,6 +4896,90 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         await self._until(lambda: self.sock.commands[-1]["type"] == "call.hangup")  # leave, not cancel
         await ws.close()
 
+    async def test_group_call_invites_more_members(self):
+        chat = self._team()
+        self.b._calls_caps = {**self.b._calls_caps, "conferenceInvite": True}
+        self.b._self_wxid = "wxid_me"
+        await self.b.on_tg_message(tg_event(chat, 10, "/call bobby"))
+        card = self.b.bot.sent[-1]
+        token = _button_urls(card)[0].rsplit("/", 1)[1]
+        ws = await self._page(token)
+        await self._next(ws)
+
+        def state(rev, st, participants):
+            return {"type": "call.state", "call": {
+                "callId": "conf-i", "revision": rev, "kind": "conference", "callType": "voice",
+                "direction": "outgoing", "state": st, "ownedByThisClient": True, "groupId": "123@chatroom",
+                "participants": participants}}
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.dial":
+                await self.b.handle_call_event(state(1, "connected", [
+                    {"participantId": "p1", "contactId": "wxid_b", "membership": "joined"}]))
+                return {"type": "command.result", "status": "accepted", "callId": "conf-i", "ownerToken": "own-i"}
+            if cmd["type"] == "call.invite":
+                return {"type": "command.result", "status": "accepted", "callId": "conf-i"}
+            return None
+        self.sock.on_command = on_cmd
+        await ws.send_json({"type": "dial"})
+        await self._next(ws, pred=lambda m: m["phase"] == "active")
+        await self._until(lambda: "群通话中（Telegram 发起）" in card.text)
+        self.assertEqual(_button_texts(card), ["🎧 通话界面", "➕ 邀请更多人", "📴 挂断"])
+
+        intruder = await self._press(card, "邀请更多人", user=111)
+        self.assertEqual(intruder.answers, [("只有桥接账号本人可以操作", True)])
+        await self._press(card, "邀请更多人")
+        picker = self.b.bot.sent[-1]
+        self.assertIsNot(picker, card)
+        self.assertEqual(picker.kwargs.get("reply_to"), card.id)
+        self.assertIn("邀请加入群语音通话", picker.text)
+        self.assertIn("邀请：尚未选择", picker.text)
+        texts = _button_texts(picker)
+        self.assertNotIn("▫️ Bob", texts)  # already in the call
+        self.assertNotIn("▫️ Me", texts)
+        self.assertIn("▫️ Alice", texts)
+        self.assertNotIn("发送邀请", " ".join(texts))
+        await self._press(picker, "Alice")
+        await self._press(picker, "Carol")
+        self.assertIn("➕ 发送邀请（2 人）", _button_texts(picker))
+
+        await self._press(picker, "发送邀请")
+        invite = self.sock.commands[-1]
+        self.assertEqual(invite, {**invite, "type": "call.invite", "callId": "conf-i",
+                                  "contactIds": ["wxid_a", "wxid_c"]})
+        self.assertIn("已邀请 2 人", picker.text)
+        self.assertIsNone(picker.kwargs["buttons"])
+        self.assertIn("邀请（3 人）：Bob、Alice、Carol", card.text)
+
+        await self.b.handle_call_event({"type": "call.invitation_result", "callId": "conf-i", "results": [
+            {"contactId": "wxid_a", "status": "submitted", "verificationRequired": False},
+            {"contactId": "wxid_c", "status": "submitted", "verificationRequired": True}]})
+        self.assertIn("邀请异常：Carol（需要验证）", card.text)
+
+        # A pending invitation is left out of the next list; a failed one can be retried
+        await self._press(card, "邀请更多人")
+        picker = self.b.bot.sent[-1]
+        texts = _button_texts(picker)
+        self.assertNotIn("▫️ Alice", texts)
+        self.assertIn("▫️ Carol", texts)
+
+        async def refuse(cmd):
+            if cmd["type"] == "call.invite":
+                return {"type": "command.result", "status": "error", "code": "not_owner"}
+            return None
+        self.sock.on_command = refuse
+        await self._press(picker, "Carol")
+        await self._press(picker, "发送邀请")
+        self.assertIn("邀请失败", self.b.bot.sent[-1].text)
+        self.assertIn("➕ 发送邀请（1 人）", _button_texts(picker))  # still usable
+
+        # The call ends: the open list closes and the card loses its buttons
+        await self.b.handle_call_event(state(2, "ended", []))
+        await self._until(lambda: picker.kwargs["buttons"] is None)
+        self.assertIn("群通话已结束", picker.text)
+        await self._until(lambda: card.kwargs["buttons"] is None)
+        await ws.close()
+
     async def test_group_dial_no_match_and_empty(self):
         chat = self._team()
         await self.b.on_tg_message(tg_event(chat, 10, "/call nobody"))

@@ -884,6 +884,9 @@ class Bridge(ContactsMixin, LoginMixin):
         if data.startswith(b"callhup:"):
             await self._on_call_hangup_callback(event, data[8:].decode("utf-8", errors="ignore"))
             return
+        if data.startswith(b"callinv:"):
+            await self._on_call_invite_callback(event, data[8:].decode("utf-8", errors="ignore"))
+            return
         if data.startswith(b"dialx:"):
             await self._on_dial_cancel_callback(event, data[6:].decode("utf-8", errors="ignore"))
             return
@@ -1974,6 +1977,8 @@ class Bridge(ContactsMixin, LoginMixin):
                 rows.append([Button.inline("📵 拒接", f"callrej:{entry['token']}".encode())])
             elif web is not None and entry.get("answered_by_tg") and web.has_session(entry["call_id"]):
                 rows.append([Button.url("🎧 通话界面", web.link(web.token_for_call(entry)))])
+                if web.can_invite(entry):
+                    rows.append([Button.inline("➕ 邀请更多人", f"callinv:{entry['token']}".encode())])
                 label = "📴 取消呼叫" if outgoing and entry["stage"] in ("dialing", "ringing") else "📴 挂断"
                 rows.append([Button.inline(label, f"callhup:{entry['token']}".encode())])
         return text, rows or None
@@ -2034,6 +2039,8 @@ class Bridge(ContactsMixin, LoginMixin):
                 await self.call_web.on_entry_changed(entry)
             except Exception:
                 log.exception("Could not update the call page for %s", entry.get("call_id"))
+        if entry["terminal"] and entry.get("direction") == "outgoing" and entry["kind"] == "conference":
+            await self._close_call_invites(entry)
         if not entry.get("chat_id") or not entry.get("msg_id"):
             return
         text, buttons = self._render_call(entry)
@@ -2458,7 +2465,9 @@ class Bridge(ContactsMixin, LoginMixin):
     def _render_group_dial(self, req: dict) -> tuple[str, list | None]:
         selected = req["selected"]
         names = req["names"]
-        lines = ["📞 <b>微信群语音通话</b>", f"群：<b>{_esc(req['name'])}</b>"]
+        inviting = bool(req.get("invite_call"))
+        title = "➕ <b>邀请加入群语音通话</b>" if inviting else "📞 <b>微信群语音通话</b>"
+        lines = [title, f"群：<b>{_esc(req['name'])}</b>"]
         if selected:
             shown = "、".join(_esc(names.get(cid) or cid) for cid in selected[:DIAL_PICK_SHOWN])
             more = f" 等 {len(selected)} 人" if len(selected) > DIAL_PICK_SHOWN else ""
@@ -2489,7 +2498,10 @@ class Bridge(ContactsMixin, LoginMixin):
                          Button.inline("▶️", f"dialp:{did}:p{(page + 1) % pages}".encode())])
         rows.append([Button.inline("☑️ 全选", f"dialp:{did}:a".encode()),
                      Button.inline("🔄 清空", f"dialp:{did}:c".encode())])
-        if selected:
+        if selected and inviting:
+            # The call page already has the microphone: inviting is a plain command, no page needed.
+            rows.append([Button.inline(f"➕ 发送邀请（{len(selected)} 人）", f"dialp:{did}:go".encode())])
+        elif selected:
             rows.append([Button.url(f"📞 开始呼叫（{len(selected)} 人）", web.link(web.token_for_dial(req)))])
         rows.append([Button.inline("✖️ 取消", f"dialx:{did}".encode())])
         return text, rows
@@ -2557,13 +2569,17 @@ class Bridge(ContactsMixin, LoginMixin):
                 status_text="勾选要邀请的成员，再点「开始呼叫」，在通话页面授权麦克风后发起",
             )
         for old in list(self._dial_requests.values()):
-            if old["live"] and old["thread_id"] == thread_id and not old.get("dialing"):
+            if (old["live"] and old["thread_id"] == thread_id and not old.get("dialing")
+                    and not old.get("invite_call")):
                 await self._close_dial_request(old, "⚪ 已发起新的呼叫，此链接已失效")
+        await self._post_dial_request(req, reply_to)
+
+    async def _post_dial_request(self, req: dict, reply_to: int | None) -> None:
         while len(self._dial_requests) > 50:
             self._dial_requests.pop(next(iter(self._dial_requests)))
         text, buttons = self._render_dial(req)
-        sent = await self.bot.send_message(chat_id, text, parse_mode="html", buttons=buttons, link_preview=False,
-                                           reply_to=reply_to)
+        sent = await self.bot.send_message(req["chat_id"], text, parse_mode="html", buttons=buttons,
+                                           link_preview=False, reply_to=reply_to)
         req["msg_id"] = sent.id
         req["_last_render"] = self._render_key(text, buttons)
         self._dial_requests[req["dial_id"]] = req
@@ -2597,8 +2613,17 @@ class Bridge(ContactsMixin, LoginMixin):
             await event.answer("呼叫已开始或已结束")
             return
         if req.get("dialing"):
-            await event.answer("正在发起群通话…")
+            await event.answer("正在发起群通话…" if not req.get("invite_call") else "正在发送邀请…")
             return
+        if req.get("invite_call"):
+            entry = self._active_calls.get(req["invite_call"])
+            if entry is None or self.call_web is None or not self.call_web.can_invite(entry):
+                await event.answer("群通话已结束")
+                await self._close_dial_request(req, "⚪ 群通话已结束，无法再邀请")
+                return
+            if op == "go":
+                await self._send_call_invite(event, req, entry)
+                return
         selected: list[str] = req["selected"]
         members: list[dict] = req["members"]
         limit = callweb.MAX_INVITEES
@@ -2635,7 +2660,8 @@ class Bridge(ContactsMixin, LoginMixin):
         while req.get("dialing"):
             await asyncio.sleep(1.0)
         if req["live"] and not req.get("call_id"):
-            await self._close_dial_request(req, "⚪ 呼叫链接已过期，请重新发送 /call")
+            await self._close_dial_request(req, "⚪ 邀请列表已过期，可在通话消息上重新点「邀请更多人」"
+                                           if req.get("invite_call") else "⚪ 呼叫链接已过期，请重新发送 /call")
 
     async def _close_dial_request(self, req: dict, status: str) -> None:
         req["live"] = False
@@ -2674,6 +2700,79 @@ class Bridge(ContactsMixin, LoginMixin):
             return
         await event.answer("已取消")
         await self._close_dial_request(req, "⚪ 已取消")
+
+    # ---------------------------------------------------------------- inviting more people (call.invite)
+    async def _on_call_invite_callback(self, event, token: str) -> None:
+        if event.sender_id != self.owner_id:
+            await event.answer("只有桥接账号本人可以操作", alert=True)
+            return
+        call_id = self._call_tokens.get(token)
+        entry = self._active_calls.get(call_id) if call_id else None
+        web = self.call_web
+        if not entry or web is None or not web.can_invite(entry):
+            await event.answer("群通话已结束，或当前 agent-wechat 不支持追加邀请", alert=True)
+            if entry:
+                await self._sync_call_msg(entry)
+            return
+        try:
+            members = await self._group_dial_members(entry["thread_id"])
+        except WeChatError as e:
+            await event.answer(f"获取群成员失败：{e.code}", alert=True)
+            return
+        # Leave out whoever is in the call or still has a pending invitation; failed or left ones can be retried.
+        state = {p.get("contactId"): p.get("membership") for p in entry.get("participants") or []}
+        failed = entry.get("invite_failed") or {}
+        busy = {cid for cid, m in state.items() if m in ("joined", "invited")}
+        busy |= {cid for cid in entry.get("invitees") or {} if cid not in failed and state.get(cid) != "left"}
+        members = [m for m in members if m["id"] not in busy]
+        if not members:
+            await event.answer("群里没有可以再邀请的成员了", alert=True)
+            return
+        for old in list(self._dial_requests.values()):
+            if old["live"] and old.get("invite_call") == call_id and not old.get("dialing"):
+                await self._close_dial_request(old, "⚪ 已打开新的邀请列表")
+        await event.answer()
+        req = {
+            "dial_id": secrets.token_hex(6),
+            "kind": "conference",
+            "invite_call": call_id,
+            "contact_id": entry["thread_id"],
+            "thread_id": entry["thread_id"],
+            "name": entry["caller_name"],
+            "chat_id": entry["chat_id"],
+            "msg_id": None,
+            "status_text": "勾选要邀请的成员，再点「发送邀请」",
+            "live": True,
+            "dialing": False,
+            "call_id": None,
+            "expire_task": None,
+            "members": members,
+            "names": {m["id"]: m["label"] for m in members},
+            "selected": [],
+            "page": 0,
+        }
+        await self._post_dial_request(req, entry.get("msg_id"))
+
+    async def _send_call_invite(self, event, req: dict, entry: dict) -> None:
+        selected = list(req["selected"])
+        if not selected:
+            await event.answer("还没有选择要邀请的成员")
+            return
+        req["dialing"] = True  # before the first await: a double tap must not invite twice
+        await event.answer("正在发送邀请…")
+        try:
+            await self.call_web.invite(entry, selected, req["names"])
+        except CallActionError as e:
+            req["dialing"] = False
+            await self._report(req["chat_id"], req["msg_id"], f"邀请失败：{e}")
+            return
+        req["dialing"] = False
+        await self._close_dial_request(req, f"✅ 已邀请 {len(selected)} 人，结果见通话消息")
+
+    async def _close_call_invites(self, entry: dict) -> None:
+        for req in list(self._dial_requests.values()):
+            if req["live"] and req.get("invite_call") == entry["call_id"] and not req.get("dialing"):
+                await self._close_dial_request(req, "⚪ 群通话已结束，无法再邀请")
 
     # ======================================================================
     # Telegram -> WeChat
