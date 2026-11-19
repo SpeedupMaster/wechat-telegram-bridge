@@ -224,17 +224,26 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         card = self.b.bot.sent[-1]
         self.assertIn("bob123", card.text)
         self.assertIn("昵称：Bobby", card.text)
-        self.assertIn("关系：✅ 好友", card.text)
+        self.assertIn("✅ 微信好友", card.text)
+        self.assertIn("朋友圈不看 TA", card.text)
         self.assertEqual(self.labels(card.kwargs["buttons"]),
-                         [["⬜ 仅聊天"], ["⬜ 不让 TA 看我的朋友圈"], ["✅ 不看 TA 的朋友圈"], ["🔄 刷新", "🗑 删除好友"]])
+                         [["🔘 聊天、朋友圈等", "⚪ 仅聊天"], ["⬜ 不让 TA 看我", "✅ 不看 TA"],
+                          ["🔄 刷新", "🗑 删除好友"]])
 
-        cb = await self.click(card.kwargs["buttons"], "不让 TA 看我的朋友圈")
+        # Pressing the option already chosen changes nothing
+        calls = len(self.daemon.request_calls)
+        cb = await self.click(card.kwargs["buttons"], "聊天、朋友圈等")
+        self.assertEqual(len(self.daemon.request_calls), calls)
+        self.assertEqual((cb.edits, cb.answers), ([], [("当前已经是这个设置", False)]))
+
+        cb = await self.click(card.kwargs["buttons"], "不让 TA 看我")
         self.assertEqual(self.daemon.request_calls[-1][:3], (
             "PATCH", "contacts/wxid_bob",
             {"expectedVersion": "p1", "privacy": {"chatsOnly": False, "hideMyPosts": True, "hideTheirPosts": True}}))
         text, kw = cb.edits[-1]
         self.assertIn("已更新", text)
-        self.assertEqual(kw["buttons"][1][0].text, "✅ 不让 TA 看我的朋友圈")
+        self.assertEqual(kw["buttons"][1][0].text, "✅ 不让 TA 看我")
+        self.assertIn("朋友圈互不可见", text)
 
         # A stale card (old version) gets refreshed with the reason
         cb = await self.click(card.kwargs["buttons"], "仅聊天")
@@ -264,11 +273,15 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         await self.b.on_tg_message(tg_event(-610, 10, "/contact"))
         card = self.b.bot.sent[-1]
         self.assertNotIn("备注", card.text)
-        self.assertEqual(card.kwargs["buttons"][0][0].text, "✅ 仅聊天")
+        # Chats-only: WeChat has no moments settings then, so neither does the card
+        self.assertEqual(self.labels(card.kwargs["buttons"]),
+                         [["⚪ 聊天、朋友圈等", "🔘 仅聊天"], ["🔄 刷新", "🗑 删除好友"]])
+        self.assertIn("仅聊天（互相看不到朋友圈）", card.text)
         self.assertNotIn("权限暂时读不到", card.text)
 
-        cb = await self.click(card.kwargs["buttons"], "不看 TA 的朋友圈")
-        self.assertEqual(self.daemon.request_calls[-1][2]["expectedVersion"], "v28")
+        cb = await self.click(card.kwargs["buttons"], "聊天、朋友圈等")
+        self.assertEqual(self.daemon.request_calls[-1][2], {
+            "expectedVersion": "v28", "privacy": {"chatsOnly": False, "hideMyPosts": False, "hideTheirPosts": False}})
 
         # 🔄 asks WeChat for the latest details, so a remark missing from the saved profile shows up
         self.daemon.contacts["wxid_amy"].update(remark="艾米", displayName="艾米")
@@ -323,8 +336,7 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         await self.b.on_tg_message(tg_event(-621, 15, "/remark 喵"))
         self.assertIn("只能改好友的备注", self.b.bot.sent[-1].text)
 
-    async def test_syncnames_pulls_the_catalog_and_renames_chats(self):
-        self.b._rename_gap = 0
+    async def test_syncnames_pulls_the_catalog_without_renaming_chats(self):
         self.daemon.add_thread("wxid_dan", "Dan Nick")
         self.daemon.add_contact("wxid_dan", "Dan Nick", nickname="Dan Nick", remark=None, relation="friend")
         self.daemon.add_thread("wxid_eve", "Eve")
@@ -341,10 +353,21 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.daemon.contact_syncs, 2)
         self.assertIn("已从微信重新同步", text)
         self.assertIn("有 1 个联系人这次没拉到", text)
-        self.assertIn("已按新备注更新 1 个群标题", text)
-        self.assertEqual(self.b.user.titles, [(630, "阿丹")])
-        self.assertEqual(self.b._link_title("wxid_dan"), "阿丹")
+        # Titles are only listed, never edited: renaming many chats at once hits Telegram's flood limits
+        self.assertIn("以下 1 个群的标题与微信不一致", text)
+        self.assertIn("• Dan Nick → <b>阿丹</b>", text)
+        self.assertEqual(self.b.user.titles, [])
+        self.assertEqual(self.b._link_title("wxid_dan"), "Dan Nick")
         self.assertEqual(await self.b._contact_names("wxid_dan"), ("阿丹", "Dan Nick"))
+
+        # The daemon's contacts.updated events for the sync don't rename either
+        await self.b.handle_event({"cursor": "9", "kind": "contacts.updated", "data": {"contactId": "wxid_dan"}})
+        self.assertEqual(self.b.user.titles, [])
+
+        # Once things are quiet again, a real remark change is followed as before
+        self.b._names_quiet_until = 0
+        await self.b.handle_event({"cursor": "10", "kind": "contacts.updated", "data": {"contactId": "wxid_dan"}})
+        self.assertEqual(self.b.user.titles, [(630, "阿丹")])
 
         # Nothing left to resume counts as done; titles already match
         self.daemon.sync_rounds = [{"complete": False, "resumeAvailable": False}]

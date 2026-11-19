@@ -96,7 +96,7 @@ HELP = (
     "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
     "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
     "• <code>/newgroup</code> 关键词 关键词 [| 群名] — 勾选好友新建微信群\n"
-    "• <code>/syncnames</code> — 从微信重新同步全部好友资料与备注，并更新标题\n"
+    "• <code>/syncnames</code> — 从微信重新同步全部好友资料与备注（不改标题）\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
@@ -155,7 +155,7 @@ TOPIC_HELP = (
     "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
     "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
     "• <code>/newgroup</code> 关键词 关键词 [| 群名] — 勾选好友新建微信群\n"
-    "• <code>/syncnames</code> — 从微信重新同步全部好友资料与备注，并更新标题\n"
+    "• <code>/syncnames</code> — 从微信重新同步全部好友资料与备注（不改标题）\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
@@ -810,7 +810,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.names: dict[tuple[str, str], str] = {}
         self._names_syncing = False  # a /syncnames is running
         self._remark_poll = 1.5  # seconds between checks that a /remark change was saved
-        self._rename_gap = 1.0  # seconds between Telegram renames after /syncnames
+        self._names_quiet_until = 0.0  # until then (monotonic) contact updates don't rename: after /syncnames
         self._tg_time_ok = True  # Telegram accepted <tg-time> date entities (False after a refusal)
         self._contact_name_cache: dict[str, tuple[str, str, float]] = {}  # wx id -> (remark, nickname, at)
         self.started = time.time()

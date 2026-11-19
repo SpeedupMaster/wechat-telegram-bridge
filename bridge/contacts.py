@@ -14,12 +14,9 @@ from .wechat import OP_OK, WeChatError
 
 log = logging.getLogger("contacts")
 
-# (privacy field, button label, card label)
-PRIVACY_FLAGS = (
-    ("chatsOnly", "仅聊天", "🔒 仅聊天"),
-    ("hideMyPosts", "不让 TA 看我的朋友圈", "🙈 不让 TA 看我的朋友圈"),
-    ("hideTheirPosts", "不看 TA 的朋友圈", "🚫 不看 TA 的朋友圈"),
-)
+PRIVACY_FIELDS = ("chatsOnly", "hideMyPosts", "hideTheirPosts")
+# Moments toggles (privacy field, button label); WeChat hides them while the friend is chats-only
+MOMENT_FLAGS = (("hideMyPosts", "不让 TA 看我"), ("hideTheirPosts", "不看 TA"))
 CHATS_ONLY = {"chatsOnly": True, "hideMyPosts": False, "hideTheirPosts": False}
 NAME_SYNC_ROUNDS = 15  # /syncnames: a round pulls at most 10 pages or runs 2 minutes, then resumes
 
@@ -48,7 +45,7 @@ CONTACT_ERRORS = {
     "operation_expired": "操作已过期，请重新操作",
 }
 
-RELATIONS = {"friend": "✅ 好友", "non_contact": "⚠️ 不是好友", "unknown": "❔ 未知"}
+RELATIONS = {"friend": "✅ 微信好友", "non_contact": "⚠️ 不是微信好友", "unknown": "❔ 好友关系未知"}
 
 
 def _esc(s) -> str:
@@ -127,31 +124,20 @@ class ContactsMixin:
         if await self.notify(text, parse_mode="html", buttons=buttons, link_preview=False) is not None:
             self.store.set(key, version)
 
-    async def on_wx_profile_changed(self, wx_id: str | None) -> bool:
+    async def on_wx_profile_changed(self, wx_id: str | None, *, asked: bool = False) -> bool:
         """A contact's remark/nickname or a group's name changed in WeChat: follow it in Telegram.
+        asked: the owner made this change here (/remark), so follow it even right after a /syncnames.
         True when a Telegram title was changed."""
         if not wx_id:
             return False
         self._forget_names(wx_id)
         if not self.cfg.bridge.auto_rename:
             return False
+        if not asked and not wx_id.endswith("@chatroom") and (
+                self._names_syncing or time.monotonic() < self._names_quiet_until):
+            return False  # a /syncnames reports every contact as updated: renaming them all hits flood limits
         dest = self._dest_for_thread(wx_id)
-        if dest is None:
-            return False
-        try:
-            thread = await self.wx.thread(wx_id)
-        except WeChatError:
-            if wx_id.endswith("@chatroom"):
-                return False
-            try:
-                contact = await self.wx.contact(wx_id)
-            except WeChatError:
-                return False
-            thread = {"id": wx_id, "kind": "direct", "displayName": contact.get("displayName")}
-        thread = await self._named_thread(thread)
-        if not thread.get("displayName"):
-            return False
-        if self._title(thread) == self._link_title(wx_id):
+        if dest is None or await self._outdated_title(wx_id) is None:
             return False
         title, status = await self.sync_title(dest[0], wx_id)
         if status and status != "unchanged":
@@ -159,6 +145,24 @@ class ContactsMixin:
             return False
         log.info("Renamed the Telegram %s of %s to %r", "topic" if self.topics else "group", wx_id, title)
         return status == ""
+
+    async def _outdated_title(self, wx_id: str) -> str | None:
+        """The title the bridged chat of wx_id should have, when it differs from the current one."""
+        try:
+            thread = await self.wx.thread(wx_id)
+        except WeChatError:
+            if wx_id.endswith("@chatroom"):
+                return None
+            try:
+                contact = await self.wx.contact(wx_id)
+            except WeChatError:
+                return None
+            thread = {"id": wx_id, "kind": "direct", "displayName": contact.get("displayName")}
+        thread = await self._named_thread(thread)
+        if not thread.get("displayName"):
+            return None
+        title = self._title(thread)
+        return None if title == self._link_title(wx_id) else title
 
     # --- remarks: /remark in a chat, /syncnames in private ----------------------------
     async def cmd_remark(self, chat_id: int, reply_to: int | None, wx_id: str, arg: str) -> None:
@@ -209,7 +213,7 @@ class ContactsMixin:
         await say(f"✅ {done}。几秒后同步到手机微信{follow}。")
         # The daemon also reports the change as contacts.updated; following it here as well covers a missed event
         await self._await_remark(wx_id, remark)
-        await self.on_wx_profile_changed(wx_id)
+        await self.on_wx_profile_changed(wx_id, asked=True)
 
     async def _await_remark(self, wx_id: str, remark: str | None, wait: float = 10.0) -> None:
         """Wait (briefly) until the daemon reports the new remark as saved."""
@@ -227,8 +231,9 @@ class ContactsMixin:
             await asyncio.sleep(self._remark_poll)
 
     async def cmd_sync_names(self, event) -> None:
-        """Pull the whole contact catalog from WeChat again (remarks missing from old profiles come back),
-        then rename the bridged chats that now have a different name."""
+        """Pull the whole contact catalog from WeChat again (remarks missing from old profiles come back).
+        Only the contact data is refreshed: Telegram titles are left alone (renaming many chats at once
+        runs into Telegram's flood limits); the chats whose title is now outdated are listed for /rename."""
         if self._names_syncing:
             await event.reply("⏳ 已经在同步了，请稍候。")
             return
@@ -250,12 +255,10 @@ class ContactsMixin:
                     break  # otherwise: a round stops after 10 pages or 2 minutes; the next one resumes
             self._contact_name_cache.clear()
             self.names.clear()
-            renamed = 0
-            if self.cfg.bridge.auto_rename:
-                for wx_id in [wx for wx, _, _ in self._link_rows() if not wx.endswith("@chatroom")]:
-                    if await self.on_wx_profile_changed(wx_id):
-                        renamed += 1
-                        await asyncio.sleep(self._rename_gap)  # go easy on Telegram's flood limits
+            outdated: list[tuple[str, str]] = []
+            for wx_id, _, _ in self._link_rows():
+                if not wx_id.endswith("@chatroom") and (title := await self._outdated_title(wx_id)):
+                    outdated.append((self._link_title(wx_id) or wx_id, title))
             noun = "话题" if self.topics else "群"
             lines = ["✅ 联系人资料已从微信重新同步。" if result.get("complete") or not result.get("resumeAvailable")
                      else "⚠️ 同步了一部分，还没完成，稍后再发一次 <code>/syncnames</code> 会接着同步。"]
@@ -263,13 +266,19 @@ class ContactsMixin:
             failed = len(failed) if isinstance(failed, (list, dict)) else failed if isinstance(failed, int) else 0
             if failed:
                 lines.append(f"有 {failed} 个联系人这次没拉到，可以稍后再试。")
-            if self.cfg.bridge.auto_rename:
-                lines.append(f"已按新备注更新 {renamed} 个{noun}标题。" if renamed else f"{noun}标题都已是最新。")
+            if not outdated:
+                lines.append(f"{noun}标题都已是最新。")
             else:
-                lines.append(f"自动改名已关闭（auto_rename = false），要更新标题请在对应{noun}里发 <code>/rename</code>。")
+                lines += ["", f"为避免触发 Telegram 频率限制，没有自动改{noun}标题。"
+                              f"以下 {len(outdated)} 个{noun}的标题与微信不一致，需要时在对应{noun}里发 <code>/rename</code>："]
+                lines += [f"• {_esc(old)} → <b>{_esc(new)}</b>" for old, new in outdated[:30]]
+                if len(outdated) > 30:
+                    lines.append(f"……还有 {len(outdated) - 30} 个")
             await event.reply("\n".join(lines), parse_mode="html")
         finally:
             self._names_syncing = False
+            # the daemon's contacts.updated events for this sync may still be on their way
+            self._names_quiet_until = time.monotonic() + 120
 
     # --- friend request cards ---------------------------------------------------
     def _request_card(self, req: dict, *, new: bool = False, note: str = "") -> tuple[str, list | None]:
@@ -415,20 +424,21 @@ class ContactsMixin:
             return "👥 这是微信群聊，没有好友资料和朋友圈权限可设置。", None
         contact = await self.wx.contact(wx_id)
         name = contact.get("displayName") or contact.get("remark") or contact.get("nickname") or wx_id
-        lines = [f"👤 <b>{_esc(name)}</b>", ""]
+        relation = contact.get("relation")
+        lines = [f"👤 <b>{_esc(name)}</b>"]
+        if relation:
+            lines.append(RELATIONS.get(relation, _esc(relation)))
+        lines.append("")
         alias = contact.get("alias")
         lines.append(f"微信号：<code>{_esc(alias or wx_id)}</code>")
         if alias and alias != wx_id:
-            lines.append(f"ID：<code>{_esc(wx_id)}</code>")
+            lines.append(f"wxid：<code>{_esc(wx_id)}</code>")
         if (nick := contact.get("nickname")) and nick != name:
             lines.append(f"昵称：{_esc(nick)}")
         if remark := contact.get("remark"):
             lines.append(f"备注：{_esc(remark)}" + ("（正在与微信同步…）" if contact.get("remarkPending") else ""))
         elif contact.get("remarkPending"):
             lines.append("备注：正在与微信同步…")
-        relation = contact.get("relation")
-        if relation:
-            lines.append(f"关系：{RELATIONS.get(relation, _esc(relation))}")
         privacy: dict | None = None
         version = ""
         why = ""
@@ -447,13 +457,28 @@ class ContactsMixin:
                         why = friendly(e.code)
         buttons: list = []
         if privacy:
-            lines += ["", "<b>朋友圈与聊天权限</b>（点下方按钮切换）"]
-            for field, label, card_label in PRIVACY_FLAGS:
-                on = bool(privacy.get(field))
-                lines.append(f"{card_label}：{'开' if on else '关'}")
-                buttons.append([Button.inline(f"{'✅' if on else '⬜'} {label}", self._make_ui_token(
-                    {"action": "ct_privacy", "wx_id": wx_id, "field": field, "value": not on,
-                     "privacy": {k: bool(privacy.get(k)) for k, _, _ in PRIVACY_FLAGS}, "version": version}))])
+            current = {k: bool(privacy.get(k)) for k in PRIVACY_FIELDS}
+
+            def toggle(field: str, value: bool):
+                return self._make_ui_token({"action": "ct_privacy", "wx_id": wx_id, "field": field,
+                                            "value": value, "privacy": current, "version": version})
+
+            def choice(label: str, chats_only: bool):
+                if current["chatsOnly"] == chats_only:  # already chosen: pressing it changes nothing
+                    return Button.inline(f"🔘 {label}", self._make_ui_token({"action": "ct_noop"}))
+                return Button.inline(f"⚪ {label}", toggle("chatsOnly", chats_only))
+
+            lines += ["", "<b>🔐 朋友权限</b>"]
+            buttons.append([choice("聊天、朋友圈等", False), choice("仅聊天", True)])
+            if current["chatsOnly"]:
+                lines.append("仅聊天（互相看不到朋友圈）")
+            else:
+                mine, theirs = current["hideMyPosts"], current["hideTheirPosts"]
+                lines.append("聊天、朋友圈等 · 朋友圈" + (
+                    "互不可见" if mine and theirs else "不让 TA 看我" if mine else "不看 TA" if theirs
+                    else "互相可见"))
+                buttons.append([Button.inline(f"{'✅' if current[f] else '⬜'} {label}", toggle(f, not current[f]))
+                                for f, label in MOMENT_FLAGS])
         elif why:
             lines += ["", f"<i>朋友圈权限暂时读不到：{_esc(why)}</i>"]
         if note:
@@ -478,6 +503,7 @@ class ContactsMixin:
             "add_send": self._ui_add_send,
             "ct_refresh": self._ui_contact_refresh,
             "ct_privacy": self._ui_contact_privacy,
+            "ct_noop": self._ui_noop,
             "ct_remove_ask": self._ui_contact_remove_ask,
             "ct_remove": self._ui_contact_remove,
         }.get(action)
@@ -616,6 +642,9 @@ class ContactsMixin:
             self._forget_names(wx_id)
         text, buttons = await self.contact_card(wx_id, note=note)
         await self._edit_ui_msg(event, text, buttons)
+
+    async def _ui_noop(self, event, p: dict) -> None:
+        await event.answer("当前已经是这个设置")
 
     async def _ui_contact_privacy(self, event, p: dict) -> None:
         wx_id, field = p["wx_id"], p["field"]
