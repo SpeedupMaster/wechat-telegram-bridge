@@ -41,8 +41,18 @@ services:
         chown 10002:10002 /token/bridge-token
         chmod 600 /token/daemon-token /token/bridge-token
         chmod 755 /token
-        chown -R 10001:10001 /wechat-data /wechat-scratch
-        chown -R 10002:10002 /bridge-data
+        # agent-wechat may already be running (compose only reruns this job), and SQLite
+        # creates and deletes its -wal/-shm files at any moment. A plain `chown -R` then
+        # fails on a file that vanished mid-walk, aborting the deploy. So only touch
+        # entries with the wrong owner (the daemon's own files never qualify), and treat
+        # leftover errors as warnings instead of failing the whole stack.
+        fix_owner() {
+          id=$$1; shift
+          find "$$@" \( ! -user "$$id" -o ! -group "$$id" \) -exec chown -h "$$id:$$id" {} + \
+            || echo "warning: could not fix ownership of some files under $$* (in use or vanished?)"
+        }
+        fix_owner 10001 /wechat-data /wechat-scratch
+        fix_owner 10002 /bridge-data
         {
           echo 'schemaVersion = 1'
           echo 'listen = "127.0.0.1:6174"'
