@@ -67,7 +67,8 @@ def _digest(*parts) -> str:
 
 
 def _label(m: dict) -> str:
-    return str(m.get("roomDisplayName") or m.get("displayName") or m.get("remark") or m.get("nickname")
+    """A member or contact as shown to me: my remark first (agent-wechat's `displayName`), then their own names."""
+    return str(m.get("remark") or m.get("displayName") or m.get("roomDisplayName") or m.get("nickname")
                or m.get("mentionName") or m.get("id") or "?").strip()
 
 
@@ -166,7 +167,7 @@ class GroupsMixin:
             members = await self.wx.group_members(room)
         except WeChatError as e:
             log.info("Could not list members of %s: %s", room, e.code)
-        names = {str(m.get("id")): _label(m) for m in members if m.get("id")}
+        names = {str(m.get("id")): self._known_remark(str(m.get("id"))) or _label(m) for m in members if m.get("id")}
         me = self._self_wxid
 
         def who(uid: str) -> str:
@@ -299,7 +300,8 @@ class GroupsMixin:
             if why := self._not_manager(group):
                 return f"⚠️ {why}", None
             members = await self.wx.group_members(room, search=query or None)
-            items = [{"id": str(m["id"]), "label": _label(m) + (" 👑" if m.get("id") == group.get("ownerId") else "")}
+            items = [{"id": str(m["id"]), "label": (self._known_remark(str(m["id"])) or _label(m))
+                      + (" 👑" if m.get("id") == group.get("ownerId") else "")}
                      for m in members if m.get("id") and m.get("id") != self._self_wxid]
             preselect: set[str] = set()
         else:

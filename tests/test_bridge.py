@@ -3616,6 +3616,82 @@ class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertIn("通话已结束", msg2.text)
 
+    async def test_call_card_names_by_remark_and_shows_connect_time(self):
+        from bridge import tghtml
+        # An older profile: the thread still reports the nickname, the contact record has the remark.
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_contact("wxid_bob", "Bob", remark="冯宝儿", nickname="Bob")
+        self.b._calls_sock = _FakeCallsSocket()
+
+        await self.b.handle_call_event({
+            "type": "call.offered",
+            "offer": {"callId": "c-rm", "revision": 1, "kind": "direct", "callType": "voice", "callerId": "wxid_bob"},
+        })
+        msg = self.b.bot.sent[-1]
+        self.assertIn("<blockquote>来电人：<b>冯宝儿</b>\n状态：🔔 响铃中…</blockquote>", msg.text)
+        self.assertIs(msg.kwargs["parse_mode"], tghtml.HTML)
+        self.assertEqual(self.b._link_title("wxid_bob"), "冯宝儿")  # the Telegram chat is named by the remark too
+
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "c-rm", "revision": 2, "kind": "direct", "callType": "voice",
+            "direction": "incoming", "state": "connected", "ownedByThisClient": False}})
+        self.assertIn('接通：<tg-time unix="', msg.text)
+        text, entities = tghtml.HTML.parse(msg.text)
+        dates = [e for e in entities if isinstance(e, types.MessageEntityFormattedDate)]
+        self.assertEqual(len(dates), 1)
+        self.assertTrue(dates[0].short_time)
+        self.assertNotIn("<", text)
+
+        self.b._active_calls["c-rm"]["connected_at"] -= 192
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "c-rm", "revision": 3, "kind": "direct", "callType": "voice",
+            "direction": "incoming", "state": "ended", "ownedByThisClient": False}})
+        self.assertIn("状态：⚪ 通话已结束\n时长：<b>3:12</b>（<tg-time", msg.text)
+
+    async def test_call_card_drops_date_entity_telegram_refuses(self):
+        from bridge import tghtml
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b._calls_sock = _FakeCallsSocket()
+        edit = self.b.bot.edit_message
+
+        async def picky_edit(chat, msg_id, text, **kw):
+            if kw.get("parse_mode") is tghtml.HTML and "<tg-time" in text:
+                raise errors.BadRequestError(None, "ENTITY_BOUNDS_INVALID")
+            return await edit(chat, msg_id, text, **kw)
+
+        self.b.bot.edit_message = picky_edit
+        await self.b.handle_call_event({
+            "type": "call.offered",
+            "offer": {"callId": "c-old", "revision": 1, "kind": "direct", "callType": "voice", "callerId": "wxid_bob"},
+        })
+        msg = self.b.bot.sent[-1]
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "c-old", "revision": 2, "kind": "direct", "callType": "voice",
+            "direction": "incoming", "state": "connected", "ownedByThisClient": False}})
+        self.assertIn("接通：", msg.text)
+        self.assertNotIn("<tg-time", msg.text)
+        self.assertEqual(msg.kwargs["parse_mode"], "html")
+        self.assertFalse(self.b._tg_time_ok)
+
+    async def test_group_sender_named_by_remark_and_follows_changes(self):
+        self.daemon.add_thread("room@chatroom", "Team", kind="group")
+        self.daemon.group_members["room@chatroom"] = [
+            {"id": "wxid_x", "username": "wxid_x", "displayName": "Xavier", "roomDisplayName": "X in group",
+             "nickname": "Xavier", "mentionName": "X in group"},
+        ]
+        self.daemon.add_contact("wxid_x", "Xavier", remark="小夏", nickname="Xavier")
+        self.daemon.add_message("gx1", "room@chatroom", "hi", sender="wxid_x")
+        await self.b.handle_event({"cursor": "1", "kind": "message.committed", "data": {
+            "messageId": "gx1", "threadId": "room@chatroom", "origin": "live", "direction": "incoming"}})
+        self.assertIn("<b>小夏</b>", self.b.bot.sent[-1].text)
+
+        self.daemon.contacts["wxid_x"]["remark"] = "夏老师"
+        await self.b.handle_event({"cursor": "2", "kind": "contacts.updated", "data": {"contactId": "wxid_x"}})
+        self.daemon.add_message("gx2", "room@chatroom", "again", sender="wxid_x")
+        await self.b.handle_event({"cursor": "1", "kind": "message.committed", "data": {
+            "messageId": "gx2", "threadId": "room@chatroom", "origin": "live", "direction": "incoming"}})
+        self.assertIn("<b>夏老师</b>", self.b.bot.sent[-1].text)
+
     async def test_conference_invitation_notifies_and_clears(self):
         self.daemon.add_thread("123@chatroom", "Team", kind="group")
         await self.b.handle_call_event({

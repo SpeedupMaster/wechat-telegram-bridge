@@ -227,13 +227,14 @@ class GroupTests(unittest.IsolatedAsyncioTestCase):
 
         self.daemon.groups[ROOM]["ownerId"] = "wxid_me"
         picker = await self.send("/kick")
-        self.assertEqual(self.labels(picker.kwargs["buttons"])[:3], ["⬜ Olivia", "⬜ Adam", "⬜ Bobby"])
+        # displayName is my remark when I set one, so it wins over their own name in the group ("Bobby").
+        self.assertEqual(self.labels(picker.kwargs["buttons"])[:3], ["⬜ Olivia", "⬜ Adam", "⬜ Bob"])
         self.assertNotIn("Me", " ".join(self.labels(picker.kwargs["buttons"])))
-        cb = await self.click(picker.kwargs["buttons"], "Bobby")
+        cb = await self.click(picker.kwargs["buttons"], "Bob")
         cb = await self.click(cb.edits[-1][1]["buttons"], "移出（1 人）")
         self.assertEqual(self.daemon.mutations[-1][:3], ("DELETE", f"groups/{ROOM}/members",
                                                          {"members": ["wxid_bob"]}))
-        self.assertIn("已把 Bobby 移出群聊", cb.edits[-1][0])
+        self.assertIn("已把 Bob 移出群聊", cb.edits[-1][0])
 
     async def test_leave_then_unlink(self):
         prompt = await self.send("/leave")

@@ -17,7 +17,7 @@ from telethon import Button, TelegramClient, errors, events, functions, types, u
 
 from .config import Config
 from . import cards, stickers
-from . import callweb
+from . import callweb, tghtml
 from .callweb import CallActionError, CallWeb
 from .contacts import ContactsMixin, friendly as contact_error
 from .groups import GROUP_COMMANDS, GroupsMixin
@@ -687,6 +687,8 @@ def _chunks(text: str, size: int = TG_TEXT_LIMIT) -> list[str]:
 # Group-call member picker: members per page (two per row) and names listed in the message text.
 DIAL_PICK_PAGE = 10
 DIAL_PICK_SHOWN = 12
+CALL_INVITEES_SHOWN = 40  # names listed on a group call card (the list folds away in Telegram)
+CONTACT_NAME_TTL = 600.0  # seconds a contact's remark/nickname is reused before reading it again
 
 
 def _short(text: str, limit: int) -> str:
@@ -695,9 +697,34 @@ def _short(text: str, limit: int) -> str:
 
 
 def _member_label(m: dict) -> str:
+    """How a member is @mentioned: their own name in the group, never my private remark."""
     return (
         m.get("mentionName") or m.get("roomDisplayName") or m.get("displayName") or m.get("nickname") or m.get("id") or ""
     ).strip()
+
+
+def _member_name(m: dict) -> str:
+    """How a member is shown to me: agent-wechat's `displayName` is my remark first, then their group name."""
+    return str(
+        m.get("displayName") or m.get("roomDisplayName") or m.get("nickname") or m.get("mentionName") or m.get("id") or ""
+    ).strip()
+
+
+def _card(title: str, lines: list[str]) -> str:
+    """A call card: bold title, then the details grouped in a quote block."""
+    return f"{title}\n<blockquote>" + "\n".join(lines) + "</blockquote>"
+
+
+def _call_time_line(entry: dict) -> str:
+    """When the call connected (in each reader's own timezone) and, once over, how long it lasted."""
+    start = entry.get("connected_at")
+    if not start:
+        return ""
+    at = tghtml.tg_time(start, time.strftime("%H:%M", time.localtime(start)))
+    end = entry.get("ended_at")
+    if entry.get("terminal") and end:
+        return f"时长：<b>{_format_duration(end - start) or '0:00'}</b>（{at} 接通）"
+    return f"接通：{at}"
 
 
 def _is_mention_boundary(name: str, after: str) -> bool:
@@ -771,6 +798,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.create_lock = asyncio.Lock()
         self.last_create = 0.0
         self.names: dict[tuple[str, str], str] = {}
+        self._tg_time_ok = True  # Telegram accepted <tg-time> date entities (False after a refusal)
+        self._contact_name_cache: dict[str, tuple[str, str, float]] = {}  # wx id -> (remark, nickname, at)
         self.started = time.time()
         self.forwarded = 0
         # Pairing bot-side and user-side ids of the same bridged message (see store.msgmap):
@@ -1242,7 +1271,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if not forum:
                 await self._forum_problem("还没有设置话题群：请在开启了「话题」的群里把我设为管理员，然后在群里发送 /forum。")
                 return None
-            title = self._title(thread)
+            title = self._title(await self._named_thread(thread))
             try:
                 topic = await self._create_topic(forum, title, group=thread.get("kind") == "group")
             except Exception as e:
@@ -1267,7 +1296,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             wait = self.cfg.bridge.create_interval_seconds - (time.monotonic() - self.last_create)
             if wait > 0:
                 await asyncio.sleep(wait)
-            title = self._title(thread)
+            title = self._title(await self._named_thread(thread))
             while True:
                 try:
                     result = await self.user(functions.messages.CreateChatRequest(users=[self.bot_input], title=title))
@@ -1315,7 +1344,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     raise
                 contact = await self.wx.contact(thread_id)
                 thread = {"id": thread_id, "kind": "direct", "displayName": contact.get("displayName") or thread_id}
-            title = self._title(thread)
+            title = self._title(await self._named_thread(thread, fresh=True))
             if self.topics:
                 topic = self._topic_for(chat_id, thread_id)
                 if topic is None:
@@ -1355,6 +1384,62 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                                              f"<code>{_esc(thread['id'])}</code>", parse_mode="html", silent=True,
                                     **kw)
 
+    # --- names ------------------------------------------------------------
+    async def _contact_names(self, wx_id: str, *, fresh: bool = False) -> tuple[str, str]:
+        """(remark, nickname) from the contact record itself, "" when unknown; cached for a while.
+
+        Threads and group members are meant to report the remark as `displayName` already, but
+        profiles saved before agent-wechat 2.6 can miss it there, so the remark is read directly.
+        """
+        if not wx_id or wx_id.endswith("@chatroom"):
+            return "", ""
+        now = time.monotonic()
+        hit = self._contact_name_cache.get(wx_id)
+        if hit and not fresh and now - hit[2] < CONTACT_NAME_TTL:
+            return hit[0], hit[1]
+        try:
+            c = await self.wx.contact(wx_id)
+            remark, nick = str(c.get("remark") or "").strip(), str(c.get("nickname") or "").strip()
+        except WeChatError:
+            remark, nick = (hit[0], hit[1]) if hit else ("", "")
+        self._contact_name_cache[wx_id] = (remark, nick, now)
+        while len(self._contact_name_cache) > 2000:
+            self._contact_name_cache.pop(next(iter(self._contact_name_cache)))
+        return remark, nick
+
+    def _known_remark(self, wx_id: str) -> str:
+        """A remark already read for this contact, without asking agent-wechat (for long member lists)."""
+        hit = self._contact_name_cache.get(wx_id)
+        return hit[0] if hit else ""
+
+    def _forget_names(self, wx_id: str) -> None:
+        """A contact's names changed: drop what is cached about them."""
+        self._contact_name_cache.pop(wx_id, None)
+        for key in [k for k in self.names if k[1] == wx_id]:
+            self.names.pop(key, None)
+
+    async def _named_thread(self, thread: dict, *, fresh: bool = False) -> dict:
+        """The thread with my remark as its name when it is a direct chat with one; the contact's
+        own nickname is kept as `nickname`."""
+        tid = thread.get("id") or ""
+        if thread.get("kind") not in (None, "direct") or tid.endswith("@chatroom"):
+            return thread
+        remark, nick = await self._contact_names(tid, fresh=fresh)
+        out = dict(thread)
+        if remark:
+            out["displayName"] = remark
+        if nick:
+            out["nickname"] = nick
+        return out
+
+    async def _thread_name(self, thread_id: str) -> str:
+        """Name to show for a chat: my remark first, then its own name."""
+        try:
+            thread = await self.wx.thread(thread_id)
+        except WeChatError:
+            thread = {"id": thread_id, "displayName": self._link_title(thread_id) or thread_id}
+        return (await self._named_thread(thread)).get("displayName") or thread_id
+
     # --- rendering --------------------------------------------------------
     async def _sender_name(self, msg: dict) -> str:
         sid = msg.get("senderId")
@@ -1364,15 +1449,18 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if key in self.names:
             return self.names[key]
         name = sid
+        remark, nick = await self._contact_names(sid)
         try:
-            if msg["threadId"].endswith("@chatroom"):
+            if remark:
+                name = remark
+            elif msg["threadId"].endswith("@chatroom"):
                 member = await self.wx.group_member(msg["threadId"], sid)
                 if member and (m_name := member.get("displayName") or member.get("nickname")):
                     name = m_name
-            if name == sid:
-                name = (await self.wx.contact(sid)).get("displayName") or sid
         except WeChatError:
             pass
+        if name == sid:
+            name = nick or sid
         self.names[key] = name
         return name
 
@@ -1972,7 +2060,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         elif etype == "call.error":
             log.warning("WeChat call error event: %s", event.get("code"))
 
-    async def _resolve_call_target(self, thread_id: str, caller_id: str, kind: str) -> tuple[dict | None, str]:
+    async def _resolve_call_target(self, thread_id: str, caller_id: str,
+                                   kind: str) -> tuple[dict | None, str]:
+        """(thread, caller's name, my remark first); thread None when the chat is not bridged."""
         try:
             thread = await self.wx.thread(thread_id)
         except WeChatError:
@@ -1987,7 +2077,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if not self._allowed(thread):
             return None, ""
         if caller_id == thread_id and not thread_id.endswith("@chatroom"):
-            caller_name = thread.get("displayName") or caller_id
+            caller_name = (await self._named_thread(thread)).get("displayName") or caller_id
         else:
             caller_name = await self._sender_name({"threadId": thread_id, "senderId": caller_id})
         return thread, caller_name or caller_id
@@ -1999,8 +2089,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         for retry in (False, True):
             topic = self._topic_for(chat, thread["id"])
             try:
-                sent = await self.bot.send_message(chat, text, parse_mode="html", buttons=buttons, link_preview=False,
-                                                   **({"reply_to": topic} if topic else {}))
+                sent = await self._rich_call_msg(self.bot.send_message, chat, text, buttons=buttons,
+                                                 link_preview=False, **({"reply_to": topic} if topic else {}))
                 return chat, sent.id
             except Exception as e:
                 if retry or not await self._drop_dead_dest(chat, thread, e):
@@ -2009,6 +2099,21 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 if not chat:
                     return None
         return None
+
+    async def _rich_call_msg(self, send, *args, **kw):
+        """Send or edit a call card with Telegram's date entity; if Telegram refuses it, drop it for good."""
+        text = args[-1]
+        if self._tg_time_ok or "<tg-time" not in text:
+            try:
+                return await send(*args, parse_mode=tghtml.HTML, **kw)
+            except errors.MessageNotModifiedError:
+                raise
+            except errors.BadRequestError as e:
+                if "<tg-time" not in text or "ENTIT" not in str(getattr(e, "message", "") or e).upper():
+                    raise
+                log.warning("Telegram refused a date entity (%s); call cards show plain times from now on", e)
+                self._tg_time_ok = False
+        return await send(*args[:-1], tghtml.strip(text), parse_mode="html", **kw)
 
     @staticmethod
     def _call_status_final(entry: dict) -> bool:
@@ -2027,12 +2132,11 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             title, who = "📹 <b>微信视频来电</b>", "来电人"
         else:
             title, who = "📞 <b>微信语音来电</b>", "来电人"
-        text = (
-            f"{title}\n"
-            f"{who}：<b>{_esc(entry['caller_name'])}</b>\n"
-            + self._render_group_progress(entry)
-            + f"状态：{entry['status_text']}"
-        )
+        lines = [f"{who}：<b>{_esc(entry['caller_name'])}</b>",
+                 f"状态：{entry['status_text']}"]
+        if when := _call_time_line(entry):
+            lines.append(when)
+        text = _card(title, lines) + self._render_group_progress(entry)
         rows: list[list] = []
         web = self.call_web
         if not entry["terminal"]:
@@ -2056,17 +2160,18 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if not invitees:
             return ""
         names = list(invitees.values())
-        shown = "、".join(_esc(n) for n in names[:DIAL_PICK_SHOWN])
-        more = f" 等 {len(names)} 人" if len(names) > DIAL_PICK_SHOWN else ""
-        out = f"邀请（{len(names)} 人）：{shown}{more}\n"
+        shown = "、".join(_esc(n) for n in names[:CALL_INVITEES_SHOWN])
+        more = f" 等 {len(names)} 人" if len(names) > CALL_INVITEES_SHOWN else ""
+        out = [f"邀请（{len(names)} 人）：{shown}{more}"]
         joined = [p for p in entry.get("participants") or [] if p.get("membership") == "joined"
                   and p.get("contactId") in invitees]
         if joined:
-            out += f"已加入：{len(joined)} 人\n"
+            out.append(f"已加入：{len(joined)} 人")
         failed = entry.get("invite_failed") or {}
         if failed:
-            out += "邀请异常：" + "、".join(f"{_esc(n)}（{why}）" for n, why in failed.values()) + "\n"
-        return out
+            out.append("邀请异常：" + "、".join(f"{_esc(n)}（{why}）" for n, why in failed.values()))
+        # A long list folds away: Telegram shows the first lines and a tap expands the rest.
+        return "\n<blockquote expandable>" + "\n".join(out) + "</blockquote>"
 
     async def _on_invitation_result(self, event: dict) -> None:
         call_id = event.get("callId") or ""
@@ -2107,6 +2212,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 log.exception("Could not update the call page for %s", entry.get("call_id"))
         if entry["terminal"] and entry.get("direction") == "outgoing" and entry["kind"] == "conference":
             await self._close_call_invites(entry)
+        if entry["terminal"] and entry.get("connected_at") and not entry.get("ended_at"):
+            entry["ended_at"] = time.time()
         if not entry.get("chat_id") or not entry.get("msg_id"):
             return
         text, buttons = self._render_call(entry)
@@ -2114,8 +2221,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if entry.get("_last_render") == render_key:
             return
         try:
-            await self.bot.edit_message(entry["chat_id"], entry["msg_id"], text, parse_mode="html",
-                                        buttons=buttons, link_preview=False)
+            await self._rich_call_msg(self.bot.edit_message, entry["chat_id"], entry["msg_id"], text,
+                                      buttons=buttons, link_preview=False)
             entry["_last_render"] = render_key
         except errors.MessageNotModifiedError:
             entry["_last_render"] = render_key
@@ -2193,7 +2300,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
         entry = self._new_call_entry(
             call_id, kind=kind, call_type=offer.get("callType") or "voice", caller_id=caller_id,
-            caller_name=caller_name, thread_id=thread["id"], stage=stage, revision=offer.get("revision", 0),
+            caller_name=caller_name, thread_id=thread["id"], stage=stage,
+            revision=offer.get("revision", 0),
             phase=offer.get("phase"),
         )
         text, buttons = self._render_call(entry)
@@ -2294,11 +2402,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         await self._sync_call_msg(entry)
 
     def _render_invite(self, inv: dict) -> tuple[str, list | None]:
-        text = (
-            "📞 <b>微信群语音通话邀请</b>\n"
-            f"发起人：<b>{_esc(inv['caller_name'])}</b>\n"
-            f"状态：{inv['status_text']}"
-        )
+        text = _card("📞 <b>微信群语音通话邀请</b>",
+                     [f"发起人：<b>{_esc(inv['caller_name'])}</b>",
+                      f"状态：{inv['status_text']}"])
         web = self.call_web
         if web is not None and inv.get("live") and web.can_join():
             return text, [[Button.url("📞 加入", web.link(web.token_for_invite(inv)))]]
@@ -2519,11 +2625,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     def _render_dial(self, req: dict) -> tuple[str, list | None]:
         if req.get("kind") == "conference":
             return self._render_group_dial(req)
-        text = (
-            "📞 <b>微信语音通话</b>\n"
-            f"呼叫：<b>{_esc(req['name'])}</b>\n"
-            f"状态：{req['status_text']}"
-        )
+        text = _card("📞 <b>微信语音通话</b>",
+                     [f"呼叫：<b>{_esc(req['name'])}</b>", f"状态：{req['status_text']}"])
         web = self.call_web
         if not req["live"] or web is None:
             return text, None
@@ -2535,7 +2638,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         names = req["names"]
         inviting = bool(req.get("invite_call"))
         title = "➕ <b>邀请加入群语音通话</b>" if inviting else "📞 <b>微信群语音通话</b>"
-        lines = [title, f"群：<b>{_esc(req['name'])}</b>"]
+        lines = [f"群：<b>{_esc(req['name'])}</b>"]
         if selected:
             shown = "、".join(_esc(names.get(cid) or cid) for cid in selected[:DIAL_PICK_SHOWN])
             more = f" 等 {len(selected)} 人" if len(selected) > DIAL_PICK_SHOWN else ""
@@ -2543,7 +2646,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         else:
             lines.append("邀请：尚未选择")
         lines.append(f"状态：{req['status_text']}")
-        text = "\n".join(lines)
+        text = _card(title, lines)
         web = self.call_web
         if not req["live"] or web is None:
             return text, None
@@ -2581,7 +2684,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             cid = m.get("id") or m.get("username")
             if not cid or cid == self._self_wxid or cid.endswith("@chatroom"):
                 continue
-            out.append({"id": cid, "label": _member_label(m) or cid,
+            out.append({"id": cid, "label": self._known_remark(cid) or _member_name(m) or cid,
                         "search": " ".join(str(m.get(k) or "") for k in
                                            ("mentionName", "roomDisplayName", "displayName", "nickname",
                                             "alias", "username", "id")).lower()})
@@ -2594,7 +2697,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         conf = thread_id.endswith("@chatroom")
         name = self._link_title(thread_id) or thread_id
         try:
-            name = (await self.wx.thread(thread_id)).get("displayName") or name
+            name = await self._thread_name(thread_id)
         except Exception:
             pass
         req = {
@@ -3133,7 +3236,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         lines = []
         for m in members:
             label = _member_label(m)
-            disp = (m.get("displayName") or "").strip()
+            disp = (self._known_remark(str(m.get("id") or "")) or m.get("displayName") or "").strip()
             nick = (m.get("nickname") or "").strip()
             alias = (m.get("alias") or "").strip()
             extras: list[str] = []
@@ -3654,7 +3757,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 await self._edit_ui_msg(event, f"⚠️ 无法建立 Telegram {noun}，请查看我刚发的提示。")
                 await event.answer()
                 return
-            title = self._title(thread)
+            title = self._link_title(wx_id) or self._title(thread)
             msg = (f"ℹ️ <b>{_esc(title)}</b> 已经有对应的 Telegram {noun}了" if existed
                    else f"✅ 已建立 Telegram {noun}：<b>{_esc(title)}</b>")
             await self._edit_ui_msg(event, msg)
@@ -3891,9 +3994,10 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 existed = self._dest_for_thread(thread["id"]) is not None
                 if await self.ensure_chat(thread) is None:
                     return await event.reply(f"⚠️ 无法建立 Telegram {noun}，请查看我刚发的提示。")
+                title = self._link_title(thread["id"]) or self._title(thread)
                 await event.reply(
-                    f"这个会话已经有{noun}了：<b>{_esc(self._title(thread))}</b>" if existed
-                    else f"已建{noun}：<b>{_esc(self._title(thread))}</b>",
+                    f"这个会话已经有{noun}了：<b>{_esc(title)}</b>" if existed
+                    else f"已建{noun}：<b>{_esc(title)}</b>",
                     parse_mode="html")
         except WeChatError as e:
             await event.reply(f"出错：{e.code}")

@@ -123,7 +123,10 @@ class ContactsMixin:
 
     async def on_wx_profile_changed(self, wx_id: str | None) -> None:
         """A contact's remark/nickname or a group's name changed in WeChat: follow it in Telegram."""
-        if not wx_id or not self.cfg.bridge.auto_rename:
+        if not wx_id:
+            return
+        self._forget_names(wx_id)
+        if not self.cfg.bridge.auto_rename:
             return
         dest = self._dest_for_thread(wx_id)
         if dest is None:
@@ -138,6 +141,7 @@ class ContactsMixin:
             except WeChatError:
                 return
             thread = {"id": wx_id, "kind": "direct", "displayName": contact.get("displayName")}
+        thread = await self._named_thread(thread)
         if not thread.get("displayName"):
             return
         if self._title(thread) == self._link_title(wx_id):
@@ -416,7 +420,7 @@ class ContactsMixin:
             if chat is None:
                 text += f"\n⚠️ 无法建立 Telegram {noun}，请查看我刚发的提示。"
             else:
-                text += f"\n💬 已建立 Telegram {noun}：<b>{_esc(self._title(thread))}</b>"
+                text += f"\n💬 已建立 Telegram {noun}：<b>{_esc(self._link_title(peer) or self._title(thread))}</b>"
             await self._edit_ui_msg(event, text)
             return
         await self._edit_ui_msg(event, text, [self._open_chat_button(peer, name)])
