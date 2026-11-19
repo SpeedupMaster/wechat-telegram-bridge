@@ -1,6 +1,7 @@
 """WeChat friend requests and contact settings (agent-wechat >= 2.7), shown as Telegram cards with buttons."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import logging
@@ -20,6 +21,7 @@ PRIVACY_FLAGS = (
     ("hideTheirPosts", "不看 TA 的朋友圈", "🚫 不看 TA 的朋友圈"),
 )
 CHATS_ONLY = {"chatsOnly": True, "hideMyPosts": False, "hideTheirPosts": False}
+NAME_SYNC_ROUNDS = 15  # /syncnames: a round pulls at most 10 pages or runs 2 minutes, then resumes
 
 CONTACT_ERRORS = {
     "stale_contact_request": "这条请求刚刚有了变化，请重新查看",
@@ -29,6 +31,10 @@ CONTACT_ERRORS = {
     "contact_privacy_pending": "上一次权限修改还在处理中，请稍后再试",
     "contact_privacy_partial": "只有部分权限改成功了，请刷新后确认",
     "contact_flags_unresolved": "暂时无法确认和 TA 的好友关系",
+    "forbidden": "daemon 令牌没有 admin 权限，不能修改（请给桥接用的令牌加上 admin 范围）",
+    "insufficient_scope": "daemon 令牌没有 admin 权限，不能修改（请给桥接用的令牌加上 admin 范围）",
+    "ordinary_contact_required": "这类联系人不支持设置朋友圈权限",
+    "profile_identity_unavailable": "微信账号资料暂时不可读，请稍后再试",
     "stale_recipient_reference": "搜索结果已过期，请重新发送 /add",
     "invalid_recipient_reference": "搜索结果已过期，请重新发送 /add",
     "contact_discovery_rejected": "微信没有找到这个用户（或对方不允许通过微信号搜到自己）",
@@ -121,36 +127,149 @@ class ContactsMixin:
         if await self.notify(text, parse_mode="html", buttons=buttons, link_preview=False) is not None:
             self.store.set(key, version)
 
-    async def on_wx_profile_changed(self, wx_id: str | None) -> None:
-        """A contact's remark/nickname or a group's name changed in WeChat: follow it in Telegram."""
+    async def on_wx_profile_changed(self, wx_id: str | None) -> bool:
+        """A contact's remark/nickname or a group's name changed in WeChat: follow it in Telegram.
+        True when a Telegram title was changed."""
         if not wx_id:
-            return
+            return False
         self._forget_names(wx_id)
         if not self.cfg.bridge.auto_rename:
-            return
+            return False
         dest = self._dest_for_thread(wx_id)
         if dest is None:
-            return
+            return False
         try:
             thread = await self.wx.thread(wx_id)
         except WeChatError:
             if wx_id.endswith("@chatroom"):
-                return
+                return False
             try:
                 contact = await self.wx.contact(wx_id)
             except WeChatError:
-                return
+                return False
             thread = {"id": wx_id, "kind": "direct", "displayName": contact.get("displayName")}
         thread = await self._named_thread(thread)
         if not thread.get("displayName"):
-            return
+            return False
         if self._title(thread) == self._link_title(wx_id):
-            return
+            return False
         title, status = await self.sync_title(dest[0], wx_id)
         if status and status != "unchanged":
             log.info("Could not follow the WeChat name of %s: %s", wx_id, status)
-        else:
-            log.info("Renamed the Telegram %s of %s to %r", "topic" if self.topics else "group", wx_id, title)
+            return False
+        log.info("Renamed the Telegram %s of %s to %r", "topic" if self.topics else "group", wx_id, title)
+        return status == ""
+
+    # --- remarks: /remark in a chat, /syncnames in private ----------------------------
+    async def cmd_remark(self, chat_id: int, reply_to: int | None, wx_id: str, arg: str) -> None:
+        async def say(text: str) -> None:
+            await self.bot.send_message(chat_id, text, parse_mode="html", reply_to=reply_to, link_preview=False)
+
+        if wx_id.endswith("@chatroom"):
+            return await say("这是微信群聊，<code>/remark</code> 只能改好友的备注。")
+        if not self.wx_ready:
+            return await say("🔐 微信尚未登录，登录后再改备注。")
+        arg = arg.strip()
+        try:
+            contact = await self.wx.contact(wx_id)
+        except WeChatError as e:
+            return await say(f"⚠️ 读取联系人资料失败：{_esc(friendly(e.code))}")
+        current = str(contact.get("remark") or "")
+        if not arg:
+            now = f"当前备注：<b>{_esc(current)}</b>" if current else "当前没有备注"
+            return await say(f"{now}\n\n发送 <code>/remark 新备注</code> 修改，<code>/remark -</code> 清除。")
+        remark = None if arg in ("-", "－") else arg
+        if (remark or "") == current:
+            return await say("备注没有变化。")
+        key = f"ct-remark-{secrets.token_hex(8)}"
+        for attempt in range(2):
+            version = str(contact.get("privacyVersion") or "")
+            if not version:
+                why = contact.get("privacyUnavailable")
+                return await say("⚠️ 暂时不能改这个联系人的备注：" + _esc(
+                    friendly(why) if why else "读不到资料版本（需要 agent-wechat 2.8 及以上）"))
+            try:
+                op = await self.wx.set_contact_remark(wx_id, remark, version, key)
+                break
+            except WeChatError as e:
+                if e.code != "stale_contact_privacy" or attempt:
+                    return await say(f"⚠️ 修改备注失败：{_esc(friendly(e.code))}")
+                # Changed elsewhere since we read it: read the new version and try once more
+                key = f"ct-remark-{secrets.token_hex(8)}"
+                try:
+                    contact = await self.wx.contact(wx_id)
+                except WeChatError as e2:
+                    return await say(f"⚠️ 修改备注失败：{_esc(friendly(e2.code))}")
+        if op.get("state") not in OP_OK:
+            return await say(f"⚠️ 修改备注失败：{_esc(op_error(op))}")
+        self._forget_names(wx_id)
+        noun = "话题" if self.topics else "群"
+        done = f"已把备注改为 <b>{_esc(remark)}</b>" if remark else "已清除备注"
+        follow = f"，{noun}标题会跟着更新" if self.cfg.bridge.auto_rename else ""
+        await say(f"✅ {done}。几秒后同步到手机微信{follow}。")
+        # The daemon also reports the change as contacts.updated; following it here as well covers a missed event
+        await self._await_remark(wx_id, remark)
+        await self.on_wx_profile_changed(wx_id)
+
+    async def _await_remark(self, wx_id: str, remark: str | None, wait: float = 10.0) -> None:
+        """Wait (briefly) until the daemon reports the new remark as saved."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        while True:
+            try:
+                c = await self.wx.contact(wx_id)
+                if not c.get("remarkPending") and (c.get("remark") or None) == remark:
+                    return
+            except WeChatError:
+                pass
+            if loop.time() >= deadline:
+                return
+            await asyncio.sleep(self._remark_poll)
+
+    async def cmd_sync_names(self, event) -> None:
+        """Pull the whole contact catalog from WeChat again (remarks missing from old profiles come back),
+        then rename the bridged chats that now have a different name."""
+        if self._names_syncing:
+            await event.reply("⏳ 已经在同步了，请稍候。")
+            return
+        self._names_syncing = True
+        try:
+            await event.reply("⏳ 正在从微信重新同步联系人资料（含备注），好友多时需要几分钟…")
+            result: dict = {}
+            for _ in range(NAME_SYNC_ROUNDS):
+                try:
+                    op = await self.wx.sync_contacts()
+                except WeChatError as e:
+                    await event.reply(f"⚠️ 同步失败：{_esc(friendly(e.code))}", parse_mode="html")
+                    return
+                if op.get("state") not in OP_OK:
+                    await event.reply(f"⚠️ 同步没有完成：{_esc(op_error(op))}", parse_mode="html")
+                    return
+                result = op.get("result") if isinstance(op.get("result"), dict) else {}
+                if result.get("complete") or not result.get("resumeAvailable"):
+                    break  # otherwise: a round stops after 10 pages or 2 minutes; the next one resumes
+            self._contact_name_cache.clear()
+            self.names.clear()
+            renamed = 0
+            if self.cfg.bridge.auto_rename:
+                for wx_id in [wx for wx, _, _ in self._link_rows() if not wx.endswith("@chatroom")]:
+                    if await self.on_wx_profile_changed(wx_id):
+                        renamed += 1
+                        await asyncio.sleep(self._rename_gap)  # go easy on Telegram's flood limits
+            noun = "话题" if self.topics else "群"
+            lines = ["✅ 联系人资料已从微信重新同步。" if result.get("complete") or not result.get("resumeAvailable")
+                     else "⚠️ 同步了一部分，还没完成，稍后再发一次 <code>/syncnames</code> 会接着同步。"]
+            failed = result.get("failedItems")
+            failed = len(failed) if isinstance(failed, (list, dict)) else failed if isinstance(failed, int) else 0
+            if failed:
+                lines.append(f"有 {failed} 个联系人这次没拉到，可以稍后再试。")
+            if self.cfg.bridge.auto_rename:
+                lines.append(f"已按新备注更新 {renamed} 个{noun}标题。" if renamed else f"{noun}标题都已是最新。")
+            else:
+                lines.append(f"自动改名已关闭（auto_rename = false），要更新标题请在对应{noun}里发 <code>/rename</code>。")
+            await event.reply("\n".join(lines), parse_mode="html")
+        finally:
+            self._names_syncing = False
 
     # --- friend request cards ---------------------------------------------------
     def _request_card(self, req: dict, *, new: bool = False, note: str = "") -> tuple[str, list | None]:
@@ -304,7 +423,9 @@ class ContactsMixin:
         if (nick := contact.get("nickname")) and nick != name:
             lines.append(f"昵称：{_esc(nick)}")
         if remark := contact.get("remark"):
-            lines.append(f"备注：{_esc(remark)}")
+            lines.append(f"备注：{_esc(remark)}" + ("（正在与微信同步…）" if contact.get("remarkPending") else ""))
+        elif contact.get("remarkPending"):
+            lines.append("备注：正在与微信同步…")
         relation = contact.get("relation")
         if relation:
             lines.append(f"关系：{RELATIONS.get(relation, _esc(relation))}")
@@ -312,11 +433,18 @@ class ContactsMixin:
         version = ""
         why = ""
         if relation != "non_contact":
-            try:
-                p = await self.wx.contact_privacy(wx_id)
-                privacy, version = p.get("privacy") or None, str(p.get("version") or "")
-            except WeChatError as e:
-                why = friendly(e.code)
+            if any(k in contact for k in ("privacy", "privacyVersion", "privacyUnavailable")):
+                # agent-wechat >= 2.8 returns the privacy with the contact (its separate route is gone)
+                privacy, version = contact.get("privacy") or None, str(contact.get("privacyVersion") or "")
+                if not privacy and contact.get("privacyUnavailable"):
+                    why = friendly(contact["privacyUnavailable"])
+            else:
+                try:
+                    p = await self.wx.contact_privacy(wx_id)
+                    privacy, version = p.get("privacy") or None, str(p.get("version") or "")
+                except WeChatError as e:
+                    if e.status != 404:  # 404: a 2.8+ daemon with no privacy for this contact
+                        why = friendly(e.code)
         buttons: list = []
         if privacy:
             lines += ["", "<b>朋友圈与聊天权限</b>（点下方按钮切换）"]
@@ -330,7 +458,7 @@ class ContactsMixin:
             lines += ["", f"<i>朋友圈权限暂时读不到：{_esc(why)}</i>"]
         if note:
             lines += ["", note]
-        last = [Button.inline("🔄 刷新", self._make_ui_token({"action": "ct_refresh", "wx_id": wx_id}))]
+        last = [Button.inline("🔄 刷新", self._make_ui_token({"action": "ct_refresh", "wx_id": wx_id, "live": True}))]
         if relation == "friend":
             last.append(Button.inline("🗑 删除好友", self._make_ui_token(
                 {"action": "ct_remove_ask", "wx_id": wx_id, "name": name})))
@@ -472,8 +600,21 @@ class ContactsMixin:
         await self._edit_ui_msg(event, text)
 
     async def _ui_contact_refresh(self, event, p: dict) -> None:
-        await event.answer("已刷新")
-        text, buttons = await self.contact_card(p["wx_id"])
+        wx_id, note = p["wx_id"], ""
+        if not p.get("live"):  # "back" from another screen: just redraw
+            await event.answer()
+        else:
+            # Ask WeChat itself, so a remark set on the phone (or missing from an old profile) shows up
+            await event.answer("正在向微信刷新…")
+            try:
+                op = await self.wx.refresh_contact(wx_id)
+                if op.get("state") not in OP_OK:
+                    note = f"<i>向微信刷新没有完成：{_esc(op_error(op))}</i>"
+            except WeChatError as e:
+                if e.status not in (404, 405):  # older agent-wechat without the route: show what is saved
+                    note = f"<i>向微信刷新失败：{_esc(friendly(e.code))}</i>"
+            self._forget_names(wx_id)
+        text, buttons = await self.contact_card(wx_id, note=note)
         await self._edit_ui_msg(event, text, buttons)
 
     async def _ui_contact_privacy(self, event, p: dict) -> None:

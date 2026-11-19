@@ -253,6 +253,105 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         await self.b.on_tg_message(tg_event(-601, 11, "/info"))
         self.assertIn("这是微信群聊", self.b.bot.sent[-1].text)
 
+    async def test_contact_card_reads_privacy_from_contact_and_refreshes_remark(self):
+        # agent-wechat 2.8: privacy comes with the contact; the old /privacy route is gone
+        self.daemon.add_thread("wxid_amy", "Amy Nick")
+        self.daemon.add_contact("wxid_amy", "Amy Nick", nickname="Amy Nick", remark=None, relation="friend",
+                                privacy={"chatsOnly": True, "hideMyPosts": False, "hideTheirPosts": False},
+                                privacyVersion="v28")
+        self.b.store.link("wxid_amy", -610, "Amy Nick")
+        self.assertEqual(await self.b._contact_names("wxid_amy"), ("", "Amy Nick"))
+        await self.b.on_tg_message(tg_event(-610, 10, "/contact"))
+        card = self.b.bot.sent[-1]
+        self.assertNotIn("备注", card.text)
+        self.assertEqual(card.kwargs["buttons"][0][0].text, "✅ 仅聊天")
+        self.assertNotIn("权限暂时读不到", card.text)
+
+        cb = await self.click(card.kwargs["buttons"], "不看 TA 的朋友圈")
+        self.assertEqual(self.daemon.request_calls[-1][2]["expectedVersion"], "v28")
+
+        # 🔄 asks WeChat for the latest details, so a remark missing from the saved profile shows up
+        self.daemon.contacts["wxid_amy"].update(remark="艾米", displayName="艾米")
+        cb = await self.click(card.kwargs["buttons"], "刷新")
+        self.assertIn(("POST", "contacts/wxid_amy/refresh"), [c[:2] for c in self.daemon.request_calls])
+        self.assertIn("备注：艾米", cb.edits[-1][0])
+        self.assertEqual(await self.b._contact_names("wxid_amy"), ("艾米", "Amy Nick"))
+
+        # A friend whose privacy can't be edited says why
+        self.daemon.add_contact("wxid_svc", "Svc", relation="friend", privacy=None, privacyVersion=None,
+                                privacyUnavailable="ordinary_contact_required")
+        self.daemon.add_thread("wxid_svc", "Svc")
+        self.b.store.link("wxid_svc", -611, "Svc")
+        await self.b.on_tg_message(tg_event(-611, 11, "/contact"))
+        self.assertIn("这类联系人不支持设置朋友圈权限", self.b.bot.sent[-1].text)
+
+    async def test_remark_command_sets_and_clears_the_remark(self):
+        self.b._remark_poll = 0
+        self.daemon.add_thread("wxid_cat", "Cat Nick")
+        self.daemon.add_contact("wxid_cat", "Cat Nick", nickname="Cat Nick", remark=None, relation="friend",
+                                privacyVersion="v1")
+        self.b.store.link("wxid_cat", -620, "Cat Nick")
+        await self.b._contact_names("wxid_cat")  # a cached name that must not outlive the change
+
+        await self.b.on_tg_message(tg_event(-620, 10, "/remark"))
+        self.assertIn("当前没有备注", self.b.bot.sent[-1].text)
+        self.assertEqual(self.daemon.request_calls, [])
+
+        await self.b.on_tg_message(tg_event(-620, 11, "/remark 小猫"))
+        method, path, body, key = self.daemon.request_calls[-1]
+        self.assertEqual((method, path, body), ("PATCH", "contacts/wxid_cat", {"expectedVersion": "v1", "remark": "小猫"}))
+        self.assertTrue(key)
+        self.assertIn("已把备注改为 <b>小猫</b>", self.b.bot.sent[-1].text)
+        self.assertEqual(self.b.user.titles[-1][1], "小猫")  # the Telegram title follows
+        self.assertEqual(self.b._link_title("wxid_cat"), "小猫")
+        self.assertEqual(await self.b._contact_names("wxid_cat"), ("小猫", "Cat Nick"))
+
+        await self.b.on_tg_message(tg_event(-620, 12, "/remark 小猫"))
+        self.assertIn("备注没有变化", self.b.bot.sent[-1].text)
+
+        await self.b.on_tg_message(tg_event(-620, 13, "/remark -"))
+        self.assertEqual(self.daemon.request_calls[-1][2], {"expectedVersion": "v1", "remark": None})
+        self.assertIn("已清除备注", self.b.bot.sent[-1].text)
+        self.assertEqual(self.b._link_title("wxid_cat"), "Cat Nick")
+
+        # An old daemon (no privacyVersion) and a WeChat group can't take a remark
+        self.daemon.contacts["wxid_cat"].pop("privacyVersion")
+        await self.b.on_tg_message(tg_event(-620, 14, "/remark 喵"))
+        self.assertIn("需要 agent-wechat 2.8", self.b.bot.sent[-1].text)
+        self.daemon.add_thread("8@chatroom", "Team", kind="group")
+        self.b.store.link("8@chatroom", -621, "👥 Team")
+        await self.b.on_tg_message(tg_event(-621, 15, "/remark 喵"))
+        self.assertIn("只能改好友的备注", self.b.bot.sent[-1].text)
+
+    async def test_syncnames_pulls_the_catalog_and_renames_chats(self):
+        self.b._rename_gap = 0
+        self.daemon.add_thread("wxid_dan", "Dan Nick")
+        self.daemon.add_contact("wxid_dan", "Dan Nick", nickname="Dan Nick", remark=None, relation="friend")
+        self.daemon.add_thread("wxid_eve", "Eve")
+        self.daemon.add_contact("wxid_eve", "Eve", nickname="Eve", remark=None, relation="friend")
+        self.b.store.link("wxid_dan", -630, "Dan Nick")
+        self.b.store.link("wxid_eve", -631, "Eve")
+        self.assertEqual(await self.b._contact_names("wxid_dan"), ("", "Dan Nick"))
+        # The first round stops part-way (10 pages / 2 minutes); the next one resumes and finishes
+        self.daemon.sync_rounds = [{"complete": False, "resumeAvailable": True},
+                                   {"complete": True, "resumeAvailable": False, "failedItems": ["wxid_x"]}]
+        self.daemon.sync_remarks = {"wxid_dan": "阿丹"}
+
+        text, _ = await self.cmd("/syncnames")
+        self.assertEqual(self.daemon.contact_syncs, 2)
+        self.assertIn("已从微信重新同步", text)
+        self.assertIn("有 1 个联系人这次没拉到", text)
+        self.assertIn("已按新备注更新 1 个群标题", text)
+        self.assertEqual(self.b.user.titles, [(630, "阿丹")])
+        self.assertEqual(self.b._link_title("wxid_dan"), "阿丹")
+        self.assertEqual(await self.b._contact_names("wxid_dan"), ("阿丹", "Dan Nick"))
+
+        # Nothing left to resume counts as done; titles already match
+        self.daemon.sync_rounds = [{"complete": False, "resumeAvailable": False}]
+        text, _ = await self.cmd("/syncnames")
+        self.assertIn("已从微信重新同步", text)
+        self.assertIn("群标题都已是最新", text)
+
     async def test_search_includes_non_friends(self):
         self.daemon.add_contact("wxid_f", "Zed Friend")
         self.daemon.add_contact("wxid_n", "Zed Stranger", relation="non_contact")

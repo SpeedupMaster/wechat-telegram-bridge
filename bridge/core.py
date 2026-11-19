@@ -96,6 +96,7 @@ HELP = (
     "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
     "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
     "• <code>/newgroup</code> 关键词 关键词 [| 群名] — 勾选好友新建微信群\n"
+    "• <code>/syncnames</code> — 从微信重新同步全部好友资料与备注，并更新标题\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
@@ -103,6 +104,7 @@ HELP = (
     "• <code>/link</code> [关键词] — 在任意群内直接发，把当前群绑定到微信会话\n"
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
+    "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理：免打扰、邀请/移出成员、清空公告、退群\n"
@@ -126,6 +128,7 @@ GROUP_HELP = (
     "<b>桥接群命令</b>\n"
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
+    "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理（免打扰、邀请/移出成员、清空公告、退群）\n"
@@ -152,6 +155,7 @@ TOPIC_HELP = (
     "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
     "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
     "• <code>/newgroup</code> 关键词 关键词 [| 群名] — 勾选好友新建微信群\n"
+    "• <code>/syncnames</code> — 从微信重新同步全部好友资料与备注，并更新标题\n"
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
@@ -160,6 +164,7 @@ TOPIC_HELP = (
     "• <code>/link</code> [关键词] — 在某个话题里发，把该话题绑定到微信会话\n"
     "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
+    "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理：免打扰、邀请/移出成员、清空公告、退群\n"
@@ -181,6 +186,7 @@ TOPIC_GROUP_HELP = (
     "<b>话题群命令</b>\n"
     "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
+    "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理（免打扰、邀请/移出成员、清空公告、退群）\n"
@@ -215,6 +221,7 @@ PRIVATE_BOT_COMMANDS = [
     ("requests", "查看待处理的微信好友请求"),
     ("add", "按微信号添加微信好友"),
     ("newgroup", "勾选好友新建微信群"),
+    ("syncnames", "从微信重新同步好友备注"),
     ("status", "查看运行与微信在线状态"),
     ("wxlogin", "重新登录微信（手机确认或扫码）"),
     ("help", "查看使用指南"),
@@ -223,6 +230,7 @@ PRIVATE_BOT_COMMANDS = [
 GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
     ("contact", "查看好友资料与朋友圈权限"),
+    ("remark", "修改微信好友备注"),
     ("call", "给好友打微信电话或发起群语音通话"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("group", "微信群资料与管理"),
@@ -249,6 +257,7 @@ TOPIC_PRIVATE_BOT_COMMANDS = [
     ("requests", "查看待处理的微信好友请求"),
     ("add", "按微信号添加微信好友"),
     ("newgroup", "勾选好友新建微信群"),
+    ("syncnames", "从微信重新同步好友备注"),
     ("status", "查看运行与微信在线状态"),
     ("wxlogin", "重新登录微信（手机确认或扫码）"),
     ("help", "查看使用指南"),
@@ -257,6 +266,7 @@ TOPIC_PRIVATE_BOT_COMMANDS = [
 TOPIC_GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
     ("contact", "查看好友资料与朋友圈权限"),
+    ("remark", "修改微信好友备注"),
     ("call", "给好友打微信电话或发起群语音通话"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("group", "微信群资料与管理"),
@@ -798,6 +808,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.create_lock = asyncio.Lock()
         self.last_create = 0.0
         self.names: dict[tuple[str, str], str] = {}
+        self._names_syncing = False  # a /syncnames is running
+        self._remark_poll = 1.5  # seconds between checks that a /remark change was saved
+        self._rename_gap = 1.0  # seconds between Telegram renames after /syncnames
         self._tg_time_ok = True  # Telegram accepted <tg-time> date entities (False after a refusal)
         self._contact_name_cache: dict[str, tuple[str, str, float]] = {}  # wx id -> (remark, nickname, at)
         self.started = time.time()
@@ -3000,7 +3013,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         elif cmd_name == "/help":
             await self._send_group_notice(event.chat_id, msg.id, TOPIC_GROUP_HELP)
         elif cmd_name in ("/wx", "/unlink", "/members", "/at", "/recall", "/rename", "/title", "/avatar",
-                          "/contact", "/info", "/call", *GROUP_COMMANDS):
+                          "/contact", "/info", "/call", "/remark", *GROUP_COMMANDS):
             await self._send_group_notice(event.chat_id, msg.id,
                                           "这个话题还没有绑定微信会话，发送 <code>/link</code> 绑定。")
 
@@ -3076,6 +3089,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 return
             if cmd_name == "/call":
                 await self._start_dial(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg.strip())
+                return
+            if cmd_name == "/remark":
+                await self.cmd_remark(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg)
                 return
             if cmd_name == "/avatar" and self.topics:
                 await self.bot.send_message(chat_id, "Telegram 话题不支持设置头像",
@@ -3935,7 +3951,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     parse_mode="html", buttons=buttons)
             elif cmd == "/wxlogin":
                 await self.request_wechat_login(force_qr=(arg.lower() in ("qr", "scan")))
-            elif cmd in ("/find", "/open", "/requests", "/add", "/newgroup") and not self.wx_ready:
+            elif cmd in ("/find", "/open", "/requests", "/add", "/newgroup", "/syncnames") and not self.wx_ready:
                 await event.reply(
                     "🔐 微信尚未登录，请先在手机微信上确认登录或扫码登录，也可以点击下方按钮重新发起登录。",
                     buttons=self._wx_login_buttons())
@@ -3945,6 +3961,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 await self.cmd_add(event, arg)
             elif cmd == "/newgroup":
                 await self.cmd_new_group(event, arg)
+            elif cmd == "/syncnames":
+                await self.cmd_sync_names(event)
             elif cmd == "/find":
                 cands = await self._wx_search_candidates(arg, limit=15 if arg else 10)
                 if not cands:

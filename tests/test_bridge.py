@@ -110,6 +110,9 @@ class FakeDaemon:
         self.contact_op = {"id": "ctop", "state": "succeeded"}
         self.discovery: dict = {}
         self.privacy: dict[str, dict] = {}
+        self.sync_rounds: list[dict] = []  # result of each POST contact-sync; [] = one complete round
+        self.sync_remarks: dict[str, str] = {}  # remarks a full contact sync brings in
+        self.contact_syncs = 0
         self.relations_supported = True
         self.contact_searches: list[dict] = []
         self.media_errors: dict[str, str] = {}  # message id -> 409 error code for its media list
@@ -270,7 +273,11 @@ class FakeDaemon:
                     return httpx.Response(404, json={"error": {"code": "not_found"}})
                 if body.get("expectedVersion") != req["version"]:
                     return httpx.Response(412, json={"error": {"code": "stale_contact_request"}})
-            if rest[0] == "contacts" and m == "PATCH":
+            if rest[0] == "contacts" and m == "PATCH" and "remark" in body:
+                cur = self.contacts.get(rest[1]) or {}
+                if body.get("expectedVersion") != cur.get("privacyVersion"):
+                    return httpx.Response(412, json={"error": {"code": "stale_contact_privacy"}})
+            elif rest[0] == "contacts" and m == "PATCH":
                 cur = self.privacy.get(rest[1]) or {}
                 if body.get("expectedVersion") != cur.get("version"):
                     return httpx.Response(412, json={"error": {"code": "stale_contact_privacy"}})
@@ -279,6 +286,8 @@ class FakeDaemon:
                     req["state"], req["actionable"], req["isContact"] = "contact", False, True
                 elif rest[0] == "contact-requests" and len(rest) == 2:  # delete
                     del self.requests[rest[1]]
+                elif rest[0] == "contacts" and m == "PATCH" and "remark" in body:
+                    cur.update(remark=body["remark"], displayName=body["remark"] or cur.get("nickname"))
                 elif rest[0] == "contacts" and m == "PATCH":
                     self.privacy[rest[1]] = {"privacy": body["privacy"], "version": cur["version"] + "x"}
                 elif rest[0] == "contacts" and m == "DELETE":
@@ -286,6 +295,13 @@ class FakeDaemon:
             return httpx.Response(202, json={"id": "ctop", "state": "queued"})
         if rest[:2] == ["operations", "ctop"]:
             return httpx.Response(200, json=self.contact_op)
+        if rest == ["contact-sync"] and m == "POST":
+            self.contact_syncs += 1
+            result = self.sync_rounds.pop(0) if self.sync_rounds else {"complete": True}
+            if result.get("complete"):
+                for cid, remark in self.sync_remarks.items():
+                    self.contacts.setdefault(cid, {"id": cid}).update(remark=remark, displayName=remark)
+            return httpx.Response(202, json={"id": "syncop", "state": "succeeded", "result": result})
         if rest[0] == "contact-requests" and len(rest) == 2:
             req = self.requests.get(rest[1])
             return httpx.Response(200, json=req) if req else httpx.Response(404, json={"error": {"code": "not_found"}})

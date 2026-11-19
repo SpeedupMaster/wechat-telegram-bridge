@@ -417,14 +417,34 @@ class WeChatClient:
         return await self._wait_operation(op)
 
     async def contact_privacy(self, username: str) -> dict:
-        """{"privacy": {"chatsOnly", "hideMyPosts", "hideTheirPosts"}, "version"}"""
+        """{"privacy": {"chatsOnly", "hideMyPosts", "hideTheirPosts"}, "version"}. agent-wechat < 2.8 only:
+        2.8 removed this route and returns `privacy` / `privacyVersion` with the contact itself."""
         return await self._req("GET", self._a(f"contacts/{_id(username)}/privacy"))
+
+    async def refresh_contact(self, username: str, *, timeout: float = 30) -> dict:
+        """Ask WeChat for a contact's latest details (remark and privacy included) and wait for the operation."""
+        op = await self._req("POST", self._a(f"contacts/{_id(username)}/refresh"), timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op, timeout)
 
     async def update_contact_privacy(self, username: str, privacy: dict, version: str, key: str) -> dict:
         op = await self._req("PATCH", self._a(f"contacts/{_id(username)}"),
                              json={"expectedVersion": version, "privacy": privacy},
                              headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
         return await self._wait_operation(op)
+
+    async def set_contact_remark(self, username: str, remark: str | None, version: str, key: str) -> dict:
+        """Set (or, with None, clear) my remark for a contact (agent-wechat >= 2.8). `version` is the
+        contact's `privacyVersion`; the new name shows a few seconds after WeChat accepts it."""
+        op = await self._req("PATCH", self._a(f"contacts/{_id(username)}"),
+                             json={"expectedVersion": version, "remark": remark},
+                             headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op)
+
+    async def sync_contacts(self, *, timeout: float = 180) -> dict:
+        """One round of the full contact catalog sync (at most 10 pages or 2 minutes); its `result` says
+        whether it is `complete` or can resume (`resumeAvailable`) with another call."""
+        op = await self._req("POST", self._a("contact-sync"), json={}, timeout=_SEND_TIMEOUT)
+        return await self._wait_operation(op, timeout)
 
     async def remove_contact(self, username: str, key: str) -> dict:
         """Remove the friendship; the chat history stays."""
