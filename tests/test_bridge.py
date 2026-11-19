@@ -32,6 +32,48 @@ def _png(w=132, h=132, color=(10, 120, 200)) -> bytes:
 AVATAR = _png()  # WeChat hands out ~132 px avatars
 
 
+def _wxgf_sample(ffmpeg: str | None, w: int, h: int, frames: int, fps: int, *, mask: bool = True) -> bytes | None:
+    """A wxgf laid out like WeChat's: one partition per frame, alternating gray alpha mask and colour frame,
+    with parameter sets only on each stream's first frame. None when ffmpeg lacks libx265."""
+    import re
+    import subprocess
+    if not ffmpeg or b"libx265" not in subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                                      capture_output=True).stdout:
+        return None
+
+    def encode(tmp: str, name: str, src: list[str], pix_fmt: str) -> bytes:
+        path = Path(tmp, name)
+        subprocess.run([ffmpeg, "-y", "-loglevel", "error", *src, "-frames:v", str(frames), "-c:v", "libx265",
+                        "-x265-params", "log-level=none:bframes=0", "-r", str(fps), "-pix_fmt", pix_fmt,
+                        "-f", "hevc", str(path)], check=True)
+        return path.read_bytes()
+
+    def access_units(stream: bytes) -> list[bytes]:
+        starts = [m.start() for m in re.finditer(rb"\x00\x00\x00\x01|(?<!\x00)\x00\x00\x01", stream)]
+        units, cur, has_slice = [], b"", False
+        for i, s in enumerate(starts):
+            nal = stream[s:starts[i + 1] if i + 1 < len(starts) else len(stream)]
+            hdr = nal[nal.index(b"\x00\x00\x01") + 3:]
+            kind = (hdr[0] >> 1) & 0x3F
+            if has_slice and (kind > 31 or hdr[2] & 0x80):
+                units.append(cur)
+                cur, has_slice = b"", False
+            cur += nal
+            has_slice |= kind <= 31
+        return units + [cur]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        lavfi = ["-f", "lavfi", "-i"]
+        colour = access_units(encode(tmp, "c.hevc", [*lavfi, f"testsrc2=s={w}x{h}:r={fps}"], "yuv420p"))
+        alpha = access_units(encode(tmp, "m.hevc", [*lavfi, f"color=c=black:s={w}x{h}:r={fps}", "-vf",
+                                                    f"geq=lum='if(lt(hypot(X-{w / 2},Y-{h / 2}),{min(w, h) / 3}),255,0)'"],
+                                    "gray"))
+    assert len(colour) == len(alpha) == frames, (len(colour), len(alpha))
+    body = b"".join((len(m).to_bytes(4, "big") + m if mask else b"") + len(c).to_bytes(4, "big") + c
+                    for c, m in zip(colour, alpha))
+    return b"wxgf" + bytes([19, 0, 2]) + w.to_bytes(2, "big") + h.to_bytes(2, "big") + bytes(8) + body
+
+
 class FakeDaemon:
     def __init__(self):
         self.messages: dict[str, dict] = {}
@@ -50,6 +92,7 @@ class FakeDaemon:
         self.avatar_lag = 0  # reads after a successful refresh that still miss (profile reader lag)
         self.media: dict[str, list[dict]] = {}  # message id -> media assets (default: one available PNG)
         self.media_bytes: dict[str, tuple[bytes, str]] = {}  # asset id -> (bytes, content_type)
+        self.content_requests: list[tuple[str, str | None]] = []  # (asset id, representation)
         self.media_transfers: list[tuple[str, dict]] = []
         self.transfer_fail_variants: set[str] = set()
         self.transfer_fail_reasons: dict[str, str] = {}
@@ -143,6 +186,11 @@ class FakeDaemon:
                                                         "contentType": "image/png", "byteLength": 4,
                                                         "filename": "pic.png"}]})
         if rest[0] == "media" and rest[2] == "content":
+            representation = request.url.params.get("representation")
+            self.content_requests.append((rest[1], representation))
+            if representation and f"{rest[1]}#{representation}" in self.media_bytes:
+                raw, ctype = self.media_bytes[f"{rest[1]}#{representation}"]
+                return httpx.Response(200, content=raw, headers={"content-type": ctype})
             if rest[1] in self.media_bytes:
                 raw, ctype = self.media_bytes[rest[1]]
                 return httpx.Response(200, content=raw, headers={"content-type": ctype})
@@ -610,6 +658,36 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(isinstance(a, types.DocumentAttributeSticker) for a in sticker_msg.kwargs["attributes"]))
         self.assertTrue(any(isinstance(a, types.DocumentAttributeVideo) and a.nosound
                             for a in sticker_msg.kwargs["attributes"]))
+
+    async def test_animated_wxgf_sticker_fetched_raw_and_sent_as_video_sticker(self):
+        """agent-wechat's wxgf preview is one still frame, so stickers fetch the original wxgf bytes;
+        when those can't be decoded the bridge falls back to the preview."""
+        from bridge import stickers
+        anim = _wxgf_sample(stickers.find_ffmpeg(), 160, 160, 12, 12)
+        if anim is None:
+            self.skipTest("needs ffmpeg with libx265 to build a wxgf sample")
+        self.daemon.add_thread("wxid_bob", "Bob")
+        preview = _png(160, 160, (255, 0, 0))
+        for mid, raw in (("st_wx", anim), ("st_bad", b"wxgf" + bytes([19, 0, 2]) + bytes(40))):
+            self.daemon.add_message(mid, "wxid_bob", None, type_=47)
+            self.daemon.media[mid] = [{"id": f"asset-{mid}", "kind": "sticker", "state": "available",
+                                       "variant": "original", "actualVariant": "original",
+                                       "contentType": "image/x-wxgf", "byteLength": len(raw),
+                                       "preview": {"contentType": "image/png"}}]
+            self.daemon.media_bytes[f"asset-{mid}"] = (raw, "image/x-wxgf")
+            self.daemon.media_bytes[f"asset-{mid}#preview"] = (preview, "image/png")
+
+        await self.event("st_wx", "wxid_bob")
+        s = self.b.bot.sent[-1]
+        self.assertEqual(self.daemon.content_requests, [("asset-st_wx", None)])
+        self.assertEqual((s.file.name, s.kwargs["mime_type"]), ("sticker.webm", "video/webm"))
+        [video] = [a for a in s.kwargs["attributes"] if isinstance(a, types.DocumentAttributeVideo)]
+        self.assertEqual(video.duration, 1.0)
+
+        await self.event("st_bad", "wxid_bob")
+        s = self.b.bot.sent[-1]
+        self.assertEqual(self.daemon.content_requests[1:], [("asset-st_bad", None), ("asset-st_bad", "preview")])
+        self.assertEqual((s.file.name, s.kwargs["mime_type"]), ("sticker.webp", "image/webp"))
 
     async def test_telegram_stickers_sent_as_native_wechat_stickers_and_echo_dropped(self):
         self.daemon.add_thread("wxid_bob", "Bob")
@@ -3154,6 +3232,40 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((ameta["w"], ameta["h"]), (512, 512))
             self.assertLessEqual(len(webm_bytes), self.stickers.TG_VIDEO_STICKER_MAX_BYTES)
             self.assertLessEqual(ameta["duration"], self.stickers.TG_VIDEO_STICKER_MAX_SECONDS)
+
+    async def test_from_wechat_sticker_keeps_wxgf_animation_and_transparency(self):
+        """Animated wxgf stickers (HEVC colour + gray mask frames) become transparent Telegram video stickers."""
+        import io
+        import subprocess
+        from PIL import Image
+        anim = _wxgf_sample(self.ffmpeg, 240, 240, 24, 12)
+        if anim is None:
+            self.skipTest("needs ffmpeg with libx265 to build a wxgf sample")
+        colour, mask = self.stickers._wxgf_streams(anim)
+        self.assertEqual((len(colour), len(mask)), (24, 24))
+        kind, webm, meta = self.stickers.from_wechat_sticker(anim, "image/x-wxgf")
+        self.assertEqual((kind, meta), ("video", {"w": 512, "h": 512, "duration": 2.0}))  # 24 frames at 12 fps
+        self.assertLessEqual(len(webm), self.stickers.TG_VIDEO_STICKER_MAX_BYTES)
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "s.webm").write_bytes(webm)
+
+            def alpha_at(x: int, y: int) -> bytes:
+                return subprocess.run([self.ffmpeg, "-loglevel", "error", "-c:v", "libvpx-vp9", "-i",
+                                       str(Path(tmp, "s.webm")), "-vf", f"alphaextract,crop=1:1:{x}:{y}",
+                                       "-f", "rawvideo", "-pix_fmt", "gray", "-"], capture_output=True).stdout
+            corner, centre = alpha_at(0, 0), alpha_at(256, 256)
+        self.assertEqual(len(corner), 24)  # every frame survives
+        self.assertTrue(max(corner) < 20 and min(centre) > 235, (set(corner), set(centre)))
+
+        # One masked frame -> transparent static sticker; no mask -> still animated, just opaque.
+        kind, webp, meta = self.stickers.from_wechat_sticker(_wxgf_sample(self.ffmpeg, 200, 150, 1, 25), "image/x-wxgf")
+        im = Image.open(io.BytesIO(webp)).convert("RGBA")
+        self.assertEqual((kind, im.size), ("static", (512, 384)))
+        self.assertEqual(im.getpixel((2, 2))[3], 0)
+        self.assertEqual(im.getpixel((256, 192))[3], 255)
+        kind, _, meta = self.stickers.from_wechat_sticker(_wxgf_sample(self.ffmpeg, 160, 160, 10, 10, mask=False),
+                                                          "image/x-wxgf")
+        self.assertEqual((kind, meta["duration"]), ("video", 1.0))
 
     async def test_picture_sent_as_file_becomes_original_wechat_image(self):
         """A picture sent as a Telegram document goes to WeChat as an original image, not a file."""

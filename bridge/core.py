@@ -1614,7 +1614,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         is_channels = t == APP and msg.get("appMessageType") == APP_CHANNELS
         if t in (IMAGE, VIDEO, VOICE, STICKER) or (t == APP and msg.get("appMessageType") == APP_FILE):
             try:
-                media = await self.wx.download_media(msg, self.max_media)
+                # Animated wxgf stickers keep their frames only in the original bytes (decoding needs ffmpeg).
+                raw_wxgf = t == STICKER and stickers.find_ffmpeg() is not None
+                media = await self.wx.download_media(msg, self.max_media, raw_wxgf=raw_wxgf)
             except WeChatError as e:
                 media = e.code
             if isinstance(media, str):
@@ -1782,6 +1784,15 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         log.info("Telegram refused link card photo (%s); falling back to text", e)
                     send_media = None
 
+            sticker = None
+            if t == STICKER and isinstance(send_media, Media):
+                sticker = await asyncio.to_thread(stickers.from_wechat_sticker, send_media.read(), send_media.mime)
+                if sticker is None and send_media.mime == "image/x-wxgf":
+                    # The original wxgf could not be decoded: use agent-wechat's still preview instead.
+                    send_media = await self._wxgf_still(msg)
+                    if isinstance(send_media, Media):
+                        sticker = await asyncio.to_thread(
+                            stickers.from_wechat_sticker, send_media.read(), send_media.mime)
             if isinstance(send_media, Media):
                 caption = (
                     header + prefix
@@ -1789,9 +1800,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     + channels_err_note
                 )
                 if t == STICKER:
-                    converted = await asyncio.to_thread(stickers.from_wechat_sticker, send_media.read(), send_media.mime)
-                    if converted is not None:
-                        sk_kind, sk_bytes, sk_meta = converted
+                    if sticker is not None:
+                        sk_kind, sk_bytes, sk_meta = sticker
                         sf = io.BytesIO(sk_bytes)
                         if sk_kind == "static":
                             sf.name = "sticker.webp"
@@ -1825,6 +1835,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                             if out:
                                 caption = ""
                                 reply = top
+                    if send_media.mime == "image/x-wxgf":  # Telegram can't show wxgf itself
+                        still = await self._wxgf_still(msg)
+                        if not isinstance(still, Media):
+                            text = ("" if out else header + prefix) + _media_failure_text(msg, still)
+                            out.append(await self.bot.send_message(chat_id, text, parse_mode="html", reply_to=reply,
+                                                                   silent=silent, link_preview=False))
+                            return out
+                        send_media = still
                 f = send_media.tg_file()
                 is_voice = t == VOICE and send_media.mime in ("audio/ogg", "audio/opus")
                 is_video = t == VIDEO or (is_channels and send_media.mime.startswith("video/"))
@@ -3289,6 +3307,16 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             bot_msg = tg_msg if chat_id < -1000000000000 else self._user_to_bot_msg.get((chat_id, tg_msg))
             if bot_msg is not None and self.store.wx_for_tg(chat_id, bot_msg, side="bot") is None:
                 self.store.map_message(chat_id, "bot", bot_msg, thread_id, local, server)
+
+    async def _wxgf_still(self, msg: dict) -> Media | str:
+        """agent-wechat's still JPEG/PNG preview of a wxgf attachment, or why it could not be fetched."""
+        try:
+            still = await self.wx.download_media(msg, self.max_media)
+        except WeChatError as e:
+            still = e.code
+        if isinstance(still, str):
+            log.info("Could not fetch the preview of wxgf sticker %s: %s", msg["id"], still)
+        return still
 
     async def _tg_media(self, msg, *, native_stickers: bool = True) -> tuple[str | None, Media | str]:
         f = msg.file

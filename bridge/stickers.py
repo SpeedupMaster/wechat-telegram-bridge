@@ -8,8 +8,10 @@ Telegram -> WeChat (native sticker, type=47):
   Legacy fallback (for agent-wechat < 2.4.0) converts to white-background JPEG or MP4 via `convert()`.
 
 WeChat -> Telegram (native Telegram sticker):
-  - static images / WXGF preview     -> 512 px RGBA .webp
-  - animated GIF                     -> 512 px VP9 .webm (<= 3 s, <= 30 fps, <= 256 KB, alpha kept)
+  - static images / 1-frame WXGF     -> 512 px RGBA .webp
+  - animated GIF / WXGF              -> 512 px VP9 .webm (<= 3 s, <= 30 fps, <= 256 KB, alpha kept)
+  WXGF is WeChat's HEVC format: colour frames plus a gray alpha-mask stream. agent-wechat's own preview
+  of it is a single still frame, so stickers are fetched as the original bytes and decoded here.
 """
 from __future__ import annotations
 
@@ -197,6 +199,180 @@ def _wxgf_partition(data: bytes) -> bytes:
     if not best:
         raise ValueError("wxgf image has no HEVC partition")
     return data[best[0]:best[1]]
+
+
+def _hevc_nal_header_ok(nal: bytes) -> bool:
+    return len(nal) == 2 and not nal[0] & 0x80 and bool(nal[1] & 7) and (nal[0] >> 1) & 0x3F <= 40
+
+
+def _wxgf_all_partitions(data: bytes) -> list[bytes]:
+    """Every HEVC partition of a wxgf v2 image, in file order.
+
+    An animated wxgf stores each frame as its own partition, alternating between an alpha-mask stream
+    (HEVC Rext, gray) and the colour stream; only a stream's first frames carry VPS/SPS/PPS. The first
+    partition must open with a parameter set, so stray start codes in the header are not mistaken for one."""
+    if len(data) < 15 or not data.startswith(b"wxgf") or data[5:7] != b"\x00\x02" or not 15 <= data[4] < len(data):
+        raise ValueError("not a wxgf v2 image")
+    parts: list[bytes] = []
+    pos = data[4] + 4
+    while pos < len(data):
+        code = 4 if data[pos:pos + 4] == b"\0\0\0\x01" else 3 if data[pos:pos + 3] == b"\0\0\x01" else 0
+        if not code:
+            pos += 1
+            continue
+        length = int.from_bytes(data[pos - 4:pos], "big")
+        end = pos + length
+        nal = data[pos + code:pos + code + 2]
+        ok = length >= code + 2 and end <= len(data) and _hevc_nal_header_ok(nal)
+        if ok and not parts:
+            ok = 32 <= (nal[0] >> 1) & 0x3F <= 34
+        if not ok:
+            pos += 1
+            continue
+        parts.append(data[pos:end])
+        pos = end
+    if not parts:
+        raise ValueError("wxgf image has no HEVC partition")
+    return parts
+
+
+def _hevc_sps_chroma_format(partition: bytes) -> int | None:
+    """chroma_format_idc of the first SPS in an Annex B partition (0 = monochrome mask), or None without one."""
+    for m in re.finditer(rb"\x00\x00\x01", partition):
+        start = m.end()
+        if len(partition) < start + 2 or (partition[start] >> 1) & 0x3F != 33:
+            continue
+        end = partition.find(b"\x00\x00\x01", start)
+        rbsp = re.sub(rb"\x00\x00\x03", b"\x00\x00", partition[start + 2:end if end != -1 else len(partition)])
+        bits = "".join(f"{b:08b}" for b in rbsp[:64])
+        pos = 0
+
+        def u(n: int) -> int:
+            nonlocal pos
+            if pos + n > len(bits):
+                raise ValueError("truncated SPS")
+            v = int(bits[pos:pos + n], 2) if n else 0
+            pos += n
+            return v
+
+        def ue() -> int:
+            nonlocal pos
+            zeros = 0
+            while u(1) == 0:
+                zeros += 1
+                if zeros > 31:
+                    raise ValueError("bad exp-golomb")
+            return (1 << zeros) - 1 + u(zeros)
+
+        try:
+            u(4)                      # sps_video_parameter_set_id
+            max_sub_layers = u(3)     # sps_max_sub_layers_minus1
+            u(1)                      # sps_temporal_id_nesting_flag
+            u(96)                     # general profile_tier_level
+            flags = [(u(1), u(1)) for _ in range(max_sub_layers)]
+            if max_sub_layers:
+                u(2 * (8 - max_sub_layers))
+            for profile_present, level_present in flags:
+                u(88 * profile_present + 8 * level_present)
+            ue()                      # sps_seq_parameter_set_id
+            return ue()               # chroma_format_idc
+        except ValueError:
+            return None
+    return None
+
+
+def _wxgf_streams(data: bytes) -> tuple[list[bytes], list[bytes]]:
+    """Split a wxgf into (colour partitions, alpha-mask partitions), one partition per frame."""
+    parts = _wxgf_all_partitions(data)
+    chroma = [_hevc_sps_chroma_format(p) for p in parts]
+    if not any(c == 0 for c in chroma):
+        return parts, []
+    if all(c is not None for c in chroma):
+        return [p for p, c in zip(parts, chroma) if c != 0], [p for p, c in zip(parts, chroma) if c == 0]
+    mask_parity = {i % 2 for i, c in enumerate(chroma) if c == 0}
+    colour_parity = {i % 2 for i, c in enumerate(chroma) if c is not None and c != 0}
+    if len(mask_parity) != 1 or mask_parity & colour_parity:
+        raise ValueError("wxgf mask and colour frames do not alternate")
+    mp = mask_parity.pop()
+    colour = [p for i, p in enumerate(parts) if i % 2 != mp]
+    if not colour:
+        raise ValueError("wxgf image has no colour frames")
+    return colour, [p for i, p in enumerate(parts) if i % 2 == mp]
+
+
+_TBR_RE = re.compile(r"Video:.*?([\d.]+) tbr")
+WX_ANIMATION_DEFAULT_FPS = 25.0
+
+
+def _hevc_frame_rate(path: str, ffmpeg: str) -> float:
+    """Frame rate from the stream's VUI timing (ffmpeg's `tbr` for raw HEVC), else ffmpeg's 25 fps default."""
+    res = subprocess.run([ffmpeg, "-hide_banner", "-nostdin", "-f", "hevc", "-i", path, "-map", "0:v:0",
+                          "-c", "copy", "-f", "null", "-"],
+                         capture_output=True, text=True, errors="replace", timeout=30)
+    m = _TBR_RE.search(res.stderr or "")
+    try:
+        rate = float(m.group(1)) if m else 0.0
+    except ValueError:
+        rate = 0.0
+    return rate if 1.0 <= rate <= 120.0 else WX_ANIMATION_DEFAULT_FPS
+
+
+def wxgf_to_tg_sticker(data: bytes, ffmpeg: str) -> tuple[str, bytes, dict]:
+    """Decode a (possibly animated, possibly transparent) wxgf into a Telegram sticker.
+
+    Returns ("video", webm, {"w", "h", "duration"}) for animations and ("static", webp, {"w", "h"}) otherwise."""
+    colour, mask = _wxgf_streams(data)
+    width, height = int.from_bytes(data[7:9], "big"), int.from_bytes(data[9:11], "big")
+    with tempfile.TemporaryDirectory() as tmp:
+        colour_path, mask_path = os.path.join(tmp, "colour.hevc"), os.path.join(tmp, "mask.hevc")
+        with open(colour_path, "wb") as f:
+            f.write(b"".join(colour))
+        if mask:
+            with open(mask_path, "wb") as f:
+                f.write(b"".join(mask))
+        fps = _hevc_frame_rate(colour_path, ffmpeg)
+        # Odd canvases decode one pixel larger in 4:2:0 HEVC; crop back to the header's canvas.
+        crop = f"crop='min(iw,{width})':'min(ih,{height})':0:0," if width and height else ""
+        animated = len(colour) > 1
+
+        def inputs(with_mask: bool) -> list[str]:
+            args = ["-framerate", f"{fps:g}", "-f", "hevc", "-i", colour_path]
+            if with_mask:
+                args += ["-framerate", f"{fps:g}", "-f", "hevc", "-i", mask_path]
+            return args
+
+        def merge(with_mask: bool) -> str:
+            # The mask's luma is the alpha channel (white = opaque).
+            return "[0:v][1:v]alphamerge," if with_mask else "[0:v]format=rgba,"
+
+        attempts = (True, False) if mask else (False,)
+        for with_mask in attempts:
+            if animated:
+                out_w, out_h = _fit_size(width or TG_STICKER_SIZE, height or TG_STICKER_SIZE, TG_STICKER_SIZE,
+                                         even=True, upscale=True)
+                graph = (f"{merge(with_mask)}{crop}fps={min(fps, TG_VIDEO_STICKER_MAX_FPS):g},"
+                         f"scale={out_w}:{out_h}:flags=lanczos,format=yuva420p[v]")
+                webm = _encode_tg_webm(ffmpeg, inputs(with_mask), ["-filter_complex", graph, "-map", "[v]"],
+                                       os.path.join(tmp, "out.webm"))
+                if webm is not None:
+                    duration = min(TG_VIDEO_STICKER_MAX_SECONDS, len(colour) / fps)
+                    return "video", webm, {"w": out_w, "h": out_h, "duration": duration}
+                continue
+            png = os.path.join(tmp, "frame.png")
+            res = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                                  *inputs(with_mask), "-filter_complex", f"{merge(with_mask)}{crop}format=rgba[v]",
+                                  "-map", "[v]", "-frames:v", "1", png], capture_output=True, timeout=30)
+            if res.returncode == 0 and os.path.exists(png):
+                with Image.open(png) as im:
+                    im.load()
+                    webp, w, h = wechat_image_to_tg_webp(im)
+                return "static", webp, {"w": w, "h": h}
+            log.info("wxgf still decode failed (mask=%s): %s", with_mask, res.stderr.decode(errors="replace")[-300:])
+    if animated:
+        # The video path failed (e.g. the webm stays over Telegram's size cap): fall back to a still.
+        webp, w, h = wechat_image_to_tg_webp(wxgf_to_image(data, ffmpeg))
+        return "static", webp, {"w": w, "h": h}
+    raise ValueError("wxgf decode failed")
 
 
 def wxgf_to_image(data: bytes, ffmpeg: str) -> Image.Image:
@@ -967,23 +1143,30 @@ def wechat_gif_to_tg_webm(data: bytes, ffmpeg: str) -> tuple[bytes, int, int, fl
     target_fps = min(TG_VIDEO_STICKER_MAX_FPS, max(1, round(n_frames / dur_s)))
     out_w, out_h = _fit_size(im.size[0], im.size[1], TG_STICKER_SIZE, even=True, upscale=True)
     with tempfile.TemporaryDirectory() as tmp:
-        src, out_path = os.path.join(tmp, "in.gif"), os.path.join(tmp, "out.webm")
+        src = os.path.join(tmp, "in.gif")
         with open(src, "wb") as f:
             f.write(data)
         vf = f"fps={target_fps},scale={out_w}:{out_h}:flags=lanczos,format=yuva420p"
-        for crf, bitrate in ((20, "650k"), (26, "450k"), (34, "280k"), (42, "150k")):
-            cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                   "-i", src, "-t", f"{TG_VIDEO_STICKER_MAX_SECONDS:g}", "-vf", vf,
-                   "-c:v", "libvpx-vp9", "-b:v", bitrate, "-crf", str(crf),
-                   "-deadline", "good", "-cpu-used", "2",
-                   "-auto-alt-ref", "0", "-an", out_path]
-            res = subprocess.run(cmd, capture_output=True, timeout=120)
-            if res.returncode != 0:
-                return None
-            with open(out_path, "rb") as f:
-                out = f.read()
-            if len(out) <= TG_VIDEO_STICKER_MAX_BYTES:
-                return out, out_w, out_h, out_dur
+        out = _encode_tg_webm(ffmpeg, ["-i", src], ["-vf", vf], os.path.join(tmp, "out.webm"))
+    return (out, out_w, out_h, out_dur) if out is not None else None
+
+
+def _encode_tg_webm(ffmpeg: str, input_args: list[str], filter_args: list[str], out_path: str) -> bytes | None:
+    """Encode to a <= 3 s VP9 webm (alpha kept), lowering quality until it fits Telegram's 256 KB cap."""
+    for crf, bitrate in ((20, "650k"), (26, "450k"), (34, "280k"), (42, "150k")):
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+               *input_args, "-t", f"{TG_VIDEO_STICKER_MAX_SECONDS:g}", *filter_args,
+               "-c:v", "libvpx-vp9", "-b:v", bitrate, "-crf", str(crf),
+               "-deadline", "good", "-cpu-used", "2",
+               "-auto-alt-ref", "0", "-an", out_path]
+        res = subprocess.run(cmd, capture_output=True, timeout=120)
+        if res.returncode != 0:
+            log.info("Telegram video sticker encode failed: %s", res.stderr.decode(errors="replace").strip()[-300:])
+            return None
+        with open(out_path, "rb") as f:
+            out = f.read()
+        if len(out) <= TG_VIDEO_STICKER_MAX_BYTES:
+            return out
     return None
 
 
@@ -997,8 +1180,11 @@ def from_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes, dict] | Non
         if mime == "image/x-wxgf":
             if not ffmpeg:
                 return None
-            im = wxgf_to_image(data, ffmpeg)
-            webp, w, h = wechat_image_to_tg_webp(im)
+            try:
+                return wxgf_to_tg_sticker(data, ffmpeg)
+            except Exception as e:
+                log.info("Could not decode wxgf sticker animation (%s); sending its first frame", e)
+            webp, w, h = wechat_image_to_tg_webp(wxgf_to_image(data, ffmpeg))
             return "static", webp, {"w": w, "h": h}
         if mime == "image/gif":
             im = Image.open(io.BytesIO(data))

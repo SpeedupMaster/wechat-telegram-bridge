@@ -758,13 +758,17 @@ class WeChatClient:
         """Fetch a Channels card's playable video if present, returning None when none is offered."""
         return await self._download_media(message, max_bytes, channels=True)
 
-    async def download_media(self, message: dict, max_bytes: int) -> Media | str:
-        """Fetch the best available copy of a message attachment, or return a reason string."""
-        res = await self._download_media(message, max_bytes, channels=False)
+    async def download_media(self, message: dict, max_bytes: int, *, raw_wxgf: bool = False) -> Media | str:
+        """Fetch the best available copy of a message attachment, or return a reason string.
+
+        WeChat's own HEVC "wxgf" images are swapped for agent-wechat's still JPEG/PNG preview unless
+        `raw_wxgf` asks for the original bytes (animated stickers keep their frames only there)."""
+        res = await self._download_media(message, max_bytes, channels=False, raw_wxgf=raw_wxgf)
         assert res is not None
         return res
 
-    async def _download_media(self, message: dict, max_bytes: int, *, channels: bool) -> Media | str | None:
+    async def _download_media(self, message: dict, max_bytes: int, *, channels: bool,
+                              raw_wxgf: bool = False) -> Media | str | None:
         mid = message["id"]
         mtype = VIDEO if channels else message["type"]
         quality = "normal" if mtype in (VOICE, VIDEO) else "best"
@@ -856,7 +860,8 @@ class WeChatClient:
             return "文件太大"
         mime = (asset.get("contentType") or "application/octet-stream").split(";")[0].strip().lower()
         params = {}
-        if mime == "image/x-wxgf" and asset.get("preview"):  # WeChat's own image format: use the JPEG/PNG preview
+        if mime == "image/x-wxgf" and asset.get("preview") and not raw_wxgf:
+            # WeChat's own image format: use the JPEG/PNG preview (its first frame only)
             params = {"representation": "preview"}
             mime = asset["preview"]["contentType"]
         try:
@@ -984,7 +989,7 @@ def _pick(assets: list[dict], mtype: int) -> dict | None:
 def _ext(mime: str) -> str:
     return {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
             "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
-            "audio/amr": ".amr", "audio/silk": ".silk", "audio/wav": ".wav"}.get(mime, ".bin")
+            "audio/amr": ".amr", "audio/silk": ".silk", "audio/wav": ".wav", "image/x-wxgf": ".wxgf"}.get(mime, ".bin")
 
 
 async def _read_http_error(reader: asyncio.StreamReader, headers: dict[str, str], status: int) -> WeChatError:
