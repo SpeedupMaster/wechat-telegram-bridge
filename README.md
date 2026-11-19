@@ -322,7 +322,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `CALL_WEB_APP` | 否 | 空 | `@BotFather` `/newapp` 注册的 Mini App 短名称 |
 | `COMPOSE_PROFILES` | 否 | 空 | 设为 `cloudflare` 时随 Compose 启动内置的 `cloudflared` 隧道容器 |
 | `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
-| `AGENT_WECHAT_VERSION` | 否 | `v2.7.1` | 上游 `agent-wechat` 镜像版本标签 |
+| `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v2.8.0`） |
 
 ### 高级配置（`config/config.toml`）
 
