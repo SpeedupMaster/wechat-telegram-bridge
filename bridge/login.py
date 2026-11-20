@@ -64,6 +64,31 @@ def _is_wx_restoring(info: dict) -> bool:
     return conn in ("connecting", "reconnecting") or state in ("starting", "connecting", "reconnecting")
 
 
+def _format_login_failure(state: str, res: dict, *, silent: bool = False) -> tuple[str, str]:
+    """Return (friendly_summary, diagnostic_details) for a terminal login operation.
+
+    agent-wechat >= 2.9.0 includes `service` (rejected sign-in step) and `serviceCode`
+    (WeChat numeric rejection code) in failed login results when WeChat refused the step.
+    """
+    code = res.get("code")
+    reason = code or res.get("reason") or state
+    friendly = {
+        "cancelled": "已取消",
+        "expired": "登录请求已过期" if silent else "二维码或确认已过期",
+        "rejected": "已在手机上取消登录",
+        "timeout": "登录超时",
+        "needs_login": "需要重新验证登录",
+        "failed": "登录失败",
+    }.get(str(reason), str(reason))
+    service = res.get("service")
+    service_code = res.get("serviceCode")
+    details = ""
+    if service is not None or service_code is not None:
+        parts = [str(p) for p in (code or reason, service, service_code) if p is not None and str(p) != ""]
+        details = " · ".join(parts)
+    return friendly, details
+
+
 class LoginMixin:
     """Mixed into Bridge. Expects self.user, self.bot, self.wx, self.store, self.cfg."""
 
@@ -88,6 +113,7 @@ class LoginMixin:
         self.login_poll_interval = 2.0
         self.wx_startup_poll_interval = 2.0
         self.wx_startup_wait_timeout = 60.0
+        self.wx_login_busy_timeout = 30.0
         self.wx_idle_auth_check_interval = 15.0
         self._wx_login_phase = ""
         self._wx_force_qr_restart = False
@@ -769,19 +795,19 @@ class LoginMixin:
                     await self.notify(
                         "⚠️ agent-wechat 当前一直有正在进行的登录/重连操作，暂时无法发起新登录。"
                         "请稍等片刻后点击下方按钮重试，也可以发送 /wxlogin 重试。",
-                        buttons=self._wx_login_buttons())
+                        buttons=self._wx_login_buttons(include_qr=True))
                 else:
                     busy_deadline = None
                     log.warning("WeChat login step failed: %s", e)
                     await self.notify(
                         f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
-                        buttons=self._wx_login_buttons())
+                        buttons=self._wx_login_buttons(include_qr=True))
             except httpx.HTTPError as e:
                 busy_deadline = None
                 log.warning("WeChat login step failed: %s", e)
                 await self.notify(
                     f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
-                    buttons=self._wx_login_buttons())
+                    buttons=self._wx_login_buttons(include_qr=True))
             self.wx_login_requested.clear()
             while True:
                 if self.wx_idle_auth_check_interval > 0:
@@ -802,7 +828,54 @@ class LoginMixin:
                     await self.wx_login_requested.wait()
                     break
 
-    async def wechat_login(self, force_qr: bool = False, *, start_notice: str = "") -> bool:
+    async def _start_login_when_free(
+        self, force_qr: bool, wait_timeout: float
+    ) -> tuple[dict | None, bool, bool]:
+        """Start a WeChat login op, waiting out transient 409 operation_in_progress when `wait_timeout > 0`.
+
+        Returns (operation, already_signed_in, effective_force_qr).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_timeout if wait_timeout > 0 else 0.0
+        notified_busy = False
+        effective_qr = force_qr
+        while True:
+            try:
+                op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=effective_qr)
+                return op, False, effective_qr
+            except WeChatError as e:
+                if not _is_op_in_progress(e) or wait_timeout <= 0:
+                    raise
+                try:
+                    info = await self.wx.account_info()
+                except (httpx.HTTPError, WeChatError):
+                    info = {}
+                if info.get("authenticated"):
+                    await self._finish_authenticated(info)
+                    return None, True, effective_qr
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise
+                if not notified_busy:
+                    notified_busy = True
+                    log.info("WeChat login hit 409 operation_in_progress; waiting up to %.0fs for account to become free",
+                             wait_timeout)
+                    await self.notify("⏳ agent-wechat 正在处理其他登录/同步任务，请稍候，空闲后会自动继续…")
+                sleep_for = min(self.wx_startup_poll_interval, remaining)
+                if sleep_for > 0:
+                    try:
+                        await asyncio.wait_for(self._wx_login_interrupt.wait(), timeout=sleep_for)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(0)
+                self._wx_login_interrupt.clear()
+                if self._wx_force_qr_restart:
+                    self._wx_force_qr_restart = False
+                    effective_qr = True
+
+    async def wechat_login(self, force_qr: bool = False, *, start_notice: str = "",
+                           wait_busy_timeout: float = 0.0) -> bool:
         if self.wx_login_lock.locked():
             await self.notify(self._wx_login_busy_hint())
             return False
@@ -811,10 +884,22 @@ class LoginMixin:
             self._wx_force_qr_restart = False
             self._wx_login_interrupt.clear()
             notice_sent = False
+            just_switched_qr = False
             while True:
                 loop = asyncio.get_running_loop()
                 self._wx_login_phase = "starting"
-                op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=current_force_qr)
+                busy_timeout = (
+                    max(wait_busy_timeout, min(10.0, self.wx_login_busy_timeout))
+                    if just_switched_qr else wait_busy_timeout
+                )
+                just_switched_qr = False
+                op, already_signed_in, current_force_qr = await self._start_login_when_free(
+                    current_force_qr, busy_timeout
+                )
+                if already_signed_in:
+                    await self.notify("✅ 微信已恢复在线。")
+                    return True
+                assert op is not None
                 if start_notice and not notice_sent and op.get("state") != "succeeded":
                     notice_sent = True
                     await self.notify(start_notice)
@@ -826,9 +911,7 @@ class LoginMixin:
                         state, res = op.get("state"), op.get("result") or {}
                         if state == "succeeded":
                             info = await self.wx.account_info()
-                            if info.get("connection") == "disconnected":
-                                await self.wx.connect()
-                            self._mark_wx_online()
+                            await self._finish_authenticated(info)
                             await self.notify("✅ 微信已登录！之后收到的消息会自动建群并转发到这里。")
                             return True
                         if state in LOGIN_DONE_STATES:
@@ -837,16 +920,18 @@ class LoginMixin:
                                 current_force_qr = True
                                 switched_to_qr = True
                                 break
-                            reason = res.get("code") or res.get("reason") or state
-                            friendly = {
-                                "cancelled": "已取消",
-                                "expired": "二维码或确认已过期",
-                                "rejected": "已在手机上取消登录",
-                                "timeout": "登录超时",
-                            }.get(str(reason), str(reason))
-                            await self.notify(
-                                f"⚠️ 微信登录未完成（{friendly}）。点击下方按钮重新登录或改用扫码登录，也可以发送 /wxlogin 重试。",
-                                buttons=self._wx_login_buttons(include_qr=True))
+                            friendly, details = _format_login_failure(state, res, silent=False)
+                            log.warning("WeChat login did not complete (state=%s, details=%s)",
+                                        state, details or friendly)
+                            lines = [f"⚠️ 微信登录未完成（{friendly}）。"]
+                            if details:
+                                lines.append(f"详情：{details}")
+                            if not current_force_qr and last_gen is None and state != "cancelled":
+                                lines.append("复用登录未成功，建议点击「📷 扫码登录」（同账号扫码，保留聊天记录），"
+                                             "或点击「🔑 重新登录微信」重试。")
+                            else:
+                                lines.append("点击下方按钮重新登录或改用扫码登录，也可以发送 /wxlogin 重试。")
+                            await self.notify("\n".join(lines), buttons=self._wx_login_buttons(include_qr=True))
                             return False
                         gen = res.get("qrGeneration")
                         if state == "awaiting_scan":
@@ -899,6 +984,7 @@ class LoginMixin:
                             break
                         op = await self.wx.operation(op["id"])
                     if switched_to_qr:
+                        just_switched_qr = True
                         continue
                     await self.notify(
                         "⏱ 微信登录超时，手机上一直没有确认。点击下方按钮重新登录或改用扫码登录，也可以发送 /wxlogin 重试。",
@@ -939,7 +1025,7 @@ class LoginMixin:
             self.wx_login_requested.set()
             return
         try:
-            if await self.wechat_login(force_qr=force_qr):
+            if await self.wechat_login(force_qr=force_qr, wait_busy_timeout=self.wx_login_busy_timeout):
                 self._mark_wx_online()
         except (httpx.HTTPError, WeChatError) as e:
             if _is_op_in_progress(e):
@@ -953,11 +1039,11 @@ class LoginMixin:
                     return
                 await self.notify(
                     "⏳ agent-wechat 当前已有正在进行的登录/重连操作，请稍等几秒后再点击重试。",
-                    buttons=self._wx_login_buttons())
+                    buttons=self._wx_login_buttons(include_qr=True))
                 return
             await self.notify(
                 f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
-                buttons=self._wx_login_buttons())
+                buttons=self._wx_login_buttons(include_qr=True))
 
     async def _on_wx_signed_out(self) -> None:
         """Handle transition into signed_out: optionally schedule a single delayed auto-relogin."""
@@ -966,7 +1052,7 @@ class LoginMixin:
         if not self.cfg.bridge.auto_relogin:
             await self.notify(
                 "⚠️ 微信已退出登录（可能在手机上移除了这台设备），点击下方按钮或发送 /wxlogin 重新登录。",
-                buttons=self._wx_login_buttons())
+                buttons=self._wx_login_buttons(include_qr=True))
             return
         if self._wx_auto_relogin_attempted:
             await self.notify(
@@ -1144,8 +1230,9 @@ class LoginMixin:
                         if info.get("connection") == "disconnected":
                             await self.wx.connect()
                     except (httpx.HTTPError, WeChatError) as e:
-                        log.warning("Auto-relogin succeeded but post-login connect check failed: %s", e)
-                        connected = False
+                        if not _is_op_in_progress(e):
+                            log.warning("Auto-relogin succeeded but post-login connect check failed: %s", e)
+                            connected = False
                     if connected:
                         self._mark_wx_online()
                     else:
@@ -1156,15 +1243,12 @@ class LoginMixin:
                     await self._cancel_wx_op_quietly(op)
                     return False, "当前需要扫码登录，无法自动完成"
                 if state in LOGIN_DONE_STATES:
-                    reason = res.get("code") or res.get("reason") or state
-                    friendly = {
-                        "cancelled": "已取消",
-                        "expired": "登录请求已过期",
-                        "rejected": "已在手机上取消登录",
-                        "timeout": "登录超时",
-                        "needs_login": "需要重新验证登录",
-                        "failed": "登录失败",
-                    }.get(str(reason), str(reason))
+                    friendly, details = _format_login_failure(state, res, silent=True)
+                    log.warning("WeChat auto-relogin did not complete (state=%s, details=%s)",
+                                state, details or friendly)
+                    if details:
+                        reason = res.get("code") or res.get("reason") or state
+                        return False, details if friendly == str(reason) else f"{friendly}（{details}）"
                     return False, friendly
                 if state == "awaiting_approval":
                     saw_approval = True

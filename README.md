@@ -329,7 +329,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `COMPOSE_PROFILES` | 否 | 空 | 设为 `cloudflare` 时随 Compose 启动内置的 `cloudflared` 隧道容器 |
 | `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
 | `AUTO_RELOGIN` | 否 | `false` | 微信掉线后是否自动尝试重新登录一次（需手机微信开启「自动登录该设备」，内置随机延迟与冷却保护，失败则提醒手动登录） |
-| `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v2.8.0`） |
+| `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v2.9.0`） |
 
 ### 高级配置（`config/config.toml`）
 

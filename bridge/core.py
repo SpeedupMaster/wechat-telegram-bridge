@@ -1056,10 +1056,6 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     # ======================================================================
     async def event_loop(self) -> None:
         cursor = self.store.get("cursor")
-        if cursor is None:
-            cursor = await self.wx.latest_cursor()
-            self.store.set("cursor", cursor)
-            log.info("First start: skipping old history, listening from event cursor %s", cursor)
         if self.store.get("since") is None:
             # Messages created before this moment are history and never forwarded, even when the
             # daemon syncs them in later ("catchup"), e.g. right after the first WeChat login.
@@ -1068,6 +1064,10 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         backoff = 1.0
         while True:
             try:
+                if cursor is None:
+                    cursor = await self.wx.latest_cursor()
+                    self.store.set("cursor", cursor)
+                    log.info("First start: skipping old history, listening from event cursor %s", cursor)
                 async for event in self.wx.stream(cursor):
                     backoff = 1.0
                     await self.handle_event(event)
@@ -1077,9 +1077,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         asyncio.create_task(self._ack(cursor))
                 log.warning("Event stream ended; reconnecting")
             except CursorExpired:
-                cursor = await self.wx.latest_cursor()
-                self.store.set("cursor", cursor)
-                log.warning("Event cursor expired on the daemon; some events were skipped. Resuming at %s", cursor)
+                try:
+                    cursor = await self.wx.latest_cursor()
+                    self.store.set("cursor", cursor)
+                    log.warning("Event cursor expired on the daemon; some events were skipped. Resuming at %s", cursor)
+                except (httpx.HTTPError, WeChatError) as e:
+                    cursor = None
+                    log.warning("Event cursor expired and newest cursor lookup failed (%s); retrying in %.0fs",
+                                e, backoff)
             except (httpx.HTTPError, WeChatError) as e:
                 log.warning("Event stream error: %s; retrying in %.0fs", e, backoff)
             await asyncio.sleep(backoff)

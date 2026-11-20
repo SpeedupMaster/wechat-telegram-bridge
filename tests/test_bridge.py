@@ -2680,6 +2680,216 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         await wx.close()
         self.assertEqual([(e["cursor"], e["kind"]) for e in got], [("5", "message.committed"), ("6", "thread.updated")])
 
+    async def test_latest_cursor_uses_newest_when_cursor_zero_expired(self):
+        seen_params: list[dict[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            seen_params.append(params)
+            if params.get("newest") == "true":
+                self.assertNotIn("after", params)
+                return httpx.Response(200, json={"items": [{"cursor": "10500"}], "nextCursor": "10500"})
+            return httpx.Response(410, json={"error": {"code": "event_cursor_expired", "retryable": False}})
+
+        wx = WeChatClient("http://daemon", "secret-token", ACC, read_retry_delays=())
+        await wx.http.aclose()
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            self.assertEqual(await wx.latest_cursor(), "10500")
+            self.assertEqual(seen_params, [{"newest": "true", "limit": "1"}])
+        finally:
+            await wx.close()
+
+        # Empty event log returns "0"
+        wx2 = WeChatClient("http://daemon", "secret-token", ACC, read_retry_delays=())
+        await wx2.http.aclose()
+        wx2.http = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"items": [], "nextCursor": "0"})))
+        try:
+            self.assertEqual(await wx2.latest_cursor(), "0")
+        finally:
+            await wx2.close()
+
+    async def test_latest_cursor_falls_back_on_legacy_daemon_without_newest(self):
+        seen_params: list[dict[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            seen_params.append(params)
+            if "newest" in params:
+                # agent-wechat < 2.9.0 uses serde(deny_unknown_fields) and returns plain-text 400
+                return httpx.Response(400, text="Failed to deserialize query string: unknown field `newest`")
+            after = int(params.get("after", "0"))
+            if after == 0:
+                return httpx.Response(200, json={"items": [{"cursor": "10"}], "nextCursor": "10"})
+            if after == 10:
+                return httpx.Response(200, json={"items": [{"cursor": "25"}], "nextCursor": "25"})
+            return httpx.Response(200, json={"items": [], "nextCursor": "25"})
+
+        wx = WeChatClient("http://daemon", "secret-token", ACC, read_retry_delays=())
+        await wx.http.aclose()
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            self.assertEqual(await wx.latest_cursor(), "25")
+            self.assertEqual(seen_params, [
+                {"newest": "true", "limit": "1"},
+                {"after": "0", "limit": "200"},
+                {"after": "10", "limit": "200"},
+                {"after": "25", "limit": "200"},
+            ])
+        finally:
+            await wx.close()
+
+    async def test_stream_raises_cursor_expired_on_http_410_and_preserves_error_codes(self):
+        from bridge.wechat import WeChatError
+
+        wx = WeChatClient("http://daemon", "secret-token", ACC)
+        await wx.http.aclose()
+        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(410, json={"error": {"code": "event_cursor_expired", "retryable": False}})))
+        try:
+            with self.assertRaises(CursorExpired):
+                async for _ in wx.stream("5"):
+                    pass
+        finally:
+            await wx.close()
+
+        wx2 = WeChatClient("http://daemon", "secret-token", ACC)
+        await wx2.http.aclose()
+        wx2.http = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(401, json={"error": {"code": "unauthorized", "retryable": False}})))
+        try:
+            with self.assertRaises(WeChatError) as ctx:
+                async for _ in wx2.stream("5"):
+                    pass
+            self.assertEqual((ctx.exception.status, ctx.exception.code), (401, "unauthorized"))
+        finally:
+            await wx2.close()
+
+    async def test_event_loop_recovers_from_http_410_cursor_expired_using_newest(self):
+        from unittest.mock import patch
+
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cfg = Config(WeChatConfig(token="secret-token", account=ACC),
+                     TelegramConfig(api_id=1, api_hash="x", bot_token="y"),
+                     BridgeConfig(), Path(tmp.name) / "config.toml")
+        b = Bridge(cfg)
+        b.store.set("cursor", "5")
+        handled: list[dict] = []
+        done = asyncio.Event()
+
+        async def fake_handle(ev: dict):
+            handled.append(ev)
+            done.set()
+
+        b.handle_event = fake_handle
+        stream_cursors: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path.removeprefix("/v1/")
+            params = dict(request.url.params)
+            if path == f"accounts/{ACC}/events":
+                if params.get("newest") == "true":
+                    return httpx.Response(200, json={"items": [{"cursor": "10050"}], "nextCursor": "10050"})
+                return httpx.Response(410, json={"error": {"code": "event_cursor_expired", "retryable": False}})
+            if path == f"accounts/{ACC}/events/stream":
+                after = params.get("after", "0")
+                stream_cursors.append(after)
+                if after == "5":
+                    return httpx.Response(410, json={"error": {"code": "event_cursor_expired", "retryable": False}})
+                body = (
+                    "id: 10051\ndata: {\"kind\":\"message.committed\",\"data\":{\"messageId\":\"m1\"}}\n\n"
+                    if after == "10050" else ": keepalive\n\n"
+                )
+                return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+            if path.startswith(f"accounts/{ACC}/consumers/"):
+                return httpx.Response(200, json={})
+            raise AssertionError(f"unexpected {request.method} {path}")
+
+        await b.wx.http.aclose()
+        b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        orig_sleep = asyncio.sleep
+
+        async def fast_sleep(_delay: float):
+            await orig_sleep(0)
+
+        try:
+            with patch("bridge.core.asyncio.sleep", side_effect=fast_sleep):
+                task = asyncio.create_task(b.event_loop())
+                await asyncio.wait_for(done.wait(), timeout=2.0)
+                await orig_sleep(0.01)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(stream_cursors[:2], ["5", "10050"])
+            self.assertEqual([e["cursor"] for e in handled], ["10051"])
+            self.assertEqual(b.store.get("cursor"), "10051")
+        finally:
+            await b.close()
+            b.store.db.close()
+            tmp.cleanup()
+
+    async def test_event_loop_retries_transient_error_during_initial_latest_cursor(self):
+        from unittest.mock import patch
+
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cfg = Config(WeChatConfig(token="secret-token", account=ACC),
+                     TelegramConfig(api_id=1, api_hash="x", bot_token="y"),
+                     BridgeConfig(), Path(tmp.name) / "config.toml")
+        b = Bridge(cfg)
+        b.wx._read_retry_delays = ()
+        done = asyncio.Event()
+        events_calls = 0
+        stream_cursors: list[str] = []
+
+        async def fake_handle(_ev: dict):
+            done.set()
+
+        b.handle_event = fake_handle
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal events_calls
+            path = request.url.path.removeprefix("/v1/")
+            if path == f"accounts/{ACC}/events":
+                events_calls += 1
+                if events_calls == 1:
+                    return httpx.Response(503, json={"error": {"code": "unavailable", "retryable": True}})
+                return httpx.Response(200, json={"items": [{"cursor": "200"}], "nextCursor": "200"})
+            if path == f"accounts/{ACC}/events/stream":
+                after = request.url.params.get("after", "0")
+                stream_cursors.append(after)
+                body = (
+                    "id: 201\ndata: {\"kind\":\"message.committed\",\"data\":{\"messageId\":\"m1\"}}\n\n"
+                    if after == "200" else ": keepalive\n\n"
+                )
+                return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+            if path.startswith(f"accounts/{ACC}/consumers/"):
+                return httpx.Response(200, json={})
+            raise AssertionError(f"unexpected {request.method} {path}")
+
+        await b.wx.http.aclose()
+        b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        orig_sleep = asyncio.sleep
+
+        async def fast_sleep(_delay: float):
+            await orig_sleep(0)
+
+        try:
+            with patch("bridge.core.asyncio.sleep", side_effect=fast_sleep):
+                task = asyncio.create_task(b.event_loop())
+                await asyncio.wait_for(done.wait(), timeout=2.0)
+                await orig_sleep(0.01)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(events_calls, 2)
+            self.assertEqual(stream_cursors[0], "200")
+            self.assertEqual(b.store.get("cursor"), "201")
+        finally:
+            await b.close()
+            b.store.db.close()
+            tmp.cleanup()
+
 
 class ConfigTests(unittest.TestCase):
     def test_env_only_and_token_file(self):
@@ -2768,6 +2978,7 @@ class LoginDaemon:
         self.connected = False
         self.account_infos: list[dict] = []  # optional scripted responses for GET accounts/{ACC}
         self.login_errors: list[tuple[int, str]] = []  # optional scripted errors for POST auth/login
+        self.connect_errors: list[tuple[int, str]] = []  # optional scripted errors for POST connect
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/v1/")
@@ -2784,6 +2995,9 @@ class LoginDaemon:
             conn = "online" if self.connected else "disconnected"
             return httpx.Response(200, json={"id": ACC, "authenticated": self.authenticated, "connection": conn})
         if path == f"accounts/{ACC}/connect":
+            if self.connect_errors:
+                st, code = self.connect_errors.pop(0)
+                return httpx.Response(st, json={"error": {"code": code}})
             self.connected = True
             return httpx.Response(200, json={})
         if path == f"accounts/{ACC}/auth/login":
@@ -2980,8 +3194,10 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         alert = self.b.bot.sent[-1]
         self.assertIn("微信已退出登录", alert.text)
         login_btn = alert.kwargs["buttons"][0][0]
+        qr_btn = alert.kwargs["buttons"][0][1]
         self.assertIn("重新登录", login_btn.text)
         self.assertEqual(btn_data(login_btn), b"wxlogin:auto")
+        self.assertEqual(btn_data(qr_btn), b"wxlogin:qr")
 
         # Stranger clicking the login button is rejected
         unauth = _CallbackEvent(111, btn_data(login_btn))
@@ -3445,6 +3661,140 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.b._wx_auto_relogin_task)
         self.assertEqual(self.daemon.login_strategies, [])
         self.assertFalse(any("已退出登录" in (s.text or "") for s in self.b.bot.sent))
+
+    async def test_login_failure_shows_service_and_service_code_and_qr_hint(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "failed", "result": {"code": "login_failed", "service": "saved_device_login", "serviceCode": -100}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        def btn_data(btn):
+            return btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+
+        await self.b.request_wechat_login(force_qr=False)
+
+        msg = self.b.bot.sent[-1]
+        self.assertIn("微信登录未完成", msg.text)
+        self.assertIn("login_failed · saved_device_login · -100", msg.text)
+        self.assertIn("扫码登录", msg.text)
+        btns = [btn_data(btn) for btn in msg.kwargs["buttons"][0]]
+        self.assertEqual(btns, [b"wxlogin:auto", b"wxlogin:qr"])
+
+    async def test_auto_relogin_failure_includes_service_and_service_code(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.0
+        self.b.cfg.bridge.auto_relogin_cooldown_seconds = 0.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "failed", "result": {"code": "login_failed", "service": "saved_device_login", "serviceCode": -100}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        await self.b._on_wx_signed_out()
+        await self.b._wx_auto_relogin_task
+
+        last = self.b.bot.sent[-1]
+        self.assertIn("微信自动登录失败（login_failed · saved_device_login · -100）", last.text)
+        self.assertEqual(len(last.kwargs["buttons"][0]), 2)
+
+    async def test_manual_wxlogin_waits_out_409_and_recovers_when_authenticated(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.b.wx_startup_poll_interval = 0.01
+        self.b.wx_login_busy_timeout = 1.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.account_infos = [
+            {"authenticated": False, "connection": "reconnecting"},
+            {"authenticated": True, "connection": "online"},
+        ]
+        self.daemon.login_errors = [(409, "operation_in_progress"), (409, "operation_in_progress")]
+        await self.b.wx.resolve_account()
+
+        await self.b.request_wechat_login(force_qr=False)
+
+        self.assertEqual(self.b.wx_state, "online")
+        texts = [s.text for s in self.b.bot.sent if s.text]
+        self.assertTrue(any("稍候" in t for t in texts))
+        self.assertIn("恢复在线", texts[-1])
+        self.assertFalse(any("409" in t for t in texts))
+
+    async def test_manual_wxlogin_retries_after_409_clears_and_tolerates_connect_409(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.b.wx_startup_poll_interval = 0.01
+        self.b.wx_login_busy_timeout = 1.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.login_errors = [(409, "operation_in_progress")]
+        self.daemon.connect_errors = [(409, "operation_in_progress")]
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        await self.b.request_wechat_login(force_qr=False)
+
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        self.assertEqual(self.b.wx_state, "online")
+        texts = [s.text for s in self.b.bot.sent if s.text]
+        self.assertIn("微信已登录", texts[-1])
+        self.assertFalse(any("登录出错" in t for t in texts))
+
+    async def test_switch_to_qr_waits_out_transient_409_after_cancel(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.b.login_poll_interval = 0.02
+        self.b.wx_startup_poll_interval = 0.01
+        self.b.wx_login_busy_timeout = 1.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "awaiting_approval", "result": {}},
+            ],
+            "qr": [
+                {"state": "awaiting_scan", "result": {"qrGeneration": 1, "qrAvailable": True}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        task = asyncio.create_task(self.b.request_wechat_login(force_qr=False))
+        for _ in range(50):
+            if any("登录确认请求" in (s.text or "") for s in self.b.bot.sent):
+                break
+            await asyncio.sleep(0.01)
+        # Simulate daemon taking a moment to release the lock of the cancelled auto op
+        self.daemon.login_errors = [(409, "operation_in_progress")]
+        await self.b.on_bot_callback(_CallbackEvent(42, b"wxlogin:qr"))
+        await task
+
+        self.assertEqual(self.daemon.login_strategies, ["auto", "qr"])
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertIn("微信已登录", self.b.bot.sent[-1].text)
 
     async def test_telegram_code_login_keypad_one_tap_phone_and_2fa(self):
         from telethon import errors, types

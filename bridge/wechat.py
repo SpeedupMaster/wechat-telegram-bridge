@@ -582,7 +582,17 @@ class WeChatClient:
 
     # --- events -------------------------------------------------------------
     async def latest_cursor(self) -> str:
-        """Walk the event log to its end without handling anything (first start)."""
+        """Read the newest event cursor without replaying history (first start / cursor recovery).
+
+        agent-wechat >= 2.9.0 accepts `newest=true`, returning the tail in one request even after
+        cursor 0 has expired (> 10,000 events). Older daemons reject the unknown query field with
+        400, so fall back to walking from cursor 0 then."""
+        try:
+            page = await self._req("GET", self._a("events"), params={"newest": "true", "limit": 1})
+            return str(page.get("nextCursor") or "0")
+        except WeChatError as e:
+            if e.status not in (400, 422):
+                raise
         cursor = "0"
         while True:
             page = await self._req("GET", self._a("events"), params={"after": cursor, "limit": 200})
@@ -601,7 +611,11 @@ class WeChatClient:
                                     headers={"Accept": "text/event-stream"}, timeout=timeout) as r:
             if r.status_code >= 400:
                 await r.aread()
-                raise WeChatError(r.status_code, "stream_failed", True)
+                err = _response_error(r)
+                if err.code == "event_cursor_expired":
+                    raise CursorExpired()
+                code = err.code if err.code != "request_failed" else "stream_failed"
+                raise WeChatError(err.status, code, err.retryable or err.status >= 500)
             data: list[str] = []
             ev_type = ev_id = ""
             async for line in r.aiter_lines():
