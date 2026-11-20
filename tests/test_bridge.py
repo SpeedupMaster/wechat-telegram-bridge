@@ -2766,6 +2766,8 @@ class LoginDaemon:
         self.cancelled_ops: list[str] = []
         self.qr_fetches: list[str] = []
         self.connected = False
+        self.account_infos: list[dict] = []  # optional scripted responses for GET accounts/{ACC}
+        self.login_errors: list[tuple[int, str]] = []  # optional scripted errors for POST auth/login
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/v1/")
@@ -2776,6 +2778,9 @@ class LoginDaemon:
             self.accounts.append({"id": ACC, "alias": json.loads(request.content)["alias"]})
             return httpx.Response(201, json=self.accounts[-1])
         if path == f"accounts/{ACC}":
+            if self.account_infos:
+                info = self.account_infos.pop(0) if len(self.account_infos) > 1 else self.account_infos[0]
+                return httpx.Response(200, json={"id": ACC, **info})
             conn = "online" if self.connected else "disconnected"
             return httpx.Response(200, json={"id": ACC, "authenticated": self.authenticated, "connection": conn})
         if path == f"accounts/{ACC}/connect":
@@ -2783,6 +2788,9 @@ class LoginDaemon:
             return httpx.Response(200, json={})
         if path == f"accounts/{ACC}/auth/login":
             assert request.headers["idempotency-key"]
+            if self.login_errors:
+                st, code = self.login_errors.pop(0)
+                return httpx.Response(st, json={"error": {"code": code}})
             strategy = json.loads(request.content).get("strategy", "auto")
             self.login_strategies.append(strategy)
             if strategy in self.ops_by_strategy:
@@ -3324,6 +3332,119 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("device_auth_expired", last.text)
         self.assertIn("不再自动重试", last.text)
         self.assertIn("/wxlogin", last.text)
+
+    async def test_ensure_wechat_waits_quietly_on_409_operation_in_progress_until_authenticated(self):
+        self.b.owner_id = 42
+        self.b.wx_startup_poll_interval = 0.01
+        self.b.wx_startup_wait_timeout = 1.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.account_infos = [
+            {"authenticated": False, "connection": "disconnected"},
+            {"authenticated": True, "connection": "online"},
+        ]
+        self.daemon.login_errors = [(409, "operation_in_progress")]
+
+        await self.b.ensure_wechat()
+
+        self.assertTrue(self.b.wx_ready)
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertEqual(self.daemon.login_strategies, [])
+        self.assertEqual(self.b.bot.sent, [], "must not spam login errors while daemon is still restoring")
+
+    async def test_ensure_wechat_waits_quietly_while_account_is_reconnecting(self):
+        self.b.owner_id = 42
+        self.b.wx_startup_poll_interval = 0.01
+        self.b.wx_startup_wait_timeout = 1.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.account_infos = [
+            {"authenticated": False, "connection": "reconnecting"},
+            {"authenticated": False, "connection": "reconnecting"},
+            {"authenticated": True, "connection": "online"},
+        ]
+
+        await self.b.ensure_wechat()
+
+        self.assertTrue(self.b.wx_ready)
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertEqual(self.daemon.login_strategies, [])
+        self.assertEqual(self.b.bot.sent, [])
+
+    async def test_ensure_wechat_retries_login_after_409_clears_when_still_unauthenticated(self):
+        self.b.owner_id = 42
+        self.b.wx_startup_poll_interval = 0.01
+        self.b.wx_startup_wait_timeout = 1.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.login_errors = [(409, "operation_in_progress")]
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+
+        await self.b.ensure_wechat()
+
+        self.assertTrue(self.b.wx_ready)
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        texts = [s.text for s in self.b.bot.sent if s.text]
+        self.assertFalse(any("409" in t or "登录出错" in t for t in texts))
+        self.assertIn("微信已登录", texts[-1])
+
+    async def test_auto_relogin_waits_on_409_operation_in_progress_and_recovers(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.0
+        self.b.cfg.bridge.auto_relogin_timeout_seconds = 1.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.account_infos = [
+            {"authenticated": False, "connection": "disconnected"},  # pre-check
+            {"authenticated": False, "connection": "reconnecting"},  # settle poll 1
+            {"authenticated": True, "connection": "online"},         # settle poll 2
+        ]
+        self.daemon.login_errors = [(409, "operation_in_progress")]
+        await self.b.wx.resolve_account()
+
+        await self.b._on_wx_signed_out()
+        await self.b._wx_auto_relogin_task
+
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertIn("自动重新登录并恢复在线", self.b.bot.sent[-1].text)
+        self.assertFalse(any("409" in (s.text or "") for s in self.b.bot.sent))
+
+    async def test_monitor_ignores_transient_reconnecting_state_when_unauthenticated(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.account_infos = [
+            {"authenticated": False, "connection": "reconnecting"},
+            {"authenticated": True, "connection": "online"},
+        ]
+        await self.b.wx.resolve_account()
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        try:
+            for _ in range(50):
+                if self.b.wx_state == "online" and any("恢复在线" in (s.text or "") for s in self.b.bot.sent):
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            mon.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await mon
+
+        self.assertIsNone(self.b._wx_auto_relogin_task)
+        self.assertEqual(self.daemon.login_strategies, [])
+        self.assertFalse(any("已退出登录" in (s.text or "") for s in self.b.bot.sent))
 
     async def test_telegram_code_login_keypad_one_tap_phone_and_2fa(self):
         from telethon import errors, types

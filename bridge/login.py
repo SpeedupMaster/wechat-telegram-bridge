@@ -54,6 +54,16 @@ def _fmt_zh_seconds(seconds: float) -> str:
     return f"{h} 小时 {m} 分钟" if m else f"{h} 小时"
 
 
+def _is_op_in_progress(err: BaseException) -> bool:
+    return isinstance(err, WeChatError) and err.status == 409 and err.code == "operation_in_progress"
+
+
+def _is_wx_restoring(info: dict) -> bool:
+    conn = str(info.get("connection") or "").lower()
+    state = str(info.get("state") or "").lower()
+    return conn in ("connecting", "reconnecting") or state in ("starting", "connecting", "reconnecting")
+
+
 class LoginMixin:
     """Mixed into Bridge. Expects self.user, self.bot, self.wx, self.store, self.cfg."""
 
@@ -76,6 +86,9 @@ class LoginMixin:
         self.wx_state = "unknown"
         self.owner_id: int | None = None
         self.login_poll_interval = 2.0
+        self.wx_startup_poll_interval = 2.0
+        self.wx_startup_wait_timeout = 60.0
+        self.wx_idle_auth_check_interval = 15.0
         self._wx_login_phase = ""
         self._wx_force_qr_restart = False
         self._wx_force_qr_next = False
@@ -670,6 +683,32 @@ class LoginMixin:
         await event.answer("正在发起微信登录…")
         self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=False))
 
+    async def _finish_authenticated(self, info: dict) -> None:
+        if info.get("connection") == "disconnected":
+            try:
+                await self.wx.connect()
+            except WeChatError as e:
+                if not _is_op_in_progress(e):
+                    raise
+        self.wx_ready = True
+        self._mark_wx_online()
+
+    async def _wait_wx_busy(self, deadline: float) -> dict | None:
+        """Poll account_info() quietly while agent-wechat is restoring/reconnecting on startup."""
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                info = await self.wx.account_info()
+            except (httpx.HTTPError, WeChatError) as e:
+                log.debug("account_info during startup wait failed: %s", e)
+                info = None
+            if info is not None and (info.get("authenticated") or not _is_wx_restoring(info)):
+                return info
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return info
+            await asyncio.sleep(min(self.wx_startup_poll_interval, remaining))
+
     async def ensure_wechat(self) -> None:
         delay = 2.0
         while True:
@@ -685,31 +724,85 @@ class LoginMixin:
                 log.warning("agent-wechat not reachable yet (%s); retrying in %.0fs", e, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60)
+        loop = asyncio.get_running_loop()
+        busy_deadline: float | None = None
         while True:
+            force_qr = False
             try:
                 info = await self.wx.account_info()
+                if not info.get("authenticated") and _is_wx_restoring(info):
+                    if busy_deadline is None:
+                        busy_deadline = loop.time() + self.wx_startup_wait_timeout
+                        log.info("agent-wechat is restoring/connecting (%s); waiting quietly",
+                                 info.get("connection") or info.get("state"))
+                    waited = await self._wait_wx_busy(busy_deadline)
+                    if waited is not None:
+                        info = waited
                 if info.get("authenticated"):
-                    if info.get("connection") == "disconnected":
-                        await self.wx.connect()
-                    self.wx_ready = True
-                    self._mark_wx_online()
+                    await self._finish_authenticated(info)
                     return
-                await self.notify("🔐 微信尚未登录，正在发起登录（请在手机确认或扫码）…")
                 force_qr = self._wx_force_qr_next
                 self._wx_force_qr_next = False
-                if await self.wechat_login(force_qr=force_qr):
+                if await self.wechat_login(
+                    force_qr=force_qr,
+                    start_notice="🔐 微信尚未登录，正在发起登录（请在手机确认或扫码）…",
+                ):
                     self.wx_ready = True
                     self._mark_wx_online()
                     return
-            except (httpx.HTTPError, WeChatError) as e:
+                busy_deadline = None
+            except WeChatError as e:
+                if _is_op_in_progress(e):
+                    self._wx_force_qr_next = force_qr
+                    now = loop.time()
+                    if busy_deadline is None:
+                        busy_deadline = now + self.wx_startup_wait_timeout
+                        log.info("agent-wechat already has an operation in progress; waiting up to %.0fs to settle",
+                                 self.wx_startup_wait_timeout)
+                    remaining = busy_deadline - now
+                    if remaining > 0:
+                        await asyncio.sleep(min(self.wx_startup_poll_interval, remaining))
+                        continue
+                    busy_deadline = None
+                    log.warning("WeChat login step still blocked by operation_in_progress after %.0fs",
+                                self.wx_startup_wait_timeout)
+                    await self.notify(
+                        "⚠️ agent-wechat 当前一直有正在进行的登录/重连操作，暂时无法发起新登录。"
+                        "请稍等片刻后点击下方按钮重试，也可以发送 /wxlogin 重试。",
+                        buttons=self._wx_login_buttons())
+                else:
+                    busy_deadline = None
+                    log.warning("WeChat login step failed: %s", e)
+                    await self.notify(
+                        f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
+                        buttons=self._wx_login_buttons())
+            except httpx.HTTPError as e:
+                busy_deadline = None
                 log.warning("WeChat login step failed: %s", e)
                 await self.notify(
                     f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
                     buttons=self._wx_login_buttons())
             self.wx_login_requested.clear()
-            await self.wx_login_requested.wait()
+            while True:
+                if self.wx_idle_auth_check_interval > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self.wx_login_requested.wait(), timeout=self.wx_idle_auth_check_interval)
+                        break
+                    except asyncio.TimeoutError:
+                        try:
+                            info = await self.wx.account_info()
+                        except (httpx.HTTPError, WeChatError):
+                            continue
+                        if info.get("authenticated"):
+                            await self._finish_authenticated(info)
+                            await self.notify("✅ 微信已恢复在线。")
+                            return
+                else:
+                    await self.wx_login_requested.wait()
+                    break
 
-    async def wechat_login(self, force_qr: bool = False) -> bool:
+    async def wechat_login(self, force_qr: bool = False, *, start_notice: str = "") -> bool:
         if self.wx_login_lock.locked():
             await self.notify(self._wx_login_busy_hint())
             return False
@@ -717,10 +810,14 @@ class LoginMixin:
             current_force_qr = force_qr
             self._wx_force_qr_restart = False
             self._wx_login_interrupt.clear()
+            notice_sent = False
             while True:
                 loop = asyncio.get_running_loop()
                 self._wx_login_phase = "starting"
                 op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=current_force_qr)
+                if start_notice and not notice_sent and op.get("state") != "succeeded":
+                    notice_sent = True
+                    await self.notify(start_notice)
                 last_gen, qr_msg, approval_since, hinted = None, None, None, False
                 switched_to_qr = False
                 deadline = loop.time() + 660
@@ -845,6 +942,19 @@ class LoginMixin:
             if await self.wechat_login(force_qr=force_qr):
                 self._mark_wx_online()
         except (httpx.HTTPError, WeChatError) as e:
+            if _is_op_in_progress(e):
+                try:
+                    info = await self.wx.account_info()
+                except (httpx.HTTPError, WeChatError):
+                    info = {}
+                if info.get("authenticated"):
+                    await self._finish_authenticated(info)
+                    await self.notify("✅ 微信已恢复在线。")
+                    return
+                await self.notify(
+                    "⏳ agent-wechat 当前已有正在进行的登录/重连操作，请稍等几秒后再点击重试。",
+                    buttons=self._wx_login_buttons())
+                return
             await self.notify(
                 f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
                 buttons=self._wx_login_buttons())
@@ -927,6 +1037,11 @@ class LoginMixin:
                 self._mark_wx_online()
                 await self.notify("✅ 微信已恢复在线，无需自动重新登录。")
                 return
+            if _is_wx_restoring(info):
+                log.info("Skipping auto-relogin: agent-wechat is already reconnecting/restoring")
+                self.wx_state = "disconnected"
+                self._wx_auto_relogin_attempted = False
+                return
             if self.wx_login_lock.locked():
                 log.info("Skipping auto-relogin: a WeChat login started during pre-check")
                 return
@@ -956,6 +1071,46 @@ class LoginMixin:
             self._wx_auto_relogin_phase = ""
             self._wx_auto_relogin_due_at = None
 
+    async def _wait_silent_auth_settle(self, deadline: float) -> tuple[bool, str]:
+        """Wait for an already-running daemon operation (409 operation_in_progress) to authenticate."""
+        loop = asyncio.get_running_loop()
+        while True:
+            if self._wx_auto_relogin_cancel.is_set():
+                return False, "user_cancelled"
+            try:
+                info = await self.wx.account_info()
+            except (httpx.HTTPError, WeChatError):
+                info = None
+            if info and info.get("authenticated"):
+                connected = True
+                if info.get("connection") == "disconnected":
+                    try:
+                        await self.wx.connect()
+                    except (httpx.HTTPError, WeChatError) as e:
+                        if not _is_op_in_progress(e):
+                            log.warning("Post-settle connect check failed: %s", e)
+                            connected = False
+                if connected:
+                    self._mark_wx_online()
+                else:
+                    self.wx_state = "disconnected"
+                    self._wx_auto_relogin_attempted = False
+                return True, ""
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False, "守护进程当前有正在进行的登录/重连操作，请稍后手动重试"
+            if self.login_poll_interval > 0:
+                try:
+                    await asyncio.wait_for(
+                        self._wx_login_interrupt.wait(),
+                        timeout=min(self.login_poll_interval, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(0)
+            self._wx_login_interrupt.clear()
+
     async def _attempt_silent_wechat_login(self) -> tuple[bool, str]:
         """Single non-interactive login attempt using strategy='auto'.
 
@@ -969,7 +1124,13 @@ class LoginMixin:
         op: dict | None = None
         saw_approval = False
         try:
-            op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=False)
+            try:
+                op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=False)
+            except WeChatError as e:
+                if _is_op_in_progress(e):
+                    log.info("Auto-relogin saw operation_in_progress; waiting for in-flight auth to settle")
+                    return await self._wait_silent_auth_settle(deadline)
+                raise
             while True:
                 if self._wx_auto_relogin_cancel.is_set():
                     await self._cancel_wx_op_quietly(op)
@@ -1053,7 +1214,22 @@ class LoginMixin:
                 continue
             auth, conn = info.get("authenticated"), info.get("connection")
             if not auth:
+                if _is_wx_restoring(info):
+                    if self.wx_state == "online":
+                        self.wx_state = "disconnected"
+                        await self.notify("⚠️ 微信正在重连或恢复登录态，请稍候…")
+                    continue
                 if self.wx_state != "signed_out":
+                    # Guard against a brief unauthenticated window right after agent-wechat restarts.
+                    confirm_wait = min(5.0, interval / 2.0) if interval >= 1.0 else 0.0
+                    if confirm_wait > 0:
+                        await asyncio.sleep(confirm_wait)
+                        try:
+                            info2 = await self.wx.account_info()
+                        except (httpx.HTTPError, WeChatError):
+                            continue
+                        if info2.get("authenticated") or _is_wx_restoring(info2):
+                            continue
                     self.wx_state = "signed_out"
                     await self._on_wx_signed_out()
             elif conn == "disconnected":
