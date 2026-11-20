@@ -101,6 +101,8 @@ services:
       TG_PROXY: ${TG_PROXY:-}
       BRIDGE_MODE: ${BRIDGE_MODE:-}
       TG_FORUM_CHAT: ${TG_FORUM_CHAT:-}
+      BRIDGE_OFFICIAL_ACCOUNTS: ${BRIDGE_OFFICIAL_ACCOUNTS:-}
+      TG_OA_FORUM_CHAT: ${TG_OA_FORUM_CHAT:-}
       # optional: answer WeChat calls in a Telegram Mini App. The page listens on CALL_WEB_LISTEN
       # (loopback by default); put an HTTPS reverse proxy for CALL_WEB_URL in front of it (see README).
       CALL_WEB_URL: ${CALL_WEB_URL:-}

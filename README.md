@@ -228,6 +228,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `/unlink` | 通用 | 解除当前群或当前话题与微信会话的绑定 |
 | `/avatar` | 仅 `groups` | 重新拉取微信头像并同步为当前 Telegram 群头像 |
 | `/forum` | 仅 `topics` | 将当前开启了话题的超级群设为桥接主群 |
+| `/oaforum [off]` | 通用 | 将当前开启了话题的超级群设为**公众号/服务号专用话题群**（每个公众号一个独立话题；加 `off` 取消） |
 | `/help` | 通用 | 查看群内命令帮助 |
 
 > **话题模式补充说明**：在话题群的 `General` 主话题中发送的普通聊天消息不会转发到微信；若某个子话题被手动删除，当该微信会话收到下一条消息时会自动重建新话题。
@@ -320,6 +321,8 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `TG_PROXY` | 否 | 空 | 连接 Telegram 的代理地址，如 `socks5://127.0.0.1:7890`（海外 VPS 留空） |
 | `BRIDGE_MODE` | 否 | `groups` | 运行模式：`groups`（一会话一群）或 `topics`（单群多话题） |
 | `TG_FORUM_CHAT` | 否 | `0` | `topics` 模式下的话题群 ID（`-100...`），留空可在群内发 `/forum` 指定 |
+| `BRIDGE_OFFICIAL_ACCOUNTS` | 否 | `true` | 是否桥接微信公众号/服务号推送 |
+| `TG_OA_FORUM_CHAT` | 否 | `0` | 可选：将公众号/服务号单独收进指定话题群（`-100...`，每个公众号一个独立话题），留空也可在话题群里发 `/oaforum` 指定 |
 | `CALL_WEB_URL` | 否 | 空 | 微信语音接听页面的公网 HTTPS 地址，留空则关闭网页接听 |
 | `CALL_WEB_LISTEN` | 否 | `127.0.0.1:8780` | 语音接听页面在容器/宿主机本机监听的地址与端口 |
 | `CALL_WEB_APP` | 否 | 空 | `@BotFather` `/newapp` 注册的 Mini App 短名称 |
@@ -341,7 +344,8 @@ cp config.example.toml config/config.toml
 | `title_direct` | `"{name}"` | 微信私聊对应的群名/话题名模板（`{name}` 为微信备注或昵称） |
 | `title_group` | `"👥 {name}"` | 微信群聊对应的群名/话题名模板 |
 | `bridge_groups` | `true` | 是否桥接微信群聊消息 |
-| `bridge_official_accounts` | `false` | 是否桥接微信公众号/服务号推送 |
+| `bridge_official_accounts` | `true` | 是否桥接微信公众号/服务号推送（环境变量 `BRIDGE_OFFICIAL_ACCOUNTS`） |
+| `official_accounts_forum_chat` | `0` | 可选：公众号/服务号专用话题群 ID（环境变量 `TG_OA_FORUM_CHAT`），设置后在 `groups` 模式下也可把每个公众号单独收进该话题群的独立话题（也可在群内发 `/oaforum` 绑定） |
 | `forward_outgoing` | `true` | 是否将你在手机/电脑微信上发出的消息同步到 Telegram |
 | `outgoing_silent` | `true` | 同步手机端自发消息时是否静音发送（不触发 Telegram 通知） |
 | `sync_avatar` | `true` | 自动建群时是否将微信头像设为 Telegram 群头像（仅 `groups` 模式有效） |

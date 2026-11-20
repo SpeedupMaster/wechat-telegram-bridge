@@ -45,7 +45,10 @@ class BridgeConfig:
     title_direct: str = "{name}"
     title_group: str = "👥 {name}"
     bridge_groups: bool = True
-    bridge_official_accounts: bool = False
+    bridge_official_accounts: bool = True
+    # Optional forum supergroup id (-100...) to route official/service accounts as individual topics
+    # (0 = disabled, or set dynamically by sending /oaforum in a forum supergroup).
+    official_accounts_forum_chat: int = 0
     forward_outgoing: bool = True
     outgoing_silent: bool = True
     sync_avatar: bool = True
@@ -76,6 +79,15 @@ class BridgeConfig:
             raise ValueError(f"[bridge] mode must be \"groups\" or \"topics\", not {self.mode!r}")
         self.mode = mode
         self.forum_chat = int(self.forum_chat or 0)
+        if not isinstance(self.bridge_official_accounts, bool):
+            raise ValueError(
+                f"[bridge] bridge_official_accounts must be true or false, not {self.bridge_official_accounts!r}"
+            )
+        if isinstance(self.official_accounts_forum_chat, bool):
+            raise ValueError(
+                f"[bridge] official_accounts_forum_chat must be a number, not {self.official_accounts_forum_chat!r}"
+            )
+        self.official_accounts_forum_chat = int(self.official_accounts_forum_chat or 0)
         self.call_web_url = str(self.call_web_url or "").strip().rstrip("/")
         if self.call_web_url and not self.call_web_url.lower().startswith(("https://", "http://")):
             raise ValueError(f"[bridge] call_web_url must start with https://, not {self.call_web_url!r}")
@@ -145,13 +157,15 @@ ENV = {
     "BRIDGE_DATA_DIR": ("bridge", "data_dir"),
     "BRIDGE_MODE": ("bridge", "mode"),
     "TG_FORUM_CHAT": ("bridge", "forum_chat"),
+    "BRIDGE_OFFICIAL_ACCOUNTS": ("bridge", "bridge_official_accounts"),
+    "TG_OA_FORUM_CHAT": ("bridge", "official_accounts_forum_chat"),
     "CALL_WEB_URL": ("bridge", "call_web_url"),
     "CALL_WEB_LISTEN": ("bridge", "call_web_listen"),
     "CALL_WEB_APP": ("bridge", "call_web_app"),
     "AUTO_RELOGIN": ("bridge", "auto_relogin"),
 }
-INT_KEYS = {"api_id", "forum_chat"}
-BOOL_KEYS = {"auto_relogin"}
+INT_KEYS = {"api_id", "forum_chat", "official_accounts_forum_chat"}
+BOOL_KEYS = {"auto_relogin", "bridge_official_accounts"}
 
 
 def _parse_bool(var: str, value: str) -> bool:

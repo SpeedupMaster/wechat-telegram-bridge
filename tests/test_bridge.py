@@ -527,6 +527,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.b.bot.sent[-1].text, "<b>Alice in group</b>：\nhey")
 
     async def test_non_live_and_official_accounts_skipped(self):
+        self.b.cfg.bridge.bridge_official_accounts = False
         self.daemon.add_thread("gh_news", "News")
         self.daemon.threads["gh_news"]["classification"] = {"category": "business"}
         self.daemon.add_message("o1", "gh_news")
@@ -2475,8 +2476,190 @@ class TopicModeTests(unittest.IsolatedAsyncioTestCase):
         menus = dict(self.b.bot.commands)
         group = [c for c, _ in menus[types.BotCommandScopeChats]]
         self.assertIn("forum", group)
+        self.assertIn("oaforum", group)
         self.assertNotIn("avatar", group)
         self.assertNotIn("link", [c for c, _ in menus[types.BotCommandScopeUsers]])
+
+
+OA_FORUM = -1009000000002
+
+
+class OfficialAccountTopicsTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.daemon = FakeDaemon()
+        self.b = await self.make_bridge(bridge_official_accounts=True, official_accounts_forum_chat=OA_FORUM)
+
+    async def make_bridge(self, *, mode: str = "groups", **bridge_kw):
+        cfg = Config(WeChatConfig(token="secret-token"), TelegramConfig(api_id=1, api_hash="x", bot_token="y"),
+                     BridgeConfig(mode=mode, create_interval_seconds=0, sync_avatar=True, **bridge_kw),
+                     Path(self.tmp.name) / "config.toml")
+        b = Bridge(cfg)
+        await b.wx.http.aclose()
+        b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(self.daemon.handler),
+                                      headers={"Authorization": "Bearer secret-token"})
+        b.user = None if mode == "topics" else FakeUser()
+        b.bot = FakeForumBot()
+        b.bot_me = SimpleNamespace(username="mybot", id=1)
+        b.bot_input = "bot_in"
+        b.owner_id = OWNER
+        b.wx_ready = True
+        await b.wx.resolve_account()
+        return b
+
+    async def asyncTearDown(self):
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+
+    async def event(self, mid, tid, direction="incoming"):
+        await self.b.handle_event({"cursor": "1", "kind": "message.committed",
+                                   "data": {"messageId": mid, "threadId": tid, "origin": "live",
+                                            "direction": direction}})
+
+    async def test_groups_mode_routes_official_accounts_to_dedicated_forum_topics(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_thread("gh_news", "Daily News")
+        self.daemon.threads["gh_news"]["classification"] = {"category": "business"}
+        self.daemon.add_thread("newsapp", "Tencent News")
+        self.daemon.threads["newsapp"]["classification"] = {"category": "business"}
+        self.daemon.add_message("m1", "wxid_bob", "hi bob")
+        self.daemon.add_message("o1", "gh_news", "morning brief")
+        self.daemon.add_message("o2", "newsapp", "breaking")
+
+        await self.event("m1", "wxid_bob")
+        await self.event("o1", "gh_news")
+        await self.event("o2", "newsapp")
+
+        # Friend gets a standalone Telegram group; official accounts get individual topics in OA_FORUM.
+        self.assertEqual(self.b.user.created, ["Bob"])
+        bob_chat = self.b.store.chat_for_thread("wxid_bob")
+        self.assertIsNotNone(bob_chat)
+        self.assertIsNone(self.b.store.chat_for_thread("gh_news"))
+        self.assertIsNone(self.b.store.chat_for_thread("newsapp"))
+
+        news_dest = self.b.store.topic_for_thread("gh_news")
+        app_dest = self.b.store.topic_for_thread("newsapp")
+        self.assertIsNotNone(news_dest)
+        self.assertIsNotNone(app_dest)
+        self.assertEqual(news_dest[0], OA_FORUM)
+        self.assertEqual(app_dest[0], OA_FORUM)
+        self.assertNotEqual(news_dest[1], app_dest[1])
+        self.assertEqual(
+            self.b.bot.topics,
+            {news_dest[1]: ("Daily News", 0xFFD67E), app_dest[1]: ("Tencent News", 0xFFD67E)},
+        )
+        # Never try to sync avatar onto the forum supergroup.
+        self.assertNotIn("gh_news", self.daemon.avatar_refreshed)
+        self.assertNotIn("newsapp", self.daemon.avatar_refreshed)
+
+        oa_msgs = [(s.text, s.kwargs.get("reply_to")) for s in self.b.bot.sent if s.chat == OA_FORUM]
+        self.assertIn(("morning brief", news_dest[1]), oa_msgs)
+        self.assertIn(("breaking", app_dest[1]), oa_msgs)
+        self.assertTrue(any("已连接微信公众号/服务号" in t and rt == news_dest[1] for t, rt in oa_msgs))
+
+        # Both standalone groups and OA topics appear in _link_rows() and /status.
+        rows = dict((wx, where) for wx, _, where in self.b._link_rows())
+        self.assertEqual(rows["wxid_bob"], str(bob_chat))
+        self.assertEqual(rows["gh_news"], f"{OA_FORUM}#{news_dest[1]}")
+        self.assertEqual(rows["newsapp"], f"{OA_FORUM}#{app_dest[1]}")
+        replies = []
+        async def reply(t, **kw):
+            replies.append(t)
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/status", reply=reply))
+        self.assertIn(f"公众号话题群：<code>{OA_FORUM}</code>", replies[-1])
+
+    async def test_oa_topic_reply_commands_rename_delete_and_no_double_link(self):
+        self.daemon.add_thread("gh_news", "Daily News")
+        self.daemon.threads["gh_news"]["classification"] = {"category": "business"}
+        self.daemon.add_message("o1", "gh_news", "push 1", server="501")
+        await self.event("o1", "gh_news")
+        topic = self.b.store.topic_for_thread("gh_news")[1]
+        bridged = self.b.bot.sent[-1].id
+
+        # Sending a message / reply in the OA topic goes to WeChat.
+        await self.b.on_forum_message(forum_event(OA_FORUM, 9500, "关键词", topic=topic))
+        self.assertEqual(self.daemon.sends[-1][0]["threadId"], "gh_news")
+        self.assertEqual(self.daemon.sends[-1][0]["text"], "关键词")
+        await self.b.on_forum_message(forum_event(OA_FORUM, 9501, "回复", topic=topic, reply_to=bridged))
+        self.assertEqual(self.daemon.sends[-1][0]["quote"], {"messageId": "o1", "serverId": "501"})
+
+        # /avatar is refused for topics; /rename edits the topic (never the forum group).
+        await self.b.on_forum_message(forum_event(OA_FORUM, 9502, "/avatar", topic=topic))
+        self.assertIn("话题不支持设置头像", self.b.bot.sent[-1].text)
+        self.daemon.threads["gh_news"]["displayName"] = "Daily News Pro"
+        await self.b.on_forum_message(forum_event(OA_FORUM, 9503, "/rename", topic=topic))
+        self.assertEqual(self.b.bot.topic_edits, [(topic, "Daily News Pro")])
+        self.assertIn("已更新话题标题", self.b.bot.sent[-1].text)
+
+        # User-side unlinked command handler must ignore OA_FORUM so /link is not handled twice.
+        before = len(self.b.bot.sent)
+        await self.b.on_tg_unlinked_command(forum_event(OA_FORUM, 9504, "/link gh_news", topic=topic))
+        self.assertEqual(len(self.b.bot.sent), before)
+
+        # Deleted OA topic is recreated on the next push.
+        self.b.bot.deleted_topics.add(topic)
+        self.daemon.add_message("o2", "gh_news", "push 2")
+        await self.event("o2", "gh_news")
+        new_topic = self.b.store.topic_for_thread("gh_news")[1]
+        self.assertNotEqual(new_topic, topic)
+        self.assertEqual((self.b.bot.sent[-1].text, self.b.bot.sent[-1].kwargs["reply_to"]), ("push 2", new_topic))
+
+        # /unlink removes topic binding; /link inside a topic rebinds it into topics table.
+        await self.b.on_forum_message(forum_event(OA_FORUM, 9505, "/unlink", topic=new_topic))
+        self.assertIsNone(self.b.store.topic_for_thread("gh_news"))
+        await self.b.on_forum_message(forum_event(OA_FORUM, 9506, "/link gh_news", topic=777))
+        self.assertEqual(self.b.store.topic_for_thread("gh_news"), (OA_FORUM, 777))
+        self.assertIsNone(self.b.store.chat_for_thread("gh_news"))
+
+    async def test_oaforum_command_and_open_noun_and_separate_forum_in_topics_mode(self):
+        # Fixed by TG_OA_FORUM_CHAT -> cannot change via /oaforum.
+        await self.b.on_forum_message(forum_event(-1009000000003, 9600, "/oaforum"))
+        self.assertIn("TG_OA_FORUM_CHAT", self.b.bot.sent[-1].text)
+
+        # Unpin config -> non-forum rejected, forum accepted, warning shown if bridge_official_accounts=False.
+        self.b.cfg.bridge.official_accounts_forum_chat = 0
+        self.b.cfg.bridge.bridge_official_accounts = False
+        await self.b.on_forum_message(forum_event(-1009000000003, 9601, "/oaforum", is_forum=False))
+        self.assertIn("还没有开启「话题」", self.b.bot.sent[-1].text)
+        await self.b.on_forum_message(forum_event(-1009000000003, 9602, "/oaforum"))
+        self.assertEqual((self.b.oa_forum_chat, self.b.store.get("oa_forum_chat")),
+                         (-1009000000003, "-1009000000003"))
+        self.assertIn("BRIDGE_OFFICIAL_ACCOUNTS=true", self.b.bot.sent[-1].text)
+
+        # /open reports "话题" for OA and "群" for a normal friend.
+        self.daemon.add_thread("gh_news", "Daily News")
+        self.daemon.threads["gh_news"]["classification"] = {"category": "business"}
+        self.daemon.add_thread("wxid_bob", "Bob")
+        replies = []
+        async def reply(t, **kw):
+            replies.append(t)
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/open gh_news", reply=reply))
+        self.assertIn("已建话题", replies[-1])
+        self.assertEqual(self.b.store.topic_for_thread("gh_news")[0], -1009000000003)
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/open wxid_bob", reply=reply))
+        self.assertIn("已建群", replies[-1])
+        self.assertIsNotNone(self.b.store.chat_for_thread("wxid_bob"))
+
+        # /oaforum off clears the binding.
+        await self.b.on_forum_message(forum_event(-1009000000003, 9603, "/oaforum off"))
+        self.assertIsNone(self.b.oa_forum_chat)
+        self.assertEqual(self.b.store.get("oa_forum_chat"), "")
+
+        # Topics mode with a separate OA forum splits normal chats and OAs into two forums.
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.b = await self.make_bridge(
+            mode="topics", forum_chat=FORUM, bridge_official_accounts=True, official_accounts_forum_chat=OA_FORUM,
+        )
+        self.daemon.add_message("m1", "wxid_bob", "hi")
+        self.daemon.add_message("o1", "gh_news", "article")
+        await self.event("m1", "wxid_bob")
+        await self.event("o1", "gh_news")
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob")[0], FORUM)
+        self.assertEqual(self.b.store.topic_for_thread("gh_news")[0], OA_FORUM)
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
@@ -2554,6 +2737,17 @@ class ConfigTests(unittest.TestCase):
                 BridgeConfig(auto_relogin_cooldown_seconds=-1)
             with self.assertRaisesRegex(ValueError, "auto_relogin must be true or false"):
                 BridgeConfig(auto_relogin="false")  # type: ignore[arg-type]
+            self.assertTrue(cfg.bridge.bridge_official_accounts)
+            cfg = load_config(
+                Path(tmp) / "missing.toml",
+                {**env, "BRIDGE_OFFICIAL_ACCOUNTS": "false", "TG_OA_FORUM_CHAT": "-1008888"},
+            )
+            self.assertEqual((cfg.bridge.bridge_official_accounts, cfg.bridge.official_accounts_forum_chat),
+                             (False, -1008888))
+            with self.assertRaisesRegex(ValueError, "TG_OA_FORUM_CHAT"):
+                load_config(Path(tmp) / "missing.toml", {**env, "TG_OA_FORUM_CHAT": "not-a-number"})
+            with self.assertRaisesRegex(ValueError, "BRIDGE_OFFICIAL_ACCOUNTS"):
+                load_config(Path(tmp) / "missing.toml", {**env, "BRIDGE_OFFICIAL_ACCOUNTS": "nope"})
 
 
 class LoginDaemon:

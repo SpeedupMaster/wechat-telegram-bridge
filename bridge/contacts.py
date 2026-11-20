@@ -143,7 +143,7 @@ class ContactsMixin:
         if status and status != "unchanged":
             log.info("Could not follow the WeChat name of %s: %s", wx_id, status)
             return False
-        log.info("Renamed the Telegram %s of %s to %r", "topic" if self.topics else "group", wx_id, title)
+        log.info("Renamed the Telegram %s of %s to %r", "topic" if dest[1] is not None else "group", wx_id, title)
         return status == ""
 
     async def _outdated_title(self, wx_id: str) -> str | None:

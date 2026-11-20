@@ -2,7 +2,8 @@
 #   Docker：复制到 config/config.toml，然后 docker compose restart telegram-bridge
 #   本地运行：复制到项目根目录的 config.toml
 # 环境变量（.env）会覆盖这里的同名设置：TG_API_ID、TG_API_HASH、TG_BOT_TOKEN、TG_PROXY、
-# WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR、BRIDGE_MODE、TG_FORUM_CHAT、AUTO_RELOGIN
+# WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR、BRIDGE_MODE、TG_FORUM_CHAT、
+# BRIDGE_OFFICIAL_ACCOUNTS、TG_OA_FORUM_CHAT、AUTO_RELOGIN
 
 [wechat]
 # agent-wechat 守护进程（wx serve）的地址。用本项目的 compose.yaml 部署时不用填
@@ -36,8 +37,12 @@ title_direct = "{name}"
 title_group = "👥 {name}"
 # 是否桥接微信群聊
 bridge_groups = true
-# 是否桥接公众号/服务号消息
-bridge_official_accounts = false
+# 是否桥接公众号/服务号消息（环境变量 BRIDGE_OFFICIAL_ACCOUNTS）
+bridge_official_accounts = true
+# 可选：将公众号/服务号单独收进一个开启了「话题」的超级群（环境变量 TG_OA_FORUM_CHAT，-100 开头）
+# 每个公众号/服务号自动生成一个独立话题（机器人需为群管理员且有「管理话题」权限）；
+# 设为 0 表示未固定，也可直接在该话题群里发 /oaforum 绑定（发 /oaforum off 取消）
+# official_accounts_forum_chat = 0
 # 在手机微信上发出的消息，是否也同步到 Telegram 群（显示为“我（手机端）”）
 forward_outgoing = true
 # 上面这类同步消息静音发送，不触发通知
