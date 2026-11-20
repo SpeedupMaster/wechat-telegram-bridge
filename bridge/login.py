@@ -5,6 +5,7 @@ import asyncio
 import html
 import io
 import logging
+import random
 import re
 import secrets
 import time
@@ -41,6 +42,18 @@ def _describe_code_delivery(sent) -> str:
     }.get(kind, "你的 Telegram（或手机短信）")
 
 
+def _fmt_zh_seconds(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        m, rem = divmod(s, 60)
+        return f"{m} 分 {rem} 秒" if rem else f"{m} 分钟"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h} 小时 {m} 分钟" if m else f"{h} 小时"
+
+
 class LoginMixin:
     """Mixed into Bridge. Expects self.user, self.bot, self.wx, self.store, self.cfg."""
 
@@ -68,6 +81,11 @@ class LoginMixin:
         self._wx_force_qr_next = False
         self._wx_login_interrupt = asyncio.Event()
         self._wx_login_task: asyncio.Task | None = None
+        self._wx_auto_relogin_task: asyncio.Task | None = None
+        self._wx_auto_relogin_cancel = asyncio.Event()
+        self._wx_auto_relogin_phase = ""  # "" / "waiting" / "running"
+        self._wx_auto_relogin_attempted = False
+        self._wx_auto_relogin_due_at: float | None = None
 
     # ======================================================================
     # Telegram account login, driven from the bot's private chat
@@ -505,11 +523,91 @@ class LoginMixin:
             return None
 
     def _wx_login_busy_hint(self) -> str:
+        if self._wx_login_phase == "auto_relogin":
+            return "⏳ 正在自动尝试重新登录微信，请稍候…"
         if self._wx_login_phase == "awaiting_scan":
             return "⏳ 正在等待扫码，请扫描上方发送的二维码。"
         if self._wx_login_phase == "awaiting_approval":
             return "⏳ 正在等待手机微信确认，请在手机上点「登录」。"
         return "⏳ 正在发起微信登录，请稍候…"
+
+    def _wx_state_text(self) -> str:
+        if self.wx_state == "signed_out":
+            if self._wx_auto_relogin_phase == "waiting":
+                if self._wx_auto_relogin_due_at is not None:
+                    rem = max(0.0, self._wx_auto_relogin_due_at - time.monotonic())
+                    if rem >= 1:
+                        return f"已退出登录（约 {_fmt_zh_seconds(rem)}后自动尝试登录）"
+                return "已退出登录（即将自动尝试登录）"
+            if self._wx_auto_relogin_phase == "running":
+                return "已退出登录（正在自动尝试登录…）"
+        return {
+            "online": "在线",
+            "disconnected": "连接断开，重连中",
+            "signed_out": "已退出登录（发 /wxlogin）",
+            "unknown": "未登录（发 /wxlogin）",
+        }.get(self.wx_state, self.wx_state)
+
+    def _wx_auto_relogin_status_line(self) -> str:
+        if not self.cfg.bridge.auto_relogin:
+            return ""
+        cd = self._auto_relogin_cooldown_remaining()
+        if cd >= 1:
+            return f"\n掉线自动登录：已开启（冷却剩余约 {_fmt_zh_seconds(cd)}）"
+        return "\n掉线自动登录：已开启"
+
+    def _mark_wx_online(self) -> None:
+        self.wx_state = "online"
+        self._wx_auto_relogin_attempted = False
+
+    def _last_auto_relogin_at(self) -> float:
+        store = getattr(self, "store", None)
+        raw = store.get("auto_relogin_last_at") if store is not None else None
+        if not raw:
+            return 0.0
+        try:
+            return float(raw)
+        except ValueError:
+            return 0.0
+
+    def _record_auto_relogin_attempt(self) -> None:
+        store = getattr(self, "store", None)
+        if store is not None:
+            store.set("auto_relogin_last_at", str(time.time()))
+
+    def _auto_relogin_cooldown_remaining(self) -> float:
+        cooldown = self.cfg.bridge.auto_relogin_cooldown_seconds
+        if cooldown <= 0:
+            return 0.0
+        last_at = self._last_auto_relogin_at()
+        if last_at <= 0:
+            return 0.0
+        elapsed = time.time() - last_at
+        if elapsed < 0 or elapsed >= cooldown:
+            return 0.0
+        return cooldown - elapsed
+
+    def _pick_auto_relogin_delay(self) -> float:
+        b = self.cfg.bridge
+        if b.auto_relogin_delay_max <= b.auto_relogin_delay_min:
+            return b.auto_relogin_delay_min
+        return random.uniform(b.auto_relogin_delay_min, b.auto_relogin_delay_max)
+
+    def _cancel_auto_relogin(self) -> None:
+        self._wx_auto_relogin_cancel.set()
+        self._wx_login_interrupt.set()
+        self._wx_auto_relogin_due_at = None
+
+    async def _cancel_wx_op_quietly(self, op: dict | None) -> None:
+        if not isinstance(op, dict):
+            return
+        op_id = op.get("id")
+        if not op_id or op.get("state") in LOGIN_DONE_STATES:
+            return
+        try:
+            await self.wx.cancel_operation(op_id)
+        except (httpx.HTTPError, WeChatError):
+            pass
 
     @staticmethod
     def _wx_login_buttons(*, include_qr: bool = False) -> list[list]:
@@ -518,11 +616,41 @@ class LoginMixin:
             row.append(Button.inline("📷 扫码登录", b"wxlogin:qr"))
         return [row]
 
+    @staticmethod
+    def _wx_auto_relogin_buttons() -> list[list]:
+        return [[
+            Button.inline("🔑 立即手动登录", b"wxlogin:auto"),
+            Button.inline("⏹ 取消自动登录", b"wxlogin:cancel_auto"),
+        ]]
+
     async def _on_wx_login_callback(self, event, mode: str) -> None:
         if event.sender_id != self.owner_id:
             await event.answer("只有桥接账号本人可以操作", alert=True)
             return
+        if mode == "cancel_auto":
+            if self._wx_auto_relogin_phase in ("waiting", "running"):
+                self._cancel_auto_relogin()
+                await event.answer("已取消本次自动登录")
+                msg = "⏹ 已取消本次自动登录。需要时可点击下方按钮或发送 /wxlogin 手动登录。"
+                btns = self._wx_login_buttons(include_qr=True)
+                if hasattr(event, "edit"):
+                    try:
+                        await event.edit(msg, buttons=btns)
+                        return
+                    except Exception:
+                        pass
+                await self.notify(msg, buttons=btns)
+                return
+            await event.answer("当前没有进行中的自动登录")
+            return
         if mode == "qr":
+            if self._wx_auto_relogin_phase == "waiting":
+                self._cancel_auto_relogin()
+            elif self._wx_auto_relogin_phase == "running":
+                self._cancel_auto_relogin()
+                await event.answer("正在取消自动登录并切换为扫码登录…")
+                self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=True))
+                return
             if self.wx_login_lock.locked():
                 if self._wx_login_phase == "awaiting_scan":
                     await event.answer("已在扫码登录中，请扫描上方二维码")
@@ -534,6 +662,8 @@ class LoginMixin:
             await event.answer("正在获取登录二维码…")
             self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=True))
             return
+        if self._wx_auto_relogin_phase == "waiting":
+            self._cancel_auto_relogin()
         if self.wx_login_lock.locked():
             await event.answer(self._wx_login_busy_hint())
             return
@@ -561,13 +691,15 @@ class LoginMixin:
                 if info.get("authenticated"):
                     if info.get("connection") == "disconnected":
                         await self.wx.connect()
-                    self.wx_ready, self.wx_state = True, "online"
+                    self.wx_ready = True
+                    self._mark_wx_online()
                     return
                 await self.notify("🔐 微信尚未登录，正在发起登录（请在手机确认或扫码）…")
                 force_qr = self._wx_force_qr_next
                 self._wx_force_qr_next = False
                 if await self.wechat_login(force_qr=force_qr):
-                    self.wx_ready, self.wx_state = True, "online"
+                    self.wx_ready = True
+                    self._mark_wx_online()
                     return
             except (httpx.HTTPError, WeChatError) as e:
                 log.warning("WeChat login step failed: %s", e)
@@ -599,6 +731,7 @@ class LoginMixin:
                             info = await self.wx.account_info()
                             if info.get("connection") == "disconnected":
                                 await self.wx.connect()
+                            self._mark_wx_online()
                             await self.notify("✅ 微信已登录！之后收到的消息会自动建群并转发到这里。")
                             return True
                         if state in LOGIN_DONE_STATES:
@@ -662,10 +795,7 @@ class LoginMixin:
                         self._wx_login_interrupt.clear()
                         if self._wx_force_qr_restart:
                             self._wx_force_qr_restart = False
-                            try:
-                                await self.wx.cancel_operation(op["id"])
-                            except WeChatError:
-                                pass
+                            await self._cancel_wx_op_quietly(op)
                             await self.notify("🔄 正在切换为扫码登录…")
                             current_force_qr = True
                             switched_to_qr = True
@@ -676,10 +806,7 @@ class LoginMixin:
                     await self.notify(
                         "⏱ 微信登录超时，手机上一直没有确认。点击下方按钮重新登录或改用扫码登录，也可以发送 /wxlogin 重试。",
                         buttons=self._wx_login_buttons(include_qr=True))
-                    try:
-                        await self.wx.cancel_operation(op["id"])
-                    except WeChatError:
-                        pass
+                    await self._cancel_wx_op_quietly(op)
                     return False
                 finally:
                     self._wx_login_phase = ""
@@ -694,6 +821,14 @@ class LoginMixin:
 
     async def request_wechat_login(self, force_qr: bool = False) -> None:
         """/wxlogin or login button: retry initial login or re-authenticate after WeChat signs out."""
+        if self._wx_auto_relogin_phase == "waiting":
+            self._cancel_auto_relogin()
+        elif self._wx_auto_relogin_phase == "running" and force_qr:
+            self._cancel_auto_relogin()
+        if force_qr and self._wx_auto_relogin_cancel.is_set():
+            task = self._wx_auto_relogin_task
+            if task and not task.done():
+                await asyncio.gather(task, return_exceptions=True)
         if self.wx_login_lock.locked():
             if force_qr and self._wx_login_phase != "awaiting_scan":
                 self._wx_force_qr_restart = True
@@ -708,11 +843,200 @@ class LoginMixin:
             return
         try:
             if await self.wechat_login(force_qr=force_qr):
-                self.wx_state = "online"
+                self._mark_wx_online()
         except (httpx.HTTPError, WeChatError) as e:
             await self.notify(
                 f"⚠️ 微信登录出错：{e}。点击下方按钮重新登录，也可以发送 /wxlogin 重试（/wxlogin qr 改用扫码）。",
                 buttons=self._wx_login_buttons())
+
+    async def _on_wx_signed_out(self) -> None:
+        """Handle transition into signed_out: optionally schedule a single delayed auto-relogin."""
+        if self.wx_login_lock.locked():
+            return
+        if not self.cfg.bridge.auto_relogin:
+            await self.notify(
+                "⚠️ 微信已退出登录（可能在手机上移除了这台设备），点击下方按钮或发送 /wxlogin 重新登录。",
+                buttons=self._wx_login_buttons())
+            return
+        if self._wx_auto_relogin_attempted:
+            await self.notify(
+                "⚠️ 微信已退出登录。本次掉线已尝试过自动登录，请点击下方按钮或发送 /wxlogin 手动登录。",
+                buttons=self._wx_login_buttons(include_qr=True))
+            return
+        rem = self._auto_relogin_cooldown_remaining()
+        if rem > 0:
+            self._wx_auto_relogin_attempted = True
+            cooldown = self.cfg.bridge.auto_relogin_cooldown_seconds
+            log.info("Skipping auto-relogin due to cooldown (%.0fs remaining)", rem)
+            await self.notify(
+                f"⚠️ 微信已退出登录。距离上次自动登录不足 {_fmt_zh_seconds(cooldown)}"
+                f"（冷却剩余约 {_fmt_zh_seconds(rem)}），为避免触发风控，本次不会自动登录。"
+                "请点击下方按钮或发送 /wxlogin 手动登录。",
+                buttons=self._wx_login_buttons(include_qr=True))
+            return
+        self._wx_auto_relogin_attempted = True
+        delay = self._pick_auto_relogin_delay()
+        self._wx_auto_relogin_cancel.clear()
+        self._wx_auto_relogin_phase = "waiting"
+        self._wx_auto_relogin_due_at = time.monotonic() + delay
+        when = f"约 {_fmt_zh_seconds(delay)}后" if delay >= 1 else "稍后"
+        log.info("WeChat signed out; scheduling one-shot auto-relogin in %.1fs", delay)
+        await self.notify(
+            f"⚠️ 微信已退出登录，将在{when}自动尝试重新登录一次"
+            "（需手机微信已开启「自动登录该设备」；失败则不再自动重试）。\n"
+            "你也可以点击下方按钮立即手动登录，或取消本次自动登录。",
+            buttons=self._wx_auto_relogin_buttons())
+        if self._wx_auto_relogin_cancel.is_set():
+            self._wx_auto_relogin_phase = ""
+            self._wx_auto_relogin_due_at = None
+            return
+        self._wx_auto_relogin_task = asyncio.create_task(self._run_auto_relogin(delay))
+
+    async def _run_auto_relogin(self, delay: float) -> None:
+        """Wait a human-like randomized delay, re-verify signed-out state, then try auto-login once."""
+        try:
+            if delay > 0:
+                try:
+                    await asyncio.wait_for(self._wx_auto_relogin_cancel.wait(), timeout=delay)
+                    log.info("Auto-relogin cancelled before starting")
+                    return
+                except asyncio.TimeoutError:
+                    pass
+            if self._wx_auto_relogin_cancel.is_set() or self.wx_state == "online":
+                return
+            if self.wx_login_lock.locked():
+                log.info("Skipping auto-relogin: a WeChat login is already in progress")
+                return
+            try:
+                info = await self.wx.account_info()
+            except (httpx.HTTPError, WeChatError) as e:
+                log.warning("Auto-relogin pre-check failed: %s", e)
+                await self.notify(
+                    f"⚠️ 微信自动登录失败（无法检查账号状态：{e}），不再自动重试。"
+                    "请点击下方按钮或发送 /wxlogin 手动登录。",
+                    buttons=self._wx_login_buttons(include_qr=True))
+                return
+            if self._wx_auto_relogin_cancel.is_set():
+                return
+            if info.get("authenticated"):
+                if info.get("connection") == "disconnected":
+                    try:
+                        await self.wx.connect()
+                    except (httpx.HTTPError, WeChatError):
+                        pass
+                self._mark_wx_online()
+                await self.notify("✅ 微信已恢复在线，无需自动重新登录。")
+                return
+            if self.wx_login_lock.locked():
+                log.info("Skipping auto-relogin: a WeChat login started during pre-check")
+                return
+            async with self.wx_login_lock:
+                if self._wx_auto_relogin_cancel.is_set() or self.wx_state == "online":
+                    return
+                self._wx_auto_relogin_phase = "running"
+                self._wx_auto_relogin_due_at = None
+                self._record_auto_relogin_attempt()
+                ok, reason = await self._attempt_silent_wechat_login()
+            if ok:
+                await self.notify("✅ 微信掉线后已自动重新登录并恢复在线。")
+            elif reason != "user_cancelled":
+                await self.notify(
+                    f"⚠️ 微信自动登录失败（{reason}），不再自动重试。"
+                    "请点击下方按钮或发送 /wxlogin 手动登录。",
+                    buttons=self._wx_login_buttons(include_qr=True))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("Unexpected error during auto-relogin")
+            await self.notify(
+                f"⚠️ 微信自动登录出错（{e}），不再自动重试。"
+                "请点击下方按钮或发送 /wxlogin 手动登录。",
+                buttons=self._wx_login_buttons(include_qr=True))
+        finally:
+            self._wx_auto_relogin_phase = ""
+            self._wx_auto_relogin_due_at = None
+
+    async def _attempt_silent_wechat_login(self) -> tuple[bool, str]:
+        """Single non-interactive login attempt using strategy='auto'.
+
+        Succeeds when mobile WeChat has '自动登录该设备' enabled. Cancels the daemon operation
+        immediately on QR fallback or timeout so it never loops or refreshes QR codes unattended.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.cfg.bridge.auto_relogin_timeout_seconds
+        self._wx_login_phase = "auto_relogin"
+        self._wx_login_interrupt.clear()
+        op: dict | None = None
+        saw_approval = False
+        try:
+            op = await self.wx.start_login(f"bridge-login-{uuid.uuid4()}", force_qr=False)
+            while True:
+                if self._wx_auto_relogin_cancel.is_set():
+                    await self._cancel_wx_op_quietly(op)
+                    return False, "user_cancelled"
+                state, res = op.get("state"), op.get("result") or {}
+                if state == "succeeded":
+                    op = None
+                    connected = True
+                    try:
+                        info = await self.wx.account_info()
+                        if info.get("connection") == "disconnected":
+                            await self.wx.connect()
+                    except (httpx.HTTPError, WeChatError) as e:
+                        log.warning("Auto-relogin succeeded but post-login connect check failed: %s", e)
+                        connected = False
+                    if connected:
+                        self._mark_wx_online()
+                    else:
+                        self.wx_state = "disconnected"
+                        self._wx_auto_relogin_attempted = False
+                    return True, ""
+                if state == "awaiting_scan":
+                    await self._cancel_wx_op_quietly(op)
+                    return False, "当前需要扫码登录，无法自动完成"
+                if state in LOGIN_DONE_STATES:
+                    reason = res.get("code") or res.get("reason") or state
+                    friendly = {
+                        "cancelled": "已取消",
+                        "expired": "登录请求已过期",
+                        "rejected": "已在手机上取消登录",
+                        "timeout": "登录超时",
+                        "needs_login": "需要重新验证登录",
+                        "failed": "登录失败",
+                    }.get(str(reason), str(reason))
+                    return False, friendly
+                if state == "awaiting_approval":
+                    saw_approval = True
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    await self._cancel_wx_op_quietly(op)
+                    if saw_approval:
+                        return False, "等待自动登录超时，可能需要手机端手动确认（请确认手机微信已开启「自动登录该设备」）"
+                    return False, "自动登录超时"
+                if self.login_poll_interval > 0:
+                    try:
+                        await asyncio.wait_for(
+                            self._wx_login_interrupt.wait(),
+                            timeout=min(self.login_poll_interval, remaining),
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(0)
+                self._wx_login_interrupt.clear()
+                if self._wx_auto_relogin_cancel.is_set():
+                    await self._cancel_wx_op_quietly(op)
+                    return False, "user_cancelled"
+                op = await self.wx.operation(op["id"])
+        except asyncio.CancelledError:
+            await self._cancel_wx_op_quietly(op)
+            raise
+        except (httpx.HTTPError, WeChatError) as e:
+            log.warning("WeChat auto-relogin failed: %s", e)
+            await self._cancel_wx_op_quietly(op)
+            return False, str(e)
+        finally:
+            self._wx_login_phase = ""
 
     async def wechat_monitor(self, interval: float = 60.0) -> None:
         """Tell the owner when WeChat goes offline or gets signed out, and when it is back."""
@@ -731,17 +1055,21 @@ class LoginMixin:
             if not auth:
                 if self.wx_state != "signed_out":
                     self.wx_state = "signed_out"
-                    await self.notify(
-                        "⚠️ 微信已退出登录（可能在手机上移除了这台设备），点击下方按钮或发送 /wxlogin 重新登录。",
-                        buttons=self._wx_login_buttons())
+                    await self._on_wx_signed_out()
             elif conn == "disconnected":
-                try:
-                    await self.wx.connect()
-                except WeChatError:
-                    pass
+                if self._wx_auto_relogin_phase == "waiting":
+                    self._cancel_auto_relogin()
+                if not self.wx_login_lock.locked():
+                    try:
+                        await self.wx.connect()
+                    except WeChatError:
+                        pass
                 if self.wx_state == "online":
                     self.wx_state = "disconnected"
                     await self.notify("⚠️ 微信连接断开，正在尝试重连…")
             elif conn == "online" and self.wx_state != "online":
-                self.wx_state = "online"
-                await self.notify("✅ 微信已恢复在线。")
+                if self._wx_auto_relogin_phase == "waiting":
+                    self._cancel_auto_relogin()
+                if not self.wx_login_lock.locked():
+                    self._mark_wx_online()
+                    await self.notify("✅ 微信已恢复在线。")

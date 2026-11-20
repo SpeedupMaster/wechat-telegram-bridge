@@ -1,6 +1,7 @@
 """Settings: environment variables (.env in Docker) plus an optional config.toml for advanced options."""
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -61,6 +62,12 @@ class BridgeConfig:
     friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
     auto_rename: bool = True  # follow WeChat remark/group-name changes in Telegram titles
     gif_as_sticker: bool = True
+    # Optional one-shot auto-relogin after WeChat signs out (requires "自动登录该设备" enabled on mobile WeChat).
+    auto_relogin: bool = False
+    auto_relogin_delay_min: float = 45.0       # minimum human-like wait (seconds) before attempting auto-relogin
+    auto_relogin_delay_max: float = 180.0      # maximum human-like wait (seconds) before attempting auto-relogin
+    auto_relogin_timeout_seconds: float = 60.0  # how long to wait for silent auto-login to complete before giving up
+    auto_relogin_cooldown_seconds: float = 3600.0  # minimum interval (seconds) between auto-relogin attempts
     skip_threads: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -76,6 +83,37 @@ class BridgeConfig:
         host, sep, port = str(self.call_web_listen or "").strip().rpartition(":")
         if not sep or not port.isdigit() or not host:
             raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
+        if not isinstance(self.auto_relogin, bool):
+            raise ValueError(f"[bridge] auto_relogin must be true or false, not {self.auto_relogin!r}")
+        for name in (
+            "auto_relogin_delay_min",
+            "auto_relogin_delay_max",
+            "auto_relogin_timeout_seconds",
+            "auto_relogin_cooldown_seconds",
+        ):
+            raw_val = getattr(self, name)
+            if isinstance(raw_val, bool):
+                raise ValueError(f"[bridge] {name} must be a number, not {raw_val!r}")
+            try:
+                num = float(raw_val)
+            except (TypeError, ValueError):
+                raise ValueError(f"[bridge] {name} must be a number, not {raw_val!r}") from None
+            if not math.isfinite(num):
+                raise ValueError(f"[bridge] {name} must be finite, not {raw_val!r}")
+            setattr(self, name, num)
+        if self.auto_relogin_delay_min < 0 or self.auto_relogin_delay_max < self.auto_relogin_delay_min:
+            raise ValueError(
+                "[bridge] auto_relogin_delay_min/max must satisfy 0 <= min <= max, "
+                f"not {self.auto_relogin_delay_min!r}..{self.auto_relogin_delay_max!r}"
+            )
+        if self.auto_relogin_timeout_seconds <= 0:
+            raise ValueError(
+                f"[bridge] auto_relogin_timeout_seconds must be > 0, not {self.auto_relogin_timeout_seconds!r}"
+            )
+        if self.auto_relogin_cooldown_seconds < 0:
+            raise ValueError(
+                f"[bridge] auto_relogin_cooldown_seconds must be >= 0, not {self.auto_relogin_cooldown_seconds!r}"
+            )
 
 
 @dataclass
@@ -110,8 +148,19 @@ ENV = {
     "CALL_WEB_URL": ("bridge", "call_web_url"),
     "CALL_WEB_LISTEN": ("bridge", "call_web_listen"),
     "CALL_WEB_APP": ("bridge", "call_web_app"),
+    "AUTO_RELOGIN": ("bridge", "auto_relogin"),
 }
 INT_KEYS = {"api_id", "forum_chat"}
+BOOL_KEYS = {"auto_relogin"}
+
+
+def _parse_bool(var: str, value: str) -> bool:
+    low = value.lower()
+    if low in ("1", "true", "yes", "on"):
+        return True
+    if low in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{var} must be true/false (or 1/0), not {value!r}")
 
 
 def _section(cls, raw: dict | None):
@@ -133,10 +182,16 @@ def load_config(path: str | Path, environ: dict | None = None) -> Config:
     for var, (section, key) in ENV.items():
         value = environ.get(var, "").strip()
         if value:
-            try:
-                raw.setdefault(section, {})[key] = int(value) if key in INT_KEYS else value
-            except ValueError:
-                raise ValueError(f"{var} must be a number, not {value!r}") from None
+            if key in INT_KEYS:
+                try:
+                    parsed: object = int(value)
+                except ValueError:
+                    raise ValueError(f"{var} must be a number, not {value!r}") from None
+            elif key in BOOL_KEYS:
+                parsed = _parse_bool(var, value)
+            else:
+                parsed = value
+            raw.setdefault(section, {})[key] = parsed
     cfg = Config(
         wechat=_section(WeChatConfig, raw.get("wechat")),
         telegram=_section(TelegramConfig, raw.get("telegram")),

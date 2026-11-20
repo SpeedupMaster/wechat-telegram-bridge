@@ -1009,10 +1009,15 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         await event.answer()
 
     async def close(self) -> None:
-        for task in list(self._notice_tasks):
+        self._cancel_auto_relogin()
+        tasks = list(self._notice_tasks)
+        for task in tasks:
             task.cancel()
-        if self._notice_tasks:
-            await asyncio.gather(*list(self._notice_tasks), return_exceptions=True)
+        if self._wx_auto_relogin_task and not self._wx_auto_relogin_task.done():
+            self._wx_auto_relogin_task.cancel()
+            tasks.append(self._wx_auto_relogin_task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         if self.call_web is not None:
             await self.call_web.stop()
         if self._calls_sock is not None:
@@ -3873,12 +3878,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 await event.reply(TOPIC_HELP if self.topics else HELP, parse_mode="html")
             elif cmd == "/status":
                 up = int(time.time() - self.started)
-                state = {"online": "在线", "disconnected": "连接断开，重连中", "signed_out": "已退出登录（发 /wxlogin）",
-                         "unknown": "未登录（发 /wxlogin）"}.get(self.wx_state, self.wx_state)
+                state = self._wx_state_text()
                 mode = ""
                 if self.topics:
                     forum = f"<code>{self.forum_chat}</code>" if self.forum_chat else "未设置（在群里发 /forum）"
                     mode = f"\n模式：话题群 {forum}"
+                mode += self._wx_auto_relogin_status_line()
                 if self.wx_ready:
                     try:
                         page = await self.wx.contact_requests(direction="incoming", actionable=True, limit=1)

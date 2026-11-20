@@ -2519,6 +2519,41 @@ class ConfigTests(unittest.TestCase):
                 load_config(Path(tmp) / "missing.toml", {**env, "BRIDGE_MODE": "channels"})
             with self.assertRaisesRegex(ValueError, "TG_FORUM_CHAT"):
                 load_config(Path(tmp) / "missing.toml", {**env, "TG_FORUM_CHAT": "my group"})
+            self.assertFalse(cfg.bridge.auto_relogin)
+            cfg = load_config(Path(tmp) / "missing.toml", {**env, "AUTO_RELOGIN": "true"})
+            self.assertTrue(cfg.bridge.auto_relogin)
+            cfg = load_config(Path(tmp) / "missing.toml", {**env, "AUTO_RELOGIN": "0"})
+            self.assertFalse(cfg.bridge.auto_relogin)
+            with self.assertRaisesRegex(ValueError, "AUTO_RELOGIN"):
+                load_config(Path(tmp) / "missing.toml", {**env, "AUTO_RELOGIN": "maybe"})
+            toml_path = Path(tmp) / "config.toml"
+            toml_path.write_text(
+                "[bridge]\n"
+                "auto_relogin = true\n"
+                "auto_relogin_delay_min = 30\n"
+                "auto_relogin_delay_max = 90\n"
+                "auto_relogin_timeout_seconds = 45\n"
+                "auto_relogin_cooldown_seconds = 1800\n",
+                encoding="utf-8",
+            )
+            cfg = load_config(toml_path, env)
+            self.assertTrue(cfg.bridge.auto_relogin)
+            self.assertEqual(
+                (cfg.bridge.auto_relogin_delay_min, cfg.bridge.auto_relogin_delay_max,
+                 cfg.bridge.auto_relogin_timeout_seconds, cfg.bridge.auto_relogin_cooldown_seconds),
+                (30.0, 90.0, 45.0, 1800.0),
+            )
+            # Environment variable overrides config.toml
+            cfg = load_config(toml_path, {**env, "AUTO_RELOGIN": "false"})
+            self.assertFalse(cfg.bridge.auto_relogin)
+            with self.assertRaisesRegex(ValueError, "auto_relogin_delay_min/max"):
+                BridgeConfig(auto_relogin_delay_min=100, auto_relogin_delay_max=50)
+            with self.assertRaisesRegex(ValueError, "auto_relogin_timeout_seconds"):
+                BridgeConfig(auto_relogin_timeout_seconds=0)
+            with self.assertRaisesRegex(ValueError, "auto_relogin_cooldown_seconds"):
+                BridgeConfig(auto_relogin_cooldown_seconds=-1)
+            with self.assertRaisesRegex(ValueError, "auto_relogin must be true or false"):
+                BridgeConfig(auto_relogin="false")  # type: ignore[arg-type]
 
 
 class LoginDaemon:
@@ -2571,6 +2606,8 @@ class LoginDaemon:
         if path == f"accounts/{ACC}/operations/op1/qr":
             self.qr_fetches.append(request.url.params.get("generation"))
             return httpx.Response(200, content=b"\x89PNG-qr", headers={"content-type": "image/png"})
+        if path == f"accounts/{ACC}/contact-requests" and m == "GET":
+            return httpx.Response(200, json={"items": [], "pendingIncomingCount": 0})
         raise AssertionError(f"unexpected {m} {path}")
 
 
@@ -2764,6 +2801,335 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.daemon.login_strategies, ["auto"])
         self.assertEqual(self.b.wx_state, "online")
         self.assertTrue(self.daemon.authenticated)
+
+    async def test_auto_relogin_succeeds_silently_after_random_delay(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.02
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.03
+        self.b.cfg.bridge.auto_relogin_timeout_seconds = 2.0
+        self.b.cfg.bridge.auto_relogin_cooldown_seconds = 3600.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        try:
+            for _ in range(100):
+                if self.b._wx_auto_relogin_task is not None and self.b._wx_auto_relogin_task.done():
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.03)  # let monitor tick again to ensure no duplicate online alerts
+        finally:
+            mon.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await mon
+
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        self.assertTrue(self.daemon.authenticated)
+        self.assertTrue(self.daemon.connected)
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertFalse(self.b._wx_auto_relogin_attempted)
+        self.assertIsNotNone(self.b.store.get("auto_relogin_last_at"))
+        texts = [s.text for s in self.b.bot.sent if s.text]
+        self.assertTrue(any("自动尝试重新登录一次" in t for t in texts))
+        # Must NOT send the noisy phone confirmation prompt when silent auto-login succeeds
+        self.assertFalse(any("登录确认请求" in t for t in texts))
+        self.assertEqual(sum("自动重新登录" in t for t in texts), 1)
+        self.assertEqual(sum("恢复在线" in t for t in texts), 1)
+
+    async def test_auto_relogin_only_tries_once_and_cancels_on_qr_fallback(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.01
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.01
+        self.b.cfg.bridge.auto_relogin_timeout_seconds = 2.0
+        self.b.cfg.bridge.auto_relogin_cooldown_seconds = 0.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_scan", "result": {"qrGeneration": 1, "qrAvailable": True}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        try:
+            for _ in range(100):
+                if self.b._wx_auto_relogin_task is not None and self.b._wx_auto_relogin_task.done():
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)  # multiple subsequent monitor ticks must NOT retry
+        finally:
+            mon.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await mon
+
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        self.assertEqual(self.daemon.cancelled_ops, ["op1"])
+        self.assertEqual(self.daemon.qr_fetches, [])
+        self.assertEqual(self.b.wx_state, "signed_out")
+        self.assertTrue(self.b._wx_auto_relogin_attempted)
+        last = self.b.bot.sent[-1]
+        self.assertIn("微信自动登录失败", last.text)
+        self.assertIn("扫码登录", last.text)
+        self.assertIn("不再自动重试", last.text)
+        self.assertEqual(len(last.kwargs["buttons"][0]), 2)
+
+    async def test_auto_relogin_times_out_waiting_for_approval_and_reminds_manual(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.0
+        self.b.cfg.bridge.auto_relogin_timeout_seconds = 0.04
+        self.b.cfg.bridge.auto_relogin_cooldown_seconds = 0.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "awaiting_approval", "result": {}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        try:
+            for _ in range(100):
+                if self.b._wx_auto_relogin_task is not None and self.b._wx_auto_relogin_task.done():
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.04)
+        finally:
+            mon.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await mon
+
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        self.assertEqual(self.daemon.cancelled_ops, ["op1"])
+        self.assertEqual(self.b.wx_state, "signed_out")
+        last = self.b.bot.sent[-1]
+        self.assertIn("自动登录该设备", last.text)
+        self.assertIn("手动登录", last.text)
+
+    async def test_auto_relogin_respects_cooldown_on_repeat_signout(self):
+        import time as _time
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.0
+        self.b.cfg.bridge.auto_relogin_cooldown_seconds = 3600.0
+        self.b.store.set("auto_relogin_last_at", str(_time.time() - 60))
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        await self.b.wx.resolve_account()
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        try:
+            for _ in range(50):
+                if self.b.wx_state == "signed_out" and self.b.bot.sent:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.03)
+        finally:
+            mon.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await mon
+
+        self.assertEqual(self.daemon.login_strategies, [])
+        self.assertIsNone(self.b._wx_auto_relogin_task)
+        last = self.b.bot.sent[-1]
+        self.assertIn("冷却", last.text)
+        self.assertIn("不会自动登录", last.text)
+
+    async def test_auto_relogin_cancel_button_and_manual_override(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 5.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 5.0
+        self.b.cfg.bridge.auto_relogin_cooldown_seconds = 3600.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        await self.b.wx.resolve_account()
+
+        def btn_data(btn):
+            return btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        try:
+            for _ in range(50):
+                if self.b._wx_auto_relogin_task is not None:
+                    break
+                await asyncio.sleep(0.01)
+            # /status should report waiting auto-relogin while pending
+            replies = []
+            async def reply(text, **kw):
+                replies.append((text, kw))
+            await self.b.on_bot_command(SimpleNamespace(raw_text="/status", reply=reply))
+            self.assertIn("自动尝试登录", replies[-1][0])
+            self.assertIn("掉线自动登录：已开启", replies[-1][0])
+
+            alert = self.b.bot.sent[-1]
+            cancel_btn = alert.kwargs["buttons"][0][1]
+            self.assertEqual(btn_data(cancel_btn), b"wxlogin:cancel_auto")
+            cb = _CallbackEvent(42, btn_data(cancel_btn))
+            await self.b.on_bot_callback(cb)
+            await self.b._wx_auto_relogin_task
+            self.assertEqual(cb.answers, [("已取消本次自动登录", False)])
+            self.assertTrue(cb.edits and "已取消本次自动登录" in cb.edits[-1][0])
+            self.assertEqual(self.daemon.login_strategies, [])
+            # Cancelling before calling WeChat should not burn the cooldown
+            self.assertIsNone(self.b.store.get("auto_relogin_last_at"))
+        finally:
+            mon.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await mon
+
+        # Now test clicking "立即手动登录" while waiting: cancels timer & runs manual login once
+        self.b._mark_wx_online()
+        self.b.bot.sent.clear()
+        self.b._wx_auto_relogin_task = None
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+        self.b.wx_state = "signed_out"
+        await self.b._on_wx_signed_out()
+        self.assertIsNotNone(self.b._wx_auto_relogin_task)
+        wait_task = self.b._wx_auto_relogin_task
+        manual_btn = self.b.bot.sent[-1].kwargs["buttons"][0][0]
+        self.assertEqual(btn_data(manual_btn), b"wxlogin:auto")
+        cb2 = _CallbackEvent(42, btn_data(manual_btn))
+        await self.b.on_bot_callback(cb2)
+        await wait_task
+        await self.b._wx_login_task
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertIsNone(self.b.store.get("auto_relogin_last_at"))
+
+    async def test_auto_relogin_aborts_if_account_recovers_during_delay(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.03
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.03
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        await self.b.wx.resolve_account()
+
+        await self.b._on_wx_signed_out()
+        self.daemon.authenticated = True
+        self.daemon.connected = True
+        await self.b._wx_auto_relogin_task
+
+        self.assertEqual(self.daemon.login_strategies, [])
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertIn("无需自动重新登录", self.b.bot.sent[-1].text)
+
+    async def test_auto_relogin_qr_override_while_running(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "signed_out"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.0
+        self.b.cfg.bridge.auto_relogin_timeout_seconds = 5.0
+        self.b.login_poll_interval = 0.05
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "awaiting_approval", "result": {}},
+                {"state": "awaiting_approval", "result": {}},
+            ],
+            "qr": [
+                {"state": "awaiting_scan", "result": {"qrGeneration": 1, "qrAvailable": True}},
+                {"state": "succeeded", "result": {}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        await self.b._on_wx_signed_out()
+        for _ in range(50):
+            if self.b._wx_auto_relogin_phase == "running" and self.daemon.login_strategies == ["auto"]:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(self.b._wx_auto_relogin_phase, "running")
+
+        cb = _CallbackEvent(42, b"wxlogin:qr")
+        await self.b.on_bot_callback(cb)
+        await self.b._wx_auto_relogin_task
+        await self.b._wx_login_task
+
+        self.assertEqual(self.daemon.login_strategies, ["auto", "qr"])
+        self.assertEqual(self.daemon.cancelled_ops, ["op1"])
+        self.assertEqual(self.b.wx_state, "online")
+        self.assertFalse(any("自动登录失败" in (s.text or "") for s in self.b.bot.sent))
+
+    async def test_auto_relogin_failure_state_does_not_retry_and_reminds_manual(self):
+        self.b.tg_ready.set()
+        self.b.owner_id = 42
+        self.b.wx_ready = True
+        self.b.wx_state = "online"
+        self.b.cfg.bridge.auto_relogin = True
+        self.b.cfg.bridge.auto_relogin_delay_min = 0.0
+        self.b.cfg.bridge.auto_relogin_delay_max = 0.0
+        self.b.cfg.bridge.auto_relogin_cooldown_seconds = 0.0
+        self.daemon.accounts = [{"id": ACC, "alias": "me"}]
+        self.daemon.authenticated = False
+        self.daemon.ops_by_strategy = {
+            "auto": [
+                {"state": "failed", "result": {"code": "device_auth_expired"}},
+            ],
+        }
+        await self.b.wx.resolve_account()
+
+        mon = asyncio.create_task(self.b.wechat_monitor(interval=0.01))
+        try:
+            for _ in range(100):
+                if self.b._wx_auto_relogin_task is not None and self.b._wx_auto_relogin_task.done():
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+        finally:
+            mon.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await mon
+
+        self.assertEqual(self.daemon.login_strategies, ["auto"])
+        self.assertEqual(self.b.wx_state, "signed_out")
+        last = self.b.bot.sent[-1]
+        self.assertIn("微信自动登录失败", last.text)
+        self.assertIn("device_auth_expired", last.text)
+        self.assertIn("不再自动重试", last.text)
+        self.assertIn("/wxlogin", last.text)
 
     async def test_telegram_code_login_keypad_one_tap_phone_and_2fa(self):
         from telethon import errors, types

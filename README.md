@@ -325,6 +325,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `CALL_WEB_APP` | 否 | 空 | `@BotFather` `/newapp` 注册的 Mini App 短名称 |
 | `COMPOSE_PROFILES` | 否 | 空 | 设为 `cloudflare` 时随 Compose 启动内置的 `cloudflared` 隧道容器 |
 | `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
+| `AUTO_RELOGIN` | 否 | `false` | 微信掉线后是否自动尝试重新登录一次（需手机微信开启「自动登录该设备」，内置随机延迟与冷却保护，失败则提醒手动登录） |
 | `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v2.8.0`） |
 
 ### 高级配置（`config/config.toml`）
@@ -352,6 +353,11 @@ cp config.example.toml config/config.toml
 | `friend_requests` | `true` | 是否把新的微信好友请求推送到机器人私聊（需 `agent-wechat >= 2.7.0`） |
 | `auto_rename` | `true` | 微信备注/群名变化后是否自动更新 Telegram 群/话题标题（关闭后可发 `/rename` 手动同步） |
 | `gif_as_sticker` | `true` | 是否将 Telegram 发送的 GIF 动图转为微信原生表情发送 |
+| `auto_relogin` | `false` | 微信退出登录后是否自动尝试重新登录一次（环境变量 `AUTO_RELOGIN`；需在手机微信开启「自动登录该设备」，失败/需扫码/超时会取消并提醒手动登录，不循环重试） |
+| `auto_relogin_delay_min` | `45` | 检测到掉线后发起自动登录前的最短随机延迟（秒），避免瞬时重登触发风控 |
+| `auto_relogin_delay_max` | `180` | 检测到掉线后发起自动登录前的最长随机延迟（秒） |
+| `auto_relogin_timeout_seconds` | `60` | 单次自动登录等待静默完成的超时秒数，超时即取消并提醒手动登录 |
+| `auto_relogin_cooldown_seconds` | `3600` | 两次自动登录尝试之间的最小冷却秒数（持久化存储，防止短时间反复掉线重登触发风控） |
 | `skip_threads` | `["weixin"]` | 忽略不桥接的微信会话 ID 列表（如 `["filehelper", "weixin"]`） |
 
 ---

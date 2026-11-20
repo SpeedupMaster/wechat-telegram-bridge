@@ -2,7 +2,7 @@
 #   Docker：复制到 config/config.toml，然后 docker compose restart telegram-bridge
 #   本地运行：复制到项目根目录的 config.toml
 # 环境变量（.env）会覆盖这里的同名设置：TG_API_ID、TG_API_HASH、TG_BOT_TOKEN、TG_PROXY、
-# WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR、BRIDGE_MODE、TG_FORUM_CHAT
+# WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR、BRIDGE_MODE、TG_FORUM_CHAT、AUTO_RELOGIN
 
 [wechat]
 # agent-wechat 守护进程（wx serve）的地址。用本项目的 compose.yaml 部署时不用填
@@ -67,5 +67,17 @@ friend_requests = true
 auto_rename = true
 # 将 Telegram 发送的 GIF 动图转为微信表情包发送（需 agent-wechat >= 2.4.0，失败时自动回退为视频）
 gif_as_sticker = true
+# 可选：微信掉线/退出登录后自动尝试重新登录一次（环境变量 AUTO_RELOGIN，默认关闭）
+#   前提：需先在手机微信中为本设备开启「自动登录该设备」
+#   防风控机制：检测到掉线后先随机延迟一段时间再发起单次登录；失败/需扫码/超时会立即取消并提醒手动登录，
+#   不会循环重试；两次自动登录尝试之间有冷却时间保护（重启也生效）；等待期间也可点按钮取消或立即手动登录
+auto_relogin = false
+# 自动登录前的随机拟人延迟范围（秒），默认 45~180 秒
+# auto_relogin_delay_min = 45
+# auto_relogin_delay_max = 180
+# 单次自动登录等待静默完成的超时时间（秒），超时未成功则取消并提醒手动登录
+# auto_relogin_timeout_seconds = 60
+# 两次自动登录尝试之间的最小冷却时间（秒），默认 3600 秒（1 小时），防止短时间反复掉线触发风控
+# auto_relogin_cooldown_seconds = 3600
 # 不桥接的微信会话 ID，例如 ["filehelper", "weixin"]
 skip_threads = ["weixin"]
