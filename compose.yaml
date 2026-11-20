@@ -89,10 +89,9 @@ services:
 
   telegram-bridge:
     # Built by GitHub Actions (.github/workflows/image.yml). The image is private, so run
-    # `docker login ghcr.io` once on the VPS (see README). Without that, `docker compose up -d --build`
-    # builds it locally from this directory instead.
+    # `docker login ghcr.io` once on the VPS (see README). To build locally from a git checkout
+    # instead, overlay compose.build.yaml (`docker compose -f compose.yaml -f compose.build.yaml up -d --build`).
     image: ${BRIDGE_IMAGE:-ghcr.io/speedupmaster/wechat-telegram-bridge:latest}
-    build: .
     network_mode: host
     environment:
       TG_API_ID: ${TG_API_ID:?set TG_API_ID in .env}

@@ -380,7 +380,7 @@ cp config.example.toml config/config.toml
 - **或者拉取最新源码在本地重新构建**：
   ```bash
   git pull
-  docker compose up -d --no-deps --build telegram-bridge
+  docker compose -f compose.yaml -f compose.build.yaml up -d --no-deps --build telegram-bridge
   ```
 
 ### 常用运维命令
@@ -457,6 +457,7 @@ python -m unittest discover -s tests -v
 │   └── store.py           # SQLite 状态存储（事件游标、群组/话题映射、双向消息 ID 映射）
 ├── tests/                 # 基于 Mock 客户端的完整离线单元测试
 ├── compose.yaml           # Docker Compose 编排（token-init + agent-wechat + telegram-bridge + cloudflared）
+├── compose.build.yaml     # 可选 Compose 覆盖文件（从本机源码构建 telegram-bridge 镜像）
 ├── Dockerfile             # 桥接服务镜像构建文件（内置 ffmpeg、gifsicle 与 Noto CJK/Emoji 字体）
 ├── setup.sh               # VPS 一键交互式初始化与启动脚本
 ├── .env.example           # 环境变量模板

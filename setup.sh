@@ -50,8 +50,8 @@ if docker compose pull; then
   docker compose up -d
 else
   echo "拉取 telegram-bridge 镜像失败（私有镜像需要先 docker login ghcr.io，见 README）。改为在本机构建…"
-  docker compose pull --ignore-buildable
-  docker compose up -d --build
+  docker compose -f compose.yaml -f compose.build.yaml pull --ignore-buildable
+  docker compose -f compose.yaml -f compose.build.yaml up -d --build
 fi
 
 echo "等待桥接程序启动…"

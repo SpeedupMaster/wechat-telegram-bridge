@@ -1,0 +1,6 @@
+# Optional Compose override for building telegram-bridge locally from a git checkout
+# (instead of pulling the prebuilt GHCR image):
+#   docker compose -f compose.yaml -f compose.build.yaml up -d --no-deps --build telegram-bridge
+services:
+  telegram-bridge:
+    build: .
