@@ -207,7 +207,7 @@ class ContactsMixin:
         if op.get("state") not in OP_OK:
             return await say(f"⚠️ 修改备注失败：{_esc(op_error(op))}")
         self._forget_names(wx_id)
-        noun = "话题" if self.topics else "群"
+        noun = self._thread_noun(wx_id)
         done = f"已把备注改为 <b>{_esc(remark)}</b>" if remark else "已清除备注"
         follow = f"，{noun}标题会跟着更新" if self.cfg.bridge.auto_rename else ""
         await say(f"✅ {done}。几秒后同步到手机微信{follow}。")
@@ -259,7 +259,10 @@ class ContactsMixin:
             for wx_id, _, _ in self._link_rows():
                 if not wx_id.endswith("@chatroom") and (title := await self._outdated_title(wx_id)):
                     outdated.append((self._link_title(wx_id) or wx_id, title))
-            noun = "话题" if self.topics else "群"
+            has_standalone = self.topics and any(
+                not self._is_forum_chat(c) for _, c, _, _ in self.store.list_topic_groups()
+            )
+            noun = "群/话题" if has_standalone else ("话题" if self.topics else "群")
             lines = ["✅ 联系人资料已从微信重新同步。" if result.get("complete") or not result.get("resumeAvailable")
                      else "⚠️ 同步了一部分，还没完成，稍后再发一次 <code>/syncnames</code> 会接着同步。"]
             failed = result.get("failedItems")
@@ -327,7 +330,7 @@ class ContactsMixin:
         return "\n".join(lines), buttons
 
     def _open_chat_button(self, wx_id: str, name: str) -> list:
-        noun = "话题" if self.topics else "群"
+        noun = self._thread_noun(wx_id)
         label = "💬 打开聊天" if self._dest_for_thread(wx_id) is not None else f"💬 发起聊天（建{noun}）"
         return [Button.inline(label, self._make_ui_token(
             {"action": "open_wx", "wx_id": wx_id, "name": name, "kind": "direct"}))]
@@ -561,11 +564,11 @@ class ContactsMixin:
         peer = req.get("peerId") or peer
         text = f"✅ 已通过 <b>{_esc(name)}</b> 的好友请求" + ("（仅聊天）" if mode == "chats_only" else "")
         if mode == "chat":
-            noun = "话题" if self.topics else "群"
             try:
                 thread = await self.wx.thread(peer)
             except WeChatError:
                 thread = {"id": peer, "kind": "direct", "displayName": name}
+            noun = self._thread_noun(peer, thread)
             try:
                 chat = await self.ensure_chat(thread)
             except Exception:
@@ -662,7 +665,7 @@ class ContactsMixin:
 
     async def _ui_contact_remove_ask(self, event, p: dict) -> None:
         await event.answer()
-        noun = "话题" if self.topics else "群"
+        noun = self._thread_noun(p["wx_id"])
         name = p.get("name") or p["wx_id"]
         buttons = [[
             Button.inline("⚠️ 确认删除", self._make_ui_token(
@@ -683,5 +686,5 @@ class ContactsMixin:
             text, buttons = await self.contact_card(p["wx_id"], note=f"⚠️ 删除失败：{_esc(op_error(op))}")
             await self._edit_ui_msg(event, text, buttons)
             return
-        noun = "话题" if self.topics else "群"
+        noun = self._thread_noun(p["wx_id"])
         await self._edit_ui_msg(event, f"🗑 已删除微信好友 <b>{_esc(name)}</b>。聊天记录和当前{noun}的绑定都保留。")

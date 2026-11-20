@@ -2262,17 +2262,23 @@ OWNER = 4242
 
 
 class FakeForumBot(FakeBot):
-    """The bot as admin of a forum supergroup: creates/edits topics; posting into a deleted topic fails."""
+    """The bot as admin of a forum supergroup (or standalone group): creates/edits topics and group info."""
 
     def __init__(self):
         super().__init__()
         self.topics: dict[int, tuple[str, int]] = {}  # topic id -> (title, icon colour)
         self.topic_edits: list[tuple[int, str]] = []
+        self.group_titles: dict[int, str] = {}
+        self.title_edits: list[tuple[int, str]] = []
+        self.photo_edits: list[tuple[int, bytes]] = []
         self.deleted_topics: set[int] = set()
         self.next_topic = 10 ** 6  # far from Sent ids
 
     async def get_input_entity(self, chat):
         return types.InputPeerChannel(channel_id=abs(chat) - 10 ** 12, access_hash=0)
+
+    async def upload_file(self, f, file_name=None):
+        return ("uploaded", f.read())
 
     async def __call__(self, request):
         if isinstance(request, functions.messages.CreateForumTopicRequest):
@@ -2291,6 +2297,25 @@ class FakeForumBot(FakeBot):
             self.topic_edits.append((request.topic_id, request.title))
             self.topics[request.topic_id] = (request.title, self.topics[request.topic_id][1])
             return types.Updates(updates=[], users=[], chats=[], date=None, seq=0)
+        if isinstance(request, functions.messages.EditChatTitleRequest):
+            if self.group_titles.get(request.chat_id) == request.title:
+                raise errors.ChatNotModifiedError(request=None)
+            self.group_titles[request.chat_id] = request.title
+            self.title_edits.append((request.chat_id, request.title))
+            return None
+        if isinstance(request, functions.channels.EditTitleRequest):
+            cid = request.channel.channel_id
+            if self.group_titles.get(cid) == request.title:
+                raise errors.ChatNotModifiedError(request=None)
+            self.group_titles[cid] = request.title
+            self.title_edits.append((cid, request.title))
+            return None
+        if isinstance(request, functions.messages.EditChatPhotoRequest):
+            self.photo_edits.append((request.chat_id, request.photo.file[1]))
+            return None
+        if isinstance(request, functions.channels.EditPhotoRequest):
+            self.photo_edits.append((request.channel.channel_id, request.photo.file[1]))
+            return None
         return await super().__call__(request)
 
     async def send_message(self, chat, text, **kw):
@@ -2484,6 +2509,232 @@ class TopicModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("oaforum", group)
         self.assertNotIn("avatar", group)
         self.assertNotIn("link", [c for c, _ in menus[types.BotCommandScopeUsers]])
+
+    async def test_on_demand_standalone_group_link_messaging_quotes_recall_and_unlink(self):
+        self.b.tg_ready.set()
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_thread("wxid_carol", "Carol")
+        # An old groups-mode binding in `threads` must stay untouched and inactive in topics mode.
+        self.b.store.link("wxid_carol", -501, "Carol Old Group")
+        self.daemon.add_message("m0", "wxid_bob", "in topic first", server="700")
+        await self.event("m0", "wxid_bob")
+        old_topic = self.topic_of("wxid_bob")
+
+        # User creates a normal standalone basic group (-601), adds bot, and runs `/link Bob`.
+        await self.b.on_forum_message(forum_event(-601, 9300, "/link Bob", is_forum=False))
+        picker = self.b.bot.sent[-1]
+        self.assertEqual(picker.chat, -601)
+        btn = picker.kwargs["buttons"][0][0]
+        btn_data = btn.type.data if hasattr(btn, "type") and hasattr(btn.type, "data") else btn.data
+        cb = _CallbackEvent(OWNER, btn_data)
+        await self.b.on_bot_callback(cb)
+        self.assertIn("已将当前群绑定到微信会话", cb.edits[-1][0])
+        self.assertIn("已解除原话题绑定并保留历史", cb.edits[-1][0])
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob"), (-601, 0))
+        self.assertIsNone(self.b.store.chat_for_thread("wxid_bob"), "groups-mode threads table untouched")
+        self.assertEqual(self.b.store.chat_for_thread("wxid_carol"), -501)
+        self.assertIsNone(self.b._dest_for_thread("wxid_carol"))
+
+        # Old topic is now unbound: posting in it does not send to WeChat.
+        sends_before = len(self.daemon.sends)
+        await self.b.on_forum_message(forum_event(FORUM, 9301, "old topic msg", topic=old_topic))
+        self.assertEqual(len(self.daemon.sends), sends_before)
+
+        # Incoming WeChat message for Bob now lands in standalone group -601 (no topic reply_to).
+        self.daemon.add_message("m1", "wxid_bob", "hi in standalone", server="701")
+        await self.event("m1", "wxid_bob")
+        m1_sent = self.b.bot.sent[-1]
+        self.assertEqual((m1_sent.chat, m1_sent.text, m1_sent.kwargs.get("reply_to")),
+                         (-601, "hi in standalone", None))
+
+        # Sending plain text and replying to m1 in basic standalone group -601 works (bot-side msg ids).
+        await self.b.on_forum_message(forum_event(-601, 9302, "plain from group", is_forum=False))
+        self.assertEqual(self.daemon.sends[-1][0]["text"], "plain from group")
+        self.assertNotIn("quote", self.daemon.sends[-1][0])
+
+        await self.b.on_forum_message(forum_event(-601, 9303, "reply to m1", reply_to=m1_sent.id, is_forum=False))
+        self.assertEqual(self.daemon.sends[-1][0]["quote"], {"messageId": "m1", "serverId": "701"})
+
+        # Echo of our sent message is dropped and links wx_msg, so WeChat quoting it replies to 9302 in -601.
+        sent_count = len(self.b.bot.sent)
+        self.daemon.add_message("echo_9302", "wxid_bob", "plain from group", direction="outgoing", server="901")
+        await self.event("echo_9302", "wxid_bob", direction="outgoing")
+        self.assertEqual(len(self.b.bot.sent), sent_count)
+        self.daemon.add_message("q_back", "wxid_bob", "quoted yours", type_=49, appMessageType=57,
+                                quote={"messageId": "echo_9302", "serverId": "901", "embeddedText": "plain from group"})
+        await self.event("q_back", "wxid_bob")
+        self.assertEqual((self.b.bot.sent[-1].chat, self.b.bot.sent[-1].kwargs.get("reply_to")), (-601, 9302))
+
+        # /recall and /wx in basic standalone group -601 use bot-side ids directly.
+        await self.b.on_forum_message(forum_event(-601, 9304, "/recall", reply_to=9302, is_forum=False))
+        self.assertEqual(self.daemon.recalls[-1][0], "echo_9302")
+        self.assertEqual(self.b.bot.sent[-1].kwargs.get("reply_to"), 9302)
+        await self.b.on_forum_message(forum_event(-601, 9305, "/wx", is_forum=False))
+        self.assertIn("wxid_bob", self.b.bot.sent[-1].text)
+        self.assertEqual(self.b.bot.sent[-1].kwargs.get("reply_to"), 9305)
+
+        # /status, /chats, /find, /open reflect standalone group accurately.
+        replies = []
+        async def reply(t, **kw):
+            replies.append((t, kw))
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/status", reply=reply))
+        self.assertIn("另含 1 个独立群", replies[-1][0])
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/chats", reply=reply))
+        self.assertIn("-601", replies[-1][0])
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/find Bob", reply=reply))
+        self.assertIn("（已绑群）", replies[-1][0])
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/open Bob", reply=reply))
+        self.assertIn("这个会话已经有群了", replies[-1][0])
+
+        # /unlink in standalone group -601 falls back to creating a topic on the next WeChat message.
+        await self.b.on_forum_message(forum_event(-601, 9306, "/unlink", is_forum=False))
+        self.assertIn("自动回到话题群", self.b.bot.sent[-1].text)
+        self.assertIsNone(self.b.store.topic_for_thread("wxid_bob"))
+        self.daemon.add_message("m2", "wxid_bob", "back to forum")
+        await self.event("m2", "wxid_bob")
+        new_topic = self.topic_of("wxid_bob")
+        self.assertGreater(new_topic, 0)
+        self.assertEqual((self.b.bot.sent[-1].chat, self.b.bot.sent[-1].kwargs.get("reply_to")), (FORUM, new_topic))
+
+    async def test_standalone_group_rename_avatar_migration_and_dead_chat_fallback(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        await self.b.on_forum_message(forum_event(-602, 9400, "/link wxid_bob", is_forum=False))
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob"), (-602, 0))
+
+        # /rename and /avatar work via self.bot (self.user is None in topics mode).
+        self.daemon.threads["wxid_bob"]["displayName"] = "Bobby"
+        await self.b.on_forum_message(forum_event(-602, 9401, "/rename", is_forum=False))
+        self.assertEqual(self.b.bot.title_edits[-1], (602, "Bobby"))
+        self.assertEqual(self.b._link_title("wxid_bob"), "Bobby")
+        self.assertIn("已更新群标题", self.b.bot.sent[-1].text)
+        await self.b.on_forum_message(forum_event(-602, 9402, "/rename", is_forum=False))
+        self.assertIn("群标题已是最新", self.b.bot.sent[-1].text)
+
+        await self.b.on_forum_message(forum_event(-602, 9403, "/avatar", is_forum=False))
+        self.assertEqual(len(self.b.bot.photo_edits), 1)
+        self.assertEqual(self.b.bot.photo_edits[-1][0], 602)
+        self.assertEqual(self.b.bot.sent[-1].text, "已更新群头像")
+
+        # Auto-rename on contact change updates the standalone group title via bot.
+        self.daemon.add_contact("wxid_bob", "Bob Remark", remark="Bob Remark")
+        await self.b.handle_event({"cursor": "2", "kind": "contacts.updated", "data": {"contactId": "wxid_bob"}})
+        self.assertEqual(self.b.bot.title_edits[-1], (602, "Bob Remark"))
+
+        # Basic group -> supergroup migration updates topics table and msgmap.
+        mig = types.UpdateNewMessage(
+            message=types.MessageService(
+                id=9404, peer_id=types.PeerChat(602), date=None,
+                action=types.MessageActionChatMigrateTo(channel_id=6020000000),
+            ),
+            pts=1, pts_count=1,
+        )
+        await self.b.on_raw_update(mig)
+        super_id = -1006020000000
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob"), (super_id, 0))
+        self.daemon.add_contact("wxid_bob", "Bob Super", remark="Bob Super")
+        await self.b.on_forum_message(forum_event(super_id, 9405, "/rename", is_forum=False))
+        self.assertEqual(self.b.bot.title_edits[-1], (6020000000, "Bob Super"))
+
+        # If the standalone group becomes unreachable (e.g. bot kicked), fall back to a topic and notify owner.
+        self.b.bot.dead_chats.add(super_id)
+        self.daemon.add_message("m_dead", "wxid_bob", "after kick")
+        await self.event("m_dead", "wxid_bob")
+        fallback_dest = self.b.store.topic_for_thread("wxid_bob")
+        self.assertIsNotNone(fallback_dest)
+        self.assertEqual(fallback_dest[0], FORUM)
+        self.assertGreater(fallback_dest[1], 0)
+        self.assertEqual((self.b.bot.sent[-1].chat, self.b.bot.sent[-1].text), (FORUM, "after kick"))
+        owner_notices = [s.text for s in self.b.bot.sent if s.chat == OWNER]
+        self.assertTrue(any("已解除独立群绑定并退回话题群" in t for t in owner_notices))
+
+    async def test_standalone_group_guards_private_link_and_permission_warning(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_thread("gh_news", "Daily News")
+        self.daemon.threads["gh_news"]["classification"] = {"category": "business"}
+
+        # 1) Unbound non-forum group ignores unrelated text/commands; unbound forum rejects /link.
+        before = len(self.b.bot.sent)
+        await self.b.on_forum_message(forum_event(-603, 9500, "random chat", is_forum=False))
+        await self.b.on_forum_message(forum_event(-603, 9501, "/help", is_forum=False))
+        self.assertEqual(len(self.b.bot.sent), before)
+        await self.b.on_forum_message(forum_event(-1007777, 9502, "/link wxid_bob", is_forum=True))
+        self.assertIn("开启了「话题」", self.b.bot.sent[-1].text)
+        self.assertIsNone(self.b.store.topic_for_thread("wxid_bob"))
+
+        # 2) Permission warning when privacy mode is on and bot is not admin; silent when bot is admin.
+        admin_flag = False
+        async def fake_perms(chat_id, user):
+            return SimpleNamespace(is_admin=admin_flag)
+        self.b.bot.get_permissions = fake_perms
+        await self.b.on_forum_message(forum_event(-603, 9503, "/link wxid_bob", is_forum=False))
+        self.assertIn("设为本群<b>管理员</b>", self.b.bot.sent[-1].text)
+        admin_flag = True
+        await self.b.on_forum_message(forum_event(-603, 9504, "/link wxid_bob", is_forum=False))
+        self.assertNotIn("设为本群<b>管理员</b>", self.b.bot.sent[-1].text)
+
+        # 3) Switching /forum preserves standalone group binding while old forum topics become inactive.
+        self.b.store.link_topic("wxid_alice", FORUM, 555, "Alice")
+        self.b.cfg.bridge.forum_chat = 0
+        await self.b.on_forum_message(forum_event(-1007778, 9505, "/forum"))
+        self.assertIsNone(self.b._dest_for_thread("wxid_alice"))
+        self.assertEqual(self.b._dest_for_thread("wxid_bob"), (-603, None))
+
+        # 4) /forum and /oaforum reject a chat currently bound as a standalone group.
+        await self.b.on_forum_message(forum_event(-603, 9506, "/forum", is_forum=True))
+        self.assertIn("当前已绑定到一个普通微信会话", self.b.bot.sent[-1].text)
+        await self.b.on_forum_message(forum_event(-603, 9507, "/oaforum", is_forum=True))
+        self.assertIn("当前已绑定到一个普通微信会话", self.b.bot.sent[-1].text)
+
+        # 5) Private /link in topics mode: guide without args, direct bind with 2 args + guards.
+        replies = []
+        async def reply(t, **kw):
+            replies.append(t)
+        async def fake_get_entity(cid):
+            return SimpleNamespace(forum=(cid == -1007779))
+        self.b.bot.get_entity = fake_get_entity
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/link", reply=reply))
+        self.assertIn("绑定到独立新群", replies[-1])
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/link wxid_bob 12345", reply=reply))
+        self.assertIn("应为负数", replies[-1])
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/link wxid_bob -1007778", reply=reply))
+        self.assertIn("是当前话题群", replies[-1])
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/link wxid_bob -1007779", reply=reply))
+        self.assertIn("开启了「话题」", replies[-1])
+        await self.b.on_bot_command(SimpleNamespace(raw_text="/link wxid_bob -1008888", reply=reply))
+        self.assertIn("已绑定", replies[-1])
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob"), (-1008888, 0))
+        self.assertEqual(self.b.bot.sent[-1].chat, -1008888)
+
+        # 6) Official account linked to a standalone group overrides oa_forum_chat; /unlink returns it.
+        self.b.oa_forum_chat = OA_FORUM
+        await self.b.on_forum_message(forum_event(-604, 9508, "/link gh_news", is_forum=False))
+        self.assertEqual(self.b._dest_for_thread("gh_news"), (-604, None))
+        self.daemon.add_message("oa1", "gh_news", "oa in group")
+        await self.event("oa1", "gh_news")
+        self.assertEqual((self.b.bot.sent[-1].chat, self.b.bot.sent[-1].kwargs.get("reply_to")), (-604, None))
+        await self.b.on_forum_message(forum_event(-604, 9509, "/unlink", is_forum=False))
+        self.daemon.add_message("oa2", "gh_news", "oa back to oa forum")
+        await self.event("oa2", "gh_news")
+        self.assertEqual(self.b.store.topic_for_thread("gh_news")[0], OA_FORUM)
+
+        # 7) Re-linking wxid_bob into a forum topic unbinds standalone group -1008888.
+        await self.b.on_forum_message(forum_event(-1007778, 9510, "/link wxid_bob", topic=888))
+        self.assertEqual(self.b.store.topic_for_thread("wxid_bob"), (-1007778, 888))
+        self.assertIsNone(self.b.store.thread_for_topic_group(-1008888))
+
+        # 8) Switching back to groups mode ignores topics-mode standalone groups and keeps `threads` bindings intact.
+        self.b.store.link_topic_group("wxid_carol", -605, "Carol Topic-Mode Group")
+        self.b.store.link("wxid_carol", -501, "Carol Groups-Mode Group")
+        cfg_g = Config(WeChatConfig(token="secret-token"), TelegramConfig(api_id=1, api_hash="x", bot_token="y"),
+                       BridgeConfig(mode="groups", create_interval_seconds=0, official_accounts_forum_chat=OA_FORUM),
+                       Path(self.tmp.name) / "config.toml")
+        gb = Bridge(cfg_g)
+        try:
+            self.assertEqual(gb._dest_for_thread("wxid_carol"), (-501, None))
+            self.assertEqual(dict((w, dst) for w, _, dst in gb._link_rows()).get("wxid_carol"), "-501")
+        finally:
+            await gb.close()
+            gb.store.db.close()
 
 
 OA_FORUM = -1009000000002

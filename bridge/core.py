@@ -160,12 +160,13 @@ GROUP_HELP = (
 
 TOPIC_HELP = (
     "<b>微信 ↔ Telegram 桥接指南（话题模式）</b>\n\n"
-    "所有微信会话都在一个话题群里，每个会话对应一个话题：在话题里发消息即发送到微信，"
-    "<b>回复</b>消息即微信引用回复。\n\n"
+    "默认所有微信会话都在一个话题群里，每个会话对应一个话题；也可以按需把某个会话单独绑定到新建的普通 Telegram 群："
+    "在话题或独立群里发消息即发送到微信，<b>回复</b>消息即微信引用回复。\n\n"
     "<b>私聊命令</b>\n"
     "• <code>/find</code> [关键词] — 搜索微信联系人/群（不填显示最近会话，点按钮直接打开）\n"
     "• <code>/open</code> [关键词] — 为微信联系人/群新建话题并主动发起聊天\n"
     "• <code>/chats</code> [关键词] — 查看已连接的会话列表（别名 <code>/list</code>）\n"
+    "• <code>/link</code> 微信ID TG群ID — 把指定微信会话直接绑定到独立群（也可直接在群/话题里发 <code>/link</code>）\n"
     "• <code>/requests</code> — 查看待处理的微信好友请求，一键通过\n"
     "• <code>/add</code> 微信号 [验证消息] — 按微信号添加微信好友\n"
     "• <code>/newgroup</code> 关键词 关键词 [| 群名] — 勾选好友新建微信群\n"
@@ -173,11 +174,11 @@ TOPIC_HELP = (
     "• <code>/status</code> — 查看运行状态与微信登录态\n"
     "• <code>/wxlogin</code> — 重新登录微信（支持手机确认或扫码）\n"
     "• <code>/help</code> — 显示这份帮助\n\n"
-    "<b>话题群内命令</b>\n"
+    "<b>话题群 / 独立群内命令</b>\n"
     "• <code>/forum</code> — 把当前群设为桥接话题群（需先开启话题，并把我设为管理员）\n"
     "• <code>/oaforum</code> — 把当前话题群设为公众号/服务号专用话题群（<code>/oaforum off</code> 取消）\n"
-    "• <code>/link</code> [关键词] — 在某个话题里发，把该话题绑定到微信会话\n"
-    "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
+    "• <code>/link</code> [关键词] — 在话题里发可绑定该话题；在新建的普通群里发可按需绑定为独立群（原话题自动解绑并保留历史）\n"
+    "• <code>/wx</code> — 查看当前话题/群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
     "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
@@ -187,13 +188,15 @@ TOPIC_HELP = (
     "• <code>/groupname</code> 新群名 · <code>/myname</code> 昵称 — 改微信群名 / 我的群昵称\n"
     "• <code>/mute</code> · <code>/unmute</code> — 开启/关闭微信消息免打扰；<code>/leave</code> — 退出微信群\n"
     "• <code>/recall</code> — 回复自己发的消息撤回微信消息（2 分钟内）\n"
-    "• <code>/rename</code> — 同步微信备注/群名为话题标题（别名 <code>/title</code>）\n"
-    "• <code>/unlink</code> — 解除当前话题与微信会话的绑定\n"
+    "• <code>/avatar</code> — 在独立群里同步微信头像为群头像（需管理员改群信息权限）\n"
+    "• <code>/rename</code> — 同步微信备注/群名为话题或群标题（别名 <code>/title</code>）\n"
+    "• <code>/unlink</code> — 解除当前话题或独立群与微信会话的绑定（独立群解绑后自动回到话题群）\n"
     "• <code>/help</code> — 显示群内帮助\n\n"
     "<b>常用技巧</b>\n"
-    "• 话题内发送 <code>@成员名</code> 或 <code>@所有人</code> 可触发微信 @ 提醒\n"
+    "• 话题或群内发送 <code>@成员名</code> 或 <code>@所有人</code> 可触发微信 @ 提醒\n"
     "• 回复 <code>/recall</code> 可撤回微信消息（2 分钟内有效）\n"
     "• 以 <code>//</code> 开头的内容仅留在 Telegram，不会发到微信\n"
+    "• 想把重要聊天单独拎出成独立群：新建未开启话题的普通群，拉我进群并设为管理员，在群里发 <code>/link</code> 即可\n"
     "• 收到微信好友请求会推送到私聊，可直接通过"
 )
 
@@ -210,7 +213,7 @@ TOPIC_GROUP_HELP = (
     "• <code>/mute</code> · <code>/unmute</code> — 微信免打扰；<code>/leave</code> — 退出微信群\n"
     "• <code>/recall</code> — 回复自己发的消息以撤回微信消息（2 分钟内）\n"
     "• <code>/rename</code> — 同步最新微信备注/群名为话题标题（别名 <code>/title</code>）\n"
-    "• <code>/link</code> [关键词] — 把当前话题绑定（或改绑）到微信会话\n"
+    "• <code>/link</code> [关键词] — 把当前话题绑定（或改绑）到微信会话；在普通群里发可绑定为独立群\n"
     "• <code>/unlink</code> — 解除当前话题与微信会话的绑定\n"
     "• <code>/forum</code> — 把当前群设为桥接话题群\n"
     "• <code>/oaforum</code> — 把当前群设为公众号/服务号专用话题群（<code>/oaforum off</code> 取消）\n"
@@ -295,9 +298,9 @@ TOPIC_GROUP_BOT_COMMANDS = [
     ("unmute", "关闭微信消息免打扰"),
     ("leave", "退出微信群"),
     ("recall", "回复消息以撤回微信消息"),
-    ("rename", "同步最新微信名称到话题标题"),
-    ("link", "绑定或切换当前话题对应的微信会话"),
-    ("unlink", "解除当前话题与微信的绑定"),
+    ("rename", "同步最新微信名称到群/话题标题"),
+    ("link", "绑定或切换当前群/话题对应的微信会话"),
+    ("unlink", "解除当前群/话题与微信的绑定"),
     ("forum", "把当前群设为桥接话题群"),
     ("oaforum", "把当前群设为公众号/服务号专用话题群"),
     ("help", "查看群内命令帮助"),
@@ -976,6 +979,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.bot.add_event_handler(self.on_forum_message, events.NewMessage(
             incoming=True, func=lambda e: not e.is_private and e.sender_id == self.owner_id))
         self.bot.add_event_handler(self.on_tg_delete, events.MessageDeleted())
+        self.bot.add_event_handler(self.on_raw_update, events.Raw(types.UpdateNewMessage))
         if not self.forum_chat:
             await self.notify(forum_setup_text(self.bot_me.username), parse_mode="html")
         await self.wechat_side()
@@ -1251,18 +1255,26 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         """True when this WeChat thread should be created/resolved as a forum topic."""
         return self.topics or (_is_official_account(thread) and bool(self.oa_forum_chat))
 
+    def _thread_noun(self, tid: str, thread: dict | str | None = None) -> str:
+        """'话题' or '群' for this WeChat thread (follows its active binding if linked, else default)."""
+        if (dest := self._dest_for_thread(tid)) is not None:
+            return "话题" if dest[1] is not None else "群"
+        return "话题" if self._uses_topic_for_thread(thread if thread is not None else tid) else "群"
+
     def _dest_for_thread(self, tid: str) -> tuple[int, int | None] | None:
         """(chat, topic) a WeChat thread is bridged to; topic is None for standalone Telegram groups."""
         dest = self.store.topic_for_thread(tid)
         if self.topics:
             if not dest:
                 return None
+            if dest[1] == 0:
+                return None if self._is_forum_chat(dest[0]) else (dest[0], None)
             if _is_official_account(tid) and self.oa_forum_chat:
                 return dest if dest[0] == self.oa_forum_chat else None
             if self.oa_forum_chat and dest[0] == self.oa_forum_chat:
                 return dest
             return dest if self.forum_chat and dest[0] == self.forum_chat else None
-        if self.oa_forum_chat and dest and dest[0] == self.oa_forum_chat:
+        if self.oa_forum_chat and dest and dest[0] == self.oa_forum_chat and dest[1] > 0:
             return dest
         if self.oa_forum_chat and _is_official_account(tid):
             return None
@@ -1274,7 +1286,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if not self._is_forum_chat(chat):
             return None
         dest = self.store.topic_for_thread(tid)
-        return dest[1] if dest and dest[0] == chat else None
+        return dest[1] if dest and dest[0] == chat and dest[1] > 0 else None
 
     def _thread_for_event(self, event) -> str | None:
         if self._is_forum_chat(event.chat_id):
@@ -1283,12 +1295,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 return None
             return self.store.thread_for_topic(event.chat_id, topic)
         if self.topics:
-            return None
+            return self.store.thread_for_topic_group(event.chat_id)
         return self.store.thread_for_chat(event.chat_id)
 
     def _unlink_thread(self, tid: str, chat_id: int | None = None) -> None:
         if chat_id is not None:
-            if self._is_forum_chat(chat_id):
+            if self.topics or self._is_forum_chat(chat_id):
                 self.store.unlink_topic(tid)
             else:
                 self.store.unlink(tid)
@@ -1308,7 +1320,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 if wx not in seen:
                     seen.add(wx)
                     rows.append((wx, title, f"{forum}#{topic}"))
-        if not self.topics:
+        if self.topics:
+            for wx, chat, title, _ in self.store.list_topic_groups():
+                if wx not in seen and not self._is_forum_chat(chat):
+                    seen.add(wx)
+                    rows.append((wx, title, str(chat)))
+        else:
             for wx, chat, title, _ in self.store.list_threads():
                 if wx not in seen and not (self.oa_forum_chat and _is_official_account(wx)):
                     seen.add(wx)
@@ -1334,6 +1351,18 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             return False
         if not _dead_chat(e):
             return False
+        if self.topics:
+            log.warning("Standalone Telegram group %s for %s is gone (%s); falling back to topic",
+                        chat, thread["id"], e)
+            self.store.unlink_topic(thread["id"])
+            self.store.forget_messages(chat, thread["id"])
+            name = thread.get("displayName") or thread["id"]
+            await self.notify(
+                f"⚠️ 独立群 <code>{chat}</code>（{_esc(name)}）无法发送消息（{_esc(type(e).__name__)}），"
+                "已解除独立群绑定并退回话题群。如需继续使用独立群，请确认我在群里后再发 <code>/link</code>。",
+                parse_mode="html",
+            )
+            return True
         log.warning("Telegram group %s for %s is gone (%s); creating a new one", chat, thread["id"], e)
         self.store.unlink(thread["id"])
         return True
@@ -1376,13 +1405,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
     async def _ensure_topic(self, thread: dict) -> int | None:
         tid = thread["id"]
-        forum = self._target_forum(thread)
-        if (dest := self.store.topic_for_thread(tid)) is not None and forum and dest[0] == forum:
+        if (dest := self._dest_for_thread(tid)) is not None:
             return dest[0]
         async with self.create_lock:
-            forum = self._target_forum(thread)
-            if (dest := self.store.topic_for_thread(tid)) is not None and forum and dest[0] == forum:
+            if (dest := self._dest_for_thread(tid)) is not None:
                 return dest[0]
+            forum = self._target_forum(thread)
             if not forum:
                 await self._forum_problem("还没有设置话题群：请在开启了「话题」的群里把我设为管理员，然后在群里发送 /forum。")
                 return None
@@ -1401,9 +1429,13 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         return forum
 
     async def ensure_chat(self, thread: dict) -> int | None:
+        tid = thread["id"]
+        if self.topics:
+            if (dest := self._dest_for_thread(tid)) is not None:
+                return dest[0]
+            return await self._ensure_topic(thread)
         if self._uses_topic_for_thread(thread):
             return await self._ensure_topic(thread)
-        tid = thread["id"]
         if (chat := self.store.chat_for_thread(tid)) is not None:
             return chat
         async with self.create_lock:
@@ -1437,13 +1469,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 log.info("No WeChat avatar for %s: %s", thread_id, why)
                 return why
             data = await asyncio.to_thread(_avatar_photo, data)
-            f = await self.user.upload_file(io.BytesIO(data), file_name="avatar.jpg")
+            client = self.bot if self.topics else self.user
+            f = await client.upload_file(io.BytesIO(data), file_name="avatar.jpg")
             peer = utils.resolve_id(chat_id)[0]
             if chat_id < -1000000000000:  # upgraded to a supergroup
-                await self.user(functions.channels.EditPhotoRequest(
-                    channel=await self.user.get_input_entity(chat_id), photo=types.InputChatUploadedPhoto(file=f)))
+                await client(functions.channels.EditPhotoRequest(
+                    channel=await client.get_input_entity(chat_id), photo=types.InputChatUploadedPhoto(file=f)))
             else:
-                await self.user(functions.messages.EditChatPhotoRequest(
+                await client(functions.messages.EditChatPhotoRequest(
                     chat_id=peer, photo=types.InputChatUploadedPhoto(file=f)))
             return ""
         except Exception as e:
@@ -1474,17 +1507,19 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     return title, "unchanged"
                 self.store.update_topic_title(thread_id, title)
                 return title, ""
+            client = self.bot if self.topics else self.user
+            save_title = self.store.update_topic_title if self.topics else self.store.update_title
             try:
                 if chat_id < -1000000000000:
-                    await self.user(functions.channels.EditTitleRequest(
-                        channel=await self.user.get_input_entity(chat_id), title=title))
+                    await client(functions.channels.EditTitleRequest(
+                        channel=await client.get_input_entity(chat_id), title=title))
                 else:
-                    await self.user(functions.messages.EditChatTitleRequest(
+                    await client(functions.messages.EditChatTitleRequest(
                         chat_id=utils.resolve_id(chat_id)[0], title=title))
             except errors.ChatNotModifiedError:
-                self.store.update_title(thread_id, title)
+                save_title(thread_id, title)
                 return title, "unchanged"
-            self.store.update_title(thread_id, title)
+            save_title(thread_id, title)
             return title, ""
         except Exception as e:
             log.info("Could not sync group title for %s: %s", thread_id, e)
@@ -1788,7 +1823,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             self.store.map_message(chat, "bot", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
             if chat < -1000000000000:
                 self.store.map_message(chat, "user", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
-            self._pair(chat, _fingerprint(m), bot=(msg["threadId"], msg["id"], msg.get("serverId")))
+            if not self.topics:
+                self._pair(chat, _fingerprint(m), bot=(msg["threadId"], msg["id"], msg.get("serverId")))
         self.forwarded += 1
 
     # --- pairing the two views of a bridged message ----------------------
@@ -1846,7 +1882,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     async def _bot_reply_id(self, chat_id: int, user_msg_id: int | None, *, wait: bool = True) -> int | None:
         if user_msg_id is None:
             return None
-        if chat_id < -1000000000000:
+        if self.topics or chat_id < -1000000000000:
             return user_msg_id
         key = (chat_id, user_msg_id)
         if (bid := self._user_to_bot_msg.get(key)) is not None:
@@ -3093,7 +3129,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     # Telegram -> WeChat
     # ======================================================================
     async def on_forum_message(self, event) -> None:
-        """Forum supergroups (topics mode, or the dedicated official-accounts forum): messages from owner."""
+        """Group messages received by the bot from owner (topics mode: forums and standalone groups;
+        groups mode: dedicated official-accounts forum and /oaforum)."""
         msg = event.message
         if msg.action or msg.via_bot_id:
             return
@@ -3109,14 +3146,31 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if cmd_name == "/oaforum":
             await self._set_oa_forum(event, arg.strip())
             return
-        if not self._is_forum_chat(event.chat_id):
+        is_forum = self._is_forum_chat(event.chat_id)
+        if not is_forum and not self.topics:
             return
         if self._thread_for_event(event) is not None:
             await self.on_tg_message(event)
             return
-        # The General topic, or a topic not bound to a WeChat chat: only a few commands do anything.
         if not cmd_name:
             return
+        if not is_forum:
+            # Unlinked non-forum group in topics mode: allow on-demand /link into a standalone group.
+            if cmd_name == "/link":
+                try:
+                    chat = await event.get_chat() if hasattr(event, "get_chat") else getattr(event, "chat", None)
+                except Exception:
+                    chat = None
+                if getattr(chat, "forum", False):
+                    await self._send_group_notice(
+                        event.chat_id, msg.id,
+                        "这个群开启了「话题」，但还不是当前话题群。\n"
+                        "• 要把它设为话题群，请先发送 <code>/forum</code>（公众号专用群发 <code>/oaforum</code>）；\n"
+                        "• 要把单个微信会话绑定到独立群，请在<b>未开启话题</b>的普通群里发送 <code>/link</code>。")
+                    return
+                await self._handle_group_link(event, arg.strip())
+            return
+        # The General topic, or a topic not bound to a WeChat chat: only a few commands do anything.
         topic = _msg_topic(msg)
         if cmd_name == "/link":
             if topic is None:
@@ -3161,7 +3215,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 "这个群还没有开启「话题」：请在群设置中开启话题（Topics），"
                 "并把我设为管理员、勾选「管理话题」权限，然后再发 <code>/oaforum</code>。")
             return
-        if not self.topics and self.store.thread_for_chat(chat_id) is not None:
+        bound = self.store.thread_for_topic_group(chat_id) if self.topics else self.store.thread_for_chat(chat_id)
+        if bound is not None:
             await self._send_group_notice(
                 chat_id, msg_id,
                 "这个群当前已绑定到一个普通微信会话。请新建一个专用的话题群（或先发送 <code>/unlink</code> 解绑），"
@@ -3199,6 +3254,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 "这个群还没有开启「话题」：请在群设置中开启话题（Topics），"
                 "并把我设为管理员、勾选「管理话题」权限，然后再发 <code>/forum</code>。")
             return
+        if self.store.thread_for_topic_group(chat_id) is not None:
+            await self._send_group_notice(
+                chat_id, msg_id,
+                "这个群当前已绑定到一个普通微信会话。请新建一个专用的话题群（或先发送 <code>/unlink</code> 解绑），"
+                "再发送 <code>/forum</code>。")
+            return
         fixed = self.cfg.bridge.forum_chat
         if fixed and fixed != chat_id:
             await self._send_group_notice(
@@ -3226,10 +3287,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             return
         is_topic = self._is_forum_chat(chat_id)
         noun = "话题" if is_topic else "群"
+        tg_side = "bot" if self.topics else "user"
         text = msg.message or ""
         if text.startswith("//"):
             return
-        self._pair_tg_user_msg(chat_id, _tg_msg_fingerprint(msg), user_id=msg.id)
+        if not self.topics:
+            self._pair_tg_user_msg(chat_id, _tg_msg_fingerprint(msg), user_id=msg.id)
         cmd, _, arg = text.strip().partition(" ")
         cmd_name, _, at_bot = cmd.partition("@")
         if not at_bot or at_bot.lower() == self.bot_me.username.lower():
@@ -3286,9 +3349,10 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 return
             if cmd_name == "/unlink":
                 self._unlink_thread(thread_id, chat_id)
+                extra = "之后新消息将自动回到话题群。" if (self.topics and not is_topic) else ""
                 await self.bot.send_message(
                     chat_id,
-                    f"已解除当前{noun}与微信会话 <code>{_esc(thread_id)}</code> 的绑定。",
+                    f"已解除当前{noun}与微信会话 <code>{_esc(thread_id)}</code> 的绑定。{extra}",
                     parse_mode="html", reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
             if cmd_name == "/link":
@@ -3311,7 +3375,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     await self.bot.send_message(chat_id, "请回复你要撤回的那条消息再发送 /recall",
                                                 reply_to=await self._bot_reply_id(chat_id, msg.id))
                     return
-                hit = self.store.wx_for_tg(chat_id, reply_id)
+                hit = self.store.wx_for_tg(chat_id, reply_id, side=tg_side)
                 if not hit:
                     await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id),
                                        "找不到这条消息对应的微信记录")
@@ -3330,7 +3394,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
         quote_ref = None
         if reply_id := _reply_target(msg):
-            if entry := self.store.wx_entry_for_tg(chat_id, reply_id):
+            if entry := self.store.wx_entry_for_tg(chat_id, reply_id, side=tg_side):
                 r_thread, r_wx_msg, r_server = entry
                 if r_thread == thread_id and r_server:
                     if not r_wx_msg:
@@ -3469,6 +3533,11 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
     def _map_tg_wx(self, chat_id: int, tg_msg: int, thread_id: str, wx_msg: str | None,
                    wx_server: str | None) -> None:
+        if self.topics:
+            self.store.map_message(chat_id, "bot", tg_msg, thread_id, wx_msg, wx_server)
+            if chat_id < -1000000000000:
+                self.store.map_message(chat_id, "user", tg_msg, thread_id, wx_msg, wx_server)
+            return
         self.store.map_message(chat_id, "user", tg_msg, thread_id, wx_msg, wx_server)
         bot_msg = tg_msg if chat_id < -1000000000000 else self._user_to_bot_msg.get((chat_id, tg_msg))
         if bot_msg is not None:
@@ -3489,6 +3558,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             self.store.add_sent(thread_id, server)
         # One Telegram message may become two WeChat sends (media + caption); quotes point at the first.
         if server or local:
+            if self.topics:
+                if self.store.wx_for_tg(chat_id, tg_msg, side="bot") is None:
+                    self.store.map_message(chat_id, "bot", tg_msg, thread_id, local, server)
+                if chat_id < -1000000000000 and self.store.wx_for_tg(chat_id, tg_msg, side="user") is None:
+                    self.store.map_message(chat_id, "user", tg_msg, thread_id, local, server)
+                return
             if self.store.wx_for_tg(chat_id, tg_msg) is None:
                 self.store.map_message(chat_id, "user", tg_msg, thread_id, local, server)
             bot_msg = tg_msg if chat_id < -1000000000000 else self._user_to_bot_msg.get((chat_id, tg_msg))
@@ -3634,7 +3709,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if len(deleted) != 1:
             return
         tg_msg = deleted[0]
-        row = self.store.lookup_tg_delete(getattr(event, "chat_id", None), tg_msg)
+        row = self.store.lookup_tg_delete(getattr(event, "chat_id", None), tg_msg,
+                                          side="bot" if self.topics else "user")
         if not row:
             return
         chat_id, thread_id, wx_msg, wx_server = row
@@ -3672,7 +3748,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if isinstance(m, types.MessageService) and isinstance(m.action, types.MessageActionChatMigrateTo):
             old = utils.get_peer_id(m.peer_id)
             new = utils.get_peer_id(types.PeerChannel(m.action.channel_id))
-            if self.store.thread_for_chat(old):
+            if self.store.thread_for_chat(old) or self.store.thread_for_topic_group(old):
                 self.store.migrate_chat(old, new)
                 log.info("Telegram group %s was upgraded to supergroup %s", old, new)
 
@@ -3841,6 +3917,32 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if cmd_name.lower() == "/link":
             await self._handle_group_link(event, arg.strip())
 
+    async def _bot_group_read_warning(self, chat_id: int) -> str:
+        """In topics mode standalone groups, warn if the bot cannot read regular messages (privacy mode on & not admin)."""
+        if not self.topics or self._is_forum_chat(chat_id):
+            return ""
+        if getattr(self.bot_me, "bot_chat_history", False):
+            return ""
+        get_perms = getattr(self.bot, "get_permissions", None)
+        if not callable(get_perms):
+            return ""
+        try:
+            perm = await get_perms(chat_id, self.bot_me)
+        except Exception:
+            return ""
+        if getattr(perm, "is_admin", False):
+            return ""
+        return (f"\n\n⚠️ 请把 @{_esc(self.bot_me.username)} 设为本群<b>管理员</b>"
+                "（或在 @BotFather 关闭群隐私模式），否则群里发送的普通消息不会转发到微信。")
+
+    async def _standalone_link_notes(self, chat_id: int, moved_from_topic: bool, *, check_perm: bool = True) -> str:
+        notes = ""
+        if moved_from_topic:
+            notes += "\n（已解除原话题绑定并保留历史；之后在本群发 <code>/unlink</code> 可回到话题群。）"
+        if check_perm:
+            notes += await self._bot_group_read_warning(chat_id)
+        return notes
+
     async def _handle_group_link(self, event, arg: str) -> None:
         chat_id = event.chat_id
         msg_id = event.message.id
@@ -3861,11 +3963,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if arg and " " not in arg:
             exact = next((c for c in cands if c["id"] == arg), None)
             if exact:
+                prev = self._dest_for_thread(exact["id"])
+                moved_from_topic = self.topics and not is_forum and prev is not None and prev[1] is not None
                 wx_title, _ = await self._complete_link(exact["id"], chat_id, exact["name"], notify_group=False,
                                                         tg_topic=topic)
+                notes = await self._standalone_link_notes(chat_id, moved_from_topic) if (self.topics and not is_forum) else ""
                 await self._send_group_notice(
                     chat_id, msg_id,
-                    f"✅ 已将当前{noun}绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(exact['id'])}</code>")
+                    f"✅ 已将当前{noun}绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(exact['id'])}</code>{notes}")
                 return
         if not cands:
             hint = (f"没有找到匹配「{_esc(arg)}」的微信联系人或群。" if arg
@@ -3895,6 +4000,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         title = title or wx_id
         if tg_topic and self._is_forum_chat(tg_chat):
             self.store.link_topic(wx_id, tg_chat, tg_topic, title)
+        elif self.topics:
+            self.store.link_topic_group(wx_id, tg_chat, title)
         else:
             self.store.link(wx_id, tg_chat, title)
         bot_ok = True
@@ -3974,7 +4081,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 thread = {"id": wx_id, "kind": payload.get("kind", "direct"),
                           "displayName": payload.get("name") or wx_id,
                           "classification": payload.get("classification")}
-            noun = "话题" if self._uses_topic_for_thread(thread) else "群"
+            noun = self._thread_noun(wx_id, thread)
             if await self.ensure_chat(thread) is None:
                 await self._edit_ui_msg(event, f"⚠️ 无法建立 Telegram {noun}，请查看我刚发的提示。")
                 await event.answer()
@@ -4026,12 +4133,22 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             tg_chat = payload["tg_chat"]
             tg_title = payload.get("tg_title") or str(tg_chat)
             in_group = bool(payload.get("in_group"))
+            tg_topic = payload.get("tg_topic")
+            if tg_topic is None and self._is_forum_chat(tg_chat):
+                await self._edit_ui_msg(event, "⚠️ 这是当前话题群，请在其中的某个话题里发送 <code>/link</code>。")
+                await event.answer()
+                return
+            prev = self._dest_for_thread(wx_id)
+            moved_from_topic = self.topics and not tg_topic and prev is not None and prev[1] is not None
             wx_title, bot_ok = await self._complete_link(wx_id, tg_chat, wx_name, notify_group=not in_group,
-                                                         tg_topic=payload.get("tg_topic"))
+                                                         tg_topic=tg_topic)
+            notes = await self._standalone_link_notes(
+                tg_chat, moved_from_topic, check_perm=bot_ok) if (self.topics and not tg_topic) else ""
             if in_group:
-                text = f"✅ 已将当前{'话题' if payload.get('tg_topic') else '群'}绑定到微信会话：<b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>"
+                text = (f"✅ 已将当前{'话题' if tg_topic else '群'}绑定到微信会话：<b>{_esc(wx_title)}</b>\n"
+                        f"<code>{_esc(wx_id)}</code>{notes}")
             else:
-                text = f"✅ 已绑定：<b>{_esc(tg_title)}</b> ↔ <b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>"
+                text = f"✅ 已绑定：<b>{_esc(tg_title)}</b> ↔ <b>{_esc(wx_title)}</b>\n<code>{_esc(wx_id)}</code>{notes}"
                 if not bot_ok:
                     text += f"\n\n⚠️ 机器人暂未进入该群，请把 @{_esc(self.bot_me.username)} 拉进「{_esc(tg_title)}」后再使用。"
             await self._edit_ui_msg(event, text)
@@ -4056,6 +4173,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 if self.topics:
                     forum = f"<code>{self.forum_chat}</code>" if self.forum_chat else "未设置（在群里发 /forum）"
                     mode = f"\n模式：话题群 {forum}"
+                    standalone = sum(1 for _, c, _, _ in self.store.list_topic_groups() if not self._is_forum_chat(c))
+                    if standalone:
+                        mode += f"（另含 {standalone} 个独立群）"
                 if self.oa_forum_chat:
                     oa_note = "" if self.cfg.bridge.bridge_official_accounts else "（未开启 bridge_official_accounts）"
                     mode += f"\n公众号话题群：<code>{self.oa_forum_chat}</code>{oa_note}"
@@ -4085,9 +4205,51 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 suffix = f"\n\n共 {len(rows)} 个会话（仅显示前 40 个）" if len(rows) > 40 else f"\n\n共 {len(rows)} 个会话"
                 await event.reply("\n".join(lines) + suffix, parse_mode="html")
             elif cmd == "/link" and self.topics:
+                parts = arg.split()
+                if len(parts) == 2:
+                    try:
+                        tg_chat = int(parts[1])
+                    except ValueError:
+                        tg_chat = None
+                    if tg_chat is not None:
+                        wx_id = parts[0]
+                        if tg_chat >= 0:
+                            return await event.reply(
+                                "TG 群 ID 应为负数（普通群如 <code>-123456</code>，超级群如 <code>-1001234567890</code>）。",
+                                parse_mode="html")
+                        if self._is_forum_chat(tg_chat):
+                            return await event.reply(
+                                f"<code>{tg_chat}</code> 是当前话题群，不能直接绑定整个群；"
+                                f"请打开其中的某个话题，在话题里发送 <code>/link {_esc(wx_id)}</code>。",
+                                parse_mode="html")
+                        get_entity = getattr(self.bot, "get_entity", None)
+                        if callable(get_entity):
+                            try:
+                                ent = await get_entity(tg_chat)
+                            except Exception:
+                                ent = None
+                            if getattr(ent, "forum", False):
+                                return await event.reply(
+                                    f"<code>{tg_chat}</code> 开启了「话题」，不能绑定为独立普通群；"
+                                    "请改用未开启话题的普通群，或先在该群发送 <code>/forum</code>。",
+                                    parse_mode="html")
+                        prev = self._dest_for_thread(wx_id)
+                        moved_from_topic = prev is not None and prev[1] is not None
+                        wx_title, bot_ok = await self._complete_link(wx_id, tg_chat, notify_group=True)
+                        notes = await self._standalone_link_notes(tg_chat, moved_from_topic, check_perm=bot_ok)
+                        text = f"✅ 已绑定：<b>{_esc(wx_title)}</b> (<code>{_esc(wx_id)}</code> ↔ <code>{tg_chat}</code>){notes}"
+                        if not bot_ok:
+                            text += (f"\n\n⚠️ 机器人暂时无法在该群发消息，请先把 @{_esc(self.bot_me.username)} "
+                                     "拉进群并设为管理员。")
+                        await event.reply(text, parse_mode="html")
+                        return
                 await event.reply(
-                    "话题模式下请在话题群里操作：打开要绑定的话题，在话题里发送 <code>/link</code> [关键词]。\n"
-                    "想为某个微信会话新建话题，直接发 <code>/open</code> [关键词]。", parse_mode="html")
+                    "<b>话题模式下的绑定方式</b>\n\n"
+                    f"• <b>绑定到独立新群</b>：新建一个<b>未开启话题</b>的 Telegram 群，把 @{_esc(self.bot_me.username)} "
+                    "拉进群并设为管理员，在群里发送 <code>/link</code> [关键词]（也可在这里直接发 <code>/link 微信ID TG群ID</code>）。\n"
+                    "• <b>绑定到话题群的话题</b>：打开要绑定的话题，在话题里发送 <code>/link</code> [关键词]。\n"
+                    "• <b>新建话题</b>：直接发 <code>/open</code> [关键词]。",
+                    parse_mode="html")
             elif cmd == "/link":
                 parts = arg.split()
                 if len(parts) == 2:
@@ -4151,14 +4313,16 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 lines = []
                 for c in cands:
                     icon = "👥" if c["kind"] == "group" else ("📰" if _is_official_account(c) else "👤")
-                    item_noun = "话题" if self._uses_topic_for_thread(c) else "群"
-                    tag = f"（已建{item_noun}）" if self._dest_for_thread(c["id"]) is not None else ""
+                    item_noun = self._thread_noun(c["id"], c)
+                    has_chat = self._dest_for_thread(c["id"]) is not None
+                    tag = (f"（已绑{item_noun}）" if (has_chat and self.topics and item_noun == "群")
+                           else f"（已建{item_noun}）" if has_chat else "")
                     if c.get("relation") == "non_contact":
                         tag += "（非好友）"
                     lines.append(f"{icon} <b>{_esc(c['name'])}</b>{tag} — <code>{_esc(c['id'])}</code>")
                 buttons = []
                 for c in cands[:8]:
-                    item_noun = "话题" if self._uses_topic_for_thread(c) else "群"
+                    item_noun = self._thread_noun(c["id"], c)
                     has_chat = self._dest_for_thread(c["id"]) is not None
                     lbl = f"{'💬 打开' if has_chat else f'➕ 建{item_noun}'}：{c['name'][:22]}"
                     tok = self._make_ui_token({
@@ -4229,7 +4393,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         return await event.reply(
                             f"找到多个匹配「<b>{_esc(arg)}</b>」的会话，请点选：",
                             parse_mode="html", buttons=buttons)
-                target_noun = "话题" if self._uses_topic_for_thread(thread) else "群"
+                target_noun = self._thread_noun(thread["id"], thread)
                 existed = self._dest_for_thread(thread["id"]) is not None
                 if await self.ensure_chat(thread) is None:
                     return await event.reply(f"⚠️ 无法建立 Telegram {target_noun}，请查看我刚发的提示。")

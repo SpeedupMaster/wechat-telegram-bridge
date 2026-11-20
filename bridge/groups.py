@@ -318,7 +318,7 @@ class GroupsMixin:
                 title = g.get("name") or g.get("displayName") or room
             except WeChatError:
                 title = room
-        noun = "话题" if self.topics else "群"
+        noun = self._thread_noun(room)
         buttons = [[
             Button.inline("🚪 确认退出", self._make_ui_token(
                 {"action": "gp_leave", "room": room, "title": title, "key": f"grp-leave-{secrets.token_hex(8)}"})),
@@ -662,7 +662,7 @@ class GroupsMixin:
         status, detail = op_outcome(op)
         title = p.get("title") or p["room"]
         if status == "ok":
-            noun = "话题" if self.topics else "群"
+            noun = self._thread_noun(p["room"])
             buttons = None
             if self._dest_for_thread(p["room"]) is not None:
                 buttons = [[Button.inline(f"🔗 同时解除 Telegram {noun}绑定", self._make_ui_token(
@@ -676,8 +676,8 @@ class GroupsMixin:
 
     async def _ui_unlink(self, event, p: dict) -> None:
         await event.answer()
+        noun = self._thread_noun(p["room"])
         self._unlink_thread(p["room"])
-        noun = "话题" if self.topics else "群"
         await self._edit_ui_msg(event, f"🚪 已退出微信群 <b>{_esc(p.get('title'))}</b>，并解除了 Telegram {noun}绑定。")
 
     async def _ui_check(self, event, p: dict) -> None:

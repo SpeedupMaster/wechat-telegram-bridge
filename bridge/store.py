@@ -13,8 +13,9 @@ CREATE TABLE IF NOT EXISTS threads (
     title      TEXT,
     created_at INTEGER NOT NULL
 );
--- Topics mode: WeChat thread <-> topic in a forum supergroup (kept apart from `threads`, so
--- switching modes keeps both sets of bindings). tg_topic = id of the topic's first message.
+-- Topics mode: WeChat thread <-> topic in a forum supergroup (or an on-demand standalone group
+-- with tg_topic = 0), kept apart from `threads`, so switching modes keeps both sets of bindings.
+-- tg_topic = id of the topic's first message, or 0 for a standalone group linked in topics mode.
 CREATE TABLE IF NOT EXISTS topics (
     wx_thread  TEXT PRIMARY KEY,
     tg_chat    INTEGER NOT NULL,
@@ -80,6 +81,7 @@ class Store:
 
     def migrate_chat(self, old_chat: int, new_chat: int) -> None:
         self.db.execute("UPDATE threads SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
+        self.db.execute("UPDATE topics SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
         self.db.execute("UPDATE msgmap SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
 
     def linked_chats(self) -> set[int]:
@@ -103,19 +105,30 @@ class Store:
                               (tg_chat, tg_topic)).fetchone()
         return row[0] if row else None
 
+    def thread_for_topic_group(self, tg_chat: int) -> str | None:
+        return self.thread_for_topic(tg_chat, 0)
+
     def link_topic(self, wx_thread: str, tg_chat: int, tg_topic: int, title: str) -> None:
         self.db.execute("DELETE FROM topics WHERE wx_thread=? OR (tg_chat=? AND tg_topic=?)",
                         (wx_thread, tg_chat, tg_topic))
         self.db.execute("INSERT INTO topics(wx_thread,tg_chat,tg_topic,title,created_at) VALUES(?,?,?,?,?)",
                         (wx_thread, tg_chat, tg_topic, title, int(time.time())))
 
+    def link_topic_group(self, wx_thread: str, tg_chat: int, title: str) -> None:
+        self.link_topic(wx_thread, tg_chat, 0, title)
+
     def unlink_topic(self, wx_thread: str) -> None:
         self.db.execute("DELETE FROM topics WHERE wx_thread=?", (wx_thread,))
 
     def list_topics(self, tg_chat: int) -> list[tuple[str, int, str, int]]:
         return list(self.db.execute(
-            "SELECT wx_thread, tg_topic, COALESCE(title, ''), created_at FROM topics WHERE tg_chat=? "
+            "SELECT wx_thread, tg_topic, COALESCE(title, ''), created_at FROM topics WHERE tg_chat=? AND tg_topic > 0 "
             "ORDER BY created_at DESC", (tg_chat,)))
+
+    def list_topic_groups(self) -> list[tuple[str, int, str, int]]:
+        return list(self.db.execute(
+            "SELECT wx_thread, tg_chat, COALESCE(title, ''), created_at FROM topics WHERE tg_topic = 0 "
+            "ORDER BY created_at DESC"))
 
     def update_topic_title(self, wx_thread: str, title: str) -> None:
         self.db.execute("UPDATE topics SET title=? WHERE wx_thread=?", (title, wx_thread))
@@ -192,16 +205,17 @@ class Store:
         return self.db.execute("SELECT 1 FROM sent WHERE wx_thread=? AND wx_server=?",
                                (wx_thread, wx_server)).fetchone() is not None
 
-    def lookup_tg_delete(self, tg_chat: int | None, tg_msg: int) -> tuple[int, str, str | None, str | None] | None:
+    def lookup_tg_delete(self, tg_chat: int | None, tg_msg: int,
+                         side: str = "user") -> tuple[int, str, str | None, str | None] | None:
         """Find (tg_chat, wx_thread, wx_msg, wx_server) for a deleted Telegram message."""
         if tg_chat is not None:
             return self.db.execute(
-                "SELECT tg_chat, wx_thread, wx_msg, wx_server FROM msgmap WHERE tg_chat=? AND side='user' AND tg_msg=?",
-                (tg_chat, tg_msg)).fetchone()
+                "SELECT tg_chat, wx_thread, wx_msg, wx_server FROM msgmap WHERE tg_chat=? AND side=? AND tg_msg=?",
+                (tg_chat, side, tg_msg)).fetchone()
         rows = self.db.execute(
             "SELECT tg_chat, wx_thread, wx_msg, wx_server FROM msgmap "
-            "WHERE side='user' AND tg_msg=? AND tg_chat < 0 AND tg_chat > -1000000000000",
-            (tg_msg,)).fetchall()
+            "WHERE side=? AND tg_msg=? AND tg_chat < 0 AND tg_chat > -1000000000000",
+            (side, tg_msg)).fetchall()
         return rows[0] if len(rows) == 1 else None
 
     def claim_echo(self, wx_thread: str, wx_server: str, wx_msg: str) -> bool:
