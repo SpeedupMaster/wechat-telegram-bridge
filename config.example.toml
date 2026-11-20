@@ -64,7 +64,7 @@ call_notifications = true
 # call_web_url = "https://call.example.com"
 # call_web_listen = "127.0.0.1:8780"
 # call_web_app = ""
-# 将微信链接分享（小红书、公众号、网页等）渲染为微信风格卡片图并附带直达按钮
+# 将微信链接分享（小红书、公众号、抖音/抖音极速版口令、网页等）渲染为微信风格卡片图并附带直达按钮
 link_card_images = true
 # 把收到的微信好友请求推送到与机器人的私聊，可一键通过（需 agent-wechat >= 2.7.0）
 friend_requests = true

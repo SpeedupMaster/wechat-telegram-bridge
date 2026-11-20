@@ -420,8 +420,20 @@ def _guess_image_media(data: bytes, stem: str) -> Media:
     return Media(data, "image/jpeg", f"{stem}.jpg")
 
 
+def _msg_link(msg: dict) -> tuple[dict | None, int | None, bool]:
+    """Return (link_payload, app_type, is_native_app_link) for WeChat link cards and app share texts."""
+    t = msg.get("type")
+    sub = msg.get("appMessageType")
+    if t == APP and sub not in (APP_CHANNELS, APP_FILE) and (link := msg.get("link")):
+        return link, sub, True
+    if t == TEXT or (t == APP and sub == APP_QUOTE and not msg.get("link")):
+        if link := cards.extract_text_link(msg.get("body")):
+            return link, None, False
+    return None, None, False
+
+
 def _is_link_card(msg: dict) -> bool:
-    return msg.get("type") == APP and msg.get("appMessageType") != APP_CHANNELS and bool(msg.get("link"))
+    return _msg_link(msg)[0] is not None
 
 
 def _link_url(link: dict | None) -> str:
@@ -438,7 +450,10 @@ def _link_buttons(link: dict | None, app_type: int | None) -> list | None:
 
 def _link_body(link: dict, app_type: int | None = None, *, inline_url: bool = False) -> str:
     src = cards.identify_link_source(link, app_type)
-    icon = {"xhs": "📕", "wxmp": "📄", "bili": "📺", "zhihu": "💡", "music": "🎵", "video": "🎬"}.get(src.brand, "🔗")
+    icon = {
+        "xhs": "📕", "wxmp": "📄", "bili": "📺", "zhihu": "💡",
+        "douyin": "🎬", "kuaishou": "🎬", "music": "🎵", "video": "🎬",
+    }.get(src.brand, "🔗")
     title = (link.get("title") or "").strip()
     desc = (link.get("description") or "").strip()
     url = _link_url(link)
@@ -1568,6 +1583,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     def _body(self, msg: dict) -> str:
         t, body = msg.get("type"), msg.get("body") or ""
         if t == TEXT:
+            if link := cards.extract_text_link(body):
+                note = f"{_fmt_wx_text(link['note'])}\n" if link.get("note") else ""
+                return note + _link_body(link, inline_url=True)
             return _fmt_wx_text(body)
         if t == SYSTEM:
             return f"<i>{_esc(body)}</i>"
@@ -1578,6 +1596,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             return _channels_body(msg.get("link"), body)
         if t == APP and (link := msg.get("link")):
             return _link_body(link, msg.get("appMessageType"), inline_url=True)
+        if t == APP and msg.get("appMessageType") == APP_QUOTE and (link := cards.extract_text_link(body)):
+            note = f"{_fmt_wx_text(link['note'])}\n" if link.get("note") else ""
+            return note + _link_body(link, inline_url=True)
         if t == APP and msg.get("appMessageType") == 19:
             return "📜 聊天记录\n" + _fmt_wx_text(body)
         if t == STICKER:
@@ -1628,6 +1649,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     def _quote_msg_summary(orig: dict) -> str:
         t, sub, body = orig.get("type"), orig.get("appMessageType"), (orig.get("body") or "").strip()
         if t == TEXT:
+            if link := cards.extract_text_link(body):
+                return (link.get("title") or link.get("description") or link.get("url") or body).strip()
             return body
         if t in (IMAGE, VOICE, VIDEO, STICKER):
             return {IMAGE: "[图片]", VOICE: "[语音]", VIDEO: "[视频]", STICKER: "[表情]"}[t]
@@ -1737,16 +1760,16 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 media = None
             if media is None and (cover := await self.wx.download_link_thumbnail(msg)):
                 media = _guess_image_media(cover, "channels-cover")
-        elif _is_link_card(msg) and self.cfg.bridge.link_card_images:
-            link = msg["link"]
-            thumb_bytes = await self.wx.download_link_thumbnail(msg)
+        elif (link_info := _msg_link(msg))[0] and self.cfg.bridge.link_card_images:
+            link, link_app_type, is_native_link = link_info
+            thumb_bytes = await self.wx.download_link_thumbnail(msg) if is_native_link else None
             card_png = await asyncio.to_thread(
                 cards.render_link_card,
                 title=_normalize_wx_text(link.get("title")),
                 description=_normalize_wx_text(link.get("description")),
                 url=link.get("url"),
                 source_name=_normalize_wx_text(link.get("sourceName")),
-                app_type=msg.get("appMessageType"),
+                app_type=link_app_type,
                 thumbnail_bytes=thumb_bytes,
             )
             if card_png:
@@ -1848,7 +1871,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             reply = reply_to if reply_to is not None else top
             t = msg.get("type")
             is_channels = t == APP and msg.get("appMessageType") == APP_CHANNELS
-            is_link = _is_link_card(msg)
+            link, link_app_type, _ = _msg_link(msg)
+            is_link = link is not None
+            link_note = f"{_fmt_wx_text(link['note'])}\n" if (link and link.get("note")) else ""
             send_media = media
             channels_err_note = (
                 f"\n<i>（视频无法获取：{_esc(MEDIA_REASONS.get(channels_video_err, channels_video_err))}）</i>"
@@ -1856,8 +1881,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             )
             if isinstance(send_media, Media) and is_link:
                 f = send_media.tg_file()
-                caption = (header + prefix).rstrip("\n")
-                buttons = _link_buttons(msg.get("link"), msg.get("appMessageType"))
+                caption = (header + prefix + link_note).rstrip("\n")
+                buttons = _link_buttons(link, link_app_type)
                 kw = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
                           silent=silent, force_document=False, buttons=buttons)
                 try:
@@ -1867,8 +1892,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     if _dead_chat(e) or _topic_gone(e):
                         raise
                     if buttons:
-                        url = _link_url(msg.get("link"))
-                        src = cards.identify_link_source(msg.get("link"), msg.get("appMessageType"))
+                        url = _link_url(link)
+                        src = cards.identify_link_source(link, link_app_type)
                         link_line = f'<a href="{_esc(url)}"><b>{_esc(src.button_label)}</b></a>'
                         fallback_cap = f"{caption}\n{link_line}" if caption else link_line
                         f = send_media.tg_file()
@@ -2011,8 +2036,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 text = header + prefix + _media_failure_text(msg, send_media)
                 buttons = None
             elif is_link:
-                buttons = _link_buttons(msg.get("link"), msg.get("appMessageType"))
-                text = header + prefix + _link_body(msg["link"], msg.get("appMessageType"), inline_url=not buttons)
+                buttons = _link_buttons(link, link_app_type)
+                text = header + prefix + link_note + _link_body(link, link_app_type, inline_url=not buttons)
             else:
                 buttons = None
                 text = header + prefix + self._body(msg) + channels_err_note
@@ -2029,8 +2054,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 if _dead_chat(e) or _topic_gone(e) or not (is_link and buttons):
                     raise
                 out.clear()
-                fallback_parts = _chunks(header + prefix + _link_body(
-                    msg["link"], msg.get("appMessageType"), inline_url=True))
+                fallback_parts = _chunks(header + prefix + link_note + _link_body(
+                    link, link_app_type, inline_url=True))
                 for i, part in enumerate(fallback_parts):
                     out.append(await self.bot.send_message(
                         chat_id, part, parse_mode="html", silent=silent,

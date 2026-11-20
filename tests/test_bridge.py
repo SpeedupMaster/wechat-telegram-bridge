@@ -5278,6 +5278,25 @@ class LinkCardTests(unittest.IsolatedAsyncioTestCase):
         zhihu = cards.identify_link_source({"url": "https://zhuanlan.zhihu.com/p/123"}, 5)
         self.assertEqual((zhihu.label, zhihu.brand), ("知乎", "zhihu"))
 
+        douyin = cards.identify_link_source({"url": "https://v.douyin.com/VYZaWHad0gs/"}, None)
+        self.assertEqual((douyin.label, douyin.brand, douyin.button_label), ("抖音", "douyin", "🎬 打开抖音"))
+
+        douyin_lite = cards.identify_link_source(
+            {"url": "https://v.douyin.com/VYZaWHad0gs/", "sourceName": "抖音极速版"}, None
+        )
+        self.assertEqual(
+            (douyin_lite.label, douyin_lite.brand, douyin_lite.button_label),
+            ("抖音极速版", "douyin", "🎬 打开抖音极速版"),
+        )
+
+        kuaishou_lite = cards.identify_link_source(
+            {"url": "https://v.kuaishou.com/abc123", "sourceName": "快手极速版"}, None
+        )
+        self.assertEqual(
+            (kuaishou_lite.label, kuaishou_lite.brand, kuaishou_lite.button_label),
+            ("快手极速版", "kuaishou", "🎬 打开快手极速版"),
+        )
+
         music = cards.identify_link_source({"url": "https://example.org/song", "sourceName": "网易云音乐"}, 3)
         self.assertEqual((music.label, music.brand), ("网易云音乐", "music"))
 
@@ -5337,6 +5356,24 @@ class LinkCardTests(unittest.IsolatedAsyncioTestCase):
                 thumbnail_bytes=b"not-an-image",
             )
             self.assertIsNotNone(no_thumb)
+
+            # Douyin Lite & Kuaishou Lite badges render cleanly without a thumbnail.
+            dy_png = cards.render_link_card(
+                title="记得你叫王老八 记得你叫我忘了吧 不好意思波忘不了...",
+                description="乐呵又一天的作品",
+                url="https://v.douyin.com/VYZaWHad0gs/",
+                source_name="抖音极速版",
+            )
+            self.assertIsNotNone(dy_png)
+            im_dy = Image.open(io.BytesIO(dy_png))
+            self.assertEqual((im_dy.size[0], im_dy.mode), (cards.CARD_WIDTH, "RGB"))
+            ks_png = cards.render_link_card(
+                title="今天做了一道硬菜",
+                description="",
+                url="https://v.kuaishou.com/ks123",
+                source_name="快手极速版",
+            )
+            self.assertIsNotNone(ks_png)
 
     async def test_download_link_thumbnail(self):
         thumb_ok = _png(120, 120, (255, 60, 80))
@@ -5515,6 +5552,206 @@ class LinkCardTests(unittest.IsolatedAsyncioTestCase):
         s3 = self.b.bot.sent[-1]
         self.assertIn(f'<a href="{xhs_url}"><b>文本按钮降级测试</b></a>', s3.text)
         self.assertNotIn("buttons", s3.kwargs)
+
+    def test_extract_text_link_douyin_and_other_platforms(self):
+        from bridge import cards
+
+        # 1) Exact Douyin Lite share text with obfuscated prefix tokens
+        got = cards.extract_text_link(
+            "0.00 09/26 :1pm E@h.OK IiC:/ 复制打开抖音极速版，看看【乐呵又一天的作品】"
+            "记得你叫王老八 记得你叫我忘了吧 不好意思波忘不了... https://v.douyin.com/VYZaWHad0gs/"
+        )
+        self.assertEqual(got, {
+            "title": "记得你叫王老八 记得你叫我忘了吧 不好意思波忘不了...",
+            "description": "乐呵又一天的作品",
+            "sourceName": "抖音极速版",
+            "url": "https://v.douyin.com/VYZaWHad0gs/",
+        })
+
+        # 2) Regular Douyin with trailing obfuscation tokens
+        got2 = cards.extract_text_link(
+            "4.82 复制打开抖音，看看【白浪源烟薯种植基地的作品】一旦找对了原产地，就很难再换其他家了... "
+            "https://v.douyin.com/ikagBCYn/ P@k.cN 01/23 ytr:/"
+        )
+        self.assertEqual(got2, {
+            "title": "一旦找对了原产地，就很难再换其他家了...",
+            "description": "白浪源烟薯种植基地的作品",
+            "sourceName": "抖音",
+            "url": "https://v.douyin.com/ikagBCYn/",
+        })
+
+        # 3) Douyin Lite with trailing CTA after Chinese comma (keeps 抖音极速版 over generic trailing 抖音)
+        got3 = cards.extract_text_link(
+            "7.15 复制打开抖音极速版，看看【XX的日常】周末逛公园 https://v.douyin.com/xxxxxx/，"
+            "长按复制此条消息，打开抖音查看..."
+        )
+        self.assertEqual(got3, {
+            "title": "周末逛公园",
+            "description": "XX的日常",
+            "sourceName": "抖音极速版",
+            "url": "https://v.douyin.com/xxxxxx/",
+        })
+
+        # 4) Douyin without space after `:/`, with zero-width space, nested 【】 in caption, and user note
+        got4 = cards.extract_text_link(
+            "笑死我了\n0.00 09/26 :1pm E@h.OK IiC:/\u200b复制打开抖音极速版，看看【作者的作品】【合集】第一集 "
+            "https://v.douyin.com/abc123/"
+        )
+        self.assertEqual(got4, {
+            "title": "【合集】第一集",
+            "description": "作者的作品",
+            "sourceName": "抖音极速版",
+            "url": "https://v.douyin.com/abc123/",
+            "note": "笑死我了",
+        })
+
+        # 5) Douyin profile share boilerplate and reverse-order Dou音 CTA
+        got5 = cards.extract_text_link(
+            "长按复制此条消息，打开抖音极速版搜索，查看TA的更多作品。 https://v.douyin.com/prof1/"
+        )
+        self.assertEqual(got5, {
+            "title": "抖音极速版主页",
+            "description": "查看TA的更多作品",
+            "sourceName": "抖音极速版",
+            "url": "https://v.douyin.com/prof1/",
+        })
+        got6 = cards.extract_text_link(
+            "【乐呵又一天的作品】记得你叫王老八 https://v.douyin.com/rev1/ 复制此链接，打开Dou音搜索，直接观看视频！"
+        )
+        self.assertEqual(got6, {
+            "title": "记得你叫王老八",
+            "description": "乐呵又一天的作品",
+            "sourceName": "抖音",
+            "url": "https://v.douyin.com/rev1/",
+        })
+        got7 = cards.extract_text_link(
+            "复制打开抖音极速版，看看【乐呵又一天的主页】 https://v.douyin.com/home1/"
+        )
+        self.assertEqual(got7, {
+            "title": "乐呵又一天的主页",
+            "description": "",
+            "sourceName": "抖音极速版",
+            "url": "https://v.douyin.com/home1/",
+        })
+
+        # 6) Kuaishou Lite, Xiaohongshu copy-link, and Bilibili copy-link share texts
+        ks = cards.extract_text_link(
+            "今天做了一道硬菜 #美食 https://v.kuaishou.com/ks123 复制此消息，打开【快手极速版】直接观看！"
+        )
+        self.assertEqual(ks, {
+            "title": "今天做了一道硬菜 #美食",
+            "description": "",
+            "sourceName": "快手极速版",
+            "url": "https://v.kuaishou.com/ks123",
+        })
+        xhs = cards.extract_text_link(
+            "87 小明发布了一篇小红书笔记，快来看吧！ 😆 abcd1234 😆 http://xhslink.com/a/xyz，"
+            "复制本条信息，打开【小红书】App查看精彩内容！"
+        )
+        self.assertEqual(xhs, {
+            "title": "小明的小红书笔记",
+            "description": "",
+            "sourceName": "小红书",
+            "url": "http://xhslink.com/a/xyz",
+        })
+        bili = cards.extract_text_link(
+            "【【4K修复】感受一下什么叫真正的神仙颜值！-哔哩哔哩】【视频标记点 01:23】 https://b23.tv/BV1xx411c7m9"
+        )
+        self.assertEqual(bili, {
+            "title": "【4K修复】感受一下什么叫真正的神仙颜值！",
+            "description": "视频标记点 01:23",
+            "sourceName": "哔哩哔哩",
+            "url": "https://b23.tv/BV1xx411c7m9",
+        })
+
+        # 7) Ordinary chat messages mentioning URLs must NOT be hijacked
+        for ordinary in (
+            "我今天打开抖音刷到了这个 https://v.douyin.com/abc/",
+            "你看这个视频 https://v.douyin.com/abc/ 太好笑了",
+            "0.00 09/26 :1pm E@h.OK IiC:/ 复制打开抖音极速版，看看【作者的作品】标题 https://v.douyin.com/a/ 靠谱吗",
+            "两个链接 https://v.douyin.com/a/ 和 https://v.douyin.com/b/",
+            "看看这篇笔记 https://www.xiaohongshu.com/explore/123",
+            "这个UP主太强了 https://b23.tv/abc",
+            "看看#日常##搞笑#还挺好[破涕为笑] https://a.b/#x#1 <tag>",
+        ):
+            self.assertIsNone(cards.extract_text_link(ordinary), ordinary)
+
+    async def test_douyin_lite_text_share_end_to_end_and_text_mode(self):
+        from unittest import mock
+
+        dy_url = "https://v.douyin.com/VYZaWHad0gs/"
+        dy_text = (
+            "0.00 09/26 :1pm E@h.OK IiC:/ 复制打开抖音极速版，看看【乐呵又一天的作品】"
+            f"记得你叫王老八 记得你叫我忘了吧 不好意思波忘不了... {dy_url}"
+        )
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_message("dy1", "wxid_alice", dy_text, type_=1)
+        self.daemon.add_message("plain1", "wxid_alice", f"刚才刷到 {dy_url}", type_=1)
+
+        def _btn_url(btn):
+            return btn.type.url if hasattr(btn, "type") and hasattr(btn.type, "url") else btn.url
+
+        # 1) Plain-text Douyin Lite share renders as a card image + CTA button without calling media download
+        fake_card = _png(800, 220, (255, 255, 255))
+        with mock.patch("bridge.cards.render_link_card", return_value=fake_card) as rmock:
+            await self.event("dy1", "wxid_alice")
+        rmock.assert_called_once_with(
+            title="记得你叫王老八 记得你叫我忘了吧 不好意思波忘不了...",
+            description="乐呵又一天的作品",
+            url=dy_url,
+            source_name="抖音极速版",
+            app_type=None,
+            thumbnail_bytes=None,
+        )
+        self.assertEqual(self.daemon.content_requests, [])
+        sent = self.b.bot.sent[-1]
+        self.assertEqual(sent.file.name, "link-card.png")
+        self.assertIsNone(sent.kwargs["caption"])
+        self.assertEqual(sent.kwargs["buttons"][0][0].text, "🎬 打开抖音极速版")
+        self.assertEqual(_btn_url(sent.kwargs["buttons"][0][0]), dy_url)
+
+        # 2) Ordinary text containing the same URL stays plain text
+        await self.event("plain1", "wxid_alice")
+        plain_sent = self.b.bot.sent[-1]
+        self.assertIsNone(plain_sent.file)
+        self.assertEqual(plain_sent.text, f"刚才刷到 {dy_url}")
+
+        # 3) Group share with leading user note preserves sender + note in photo caption
+        self.daemon.add_thread("123@chatroom", "Friends", kind="group")
+        self.daemon.add_contact("wxid_bob", "Bob")
+        self.daemon.add_message("dy2", "123@chatroom", f"笑死我了\n{dy_text}", type_=1, sender="wxid_bob")
+        with mock.patch("bridge.cards.render_link_card", return_value=fake_card):
+            await self.event("dy2", "123@chatroom")
+        grp_sent = self.b.bot.sent[-1]
+        self.assertEqual(grp_sent.file.name, "link-card.png")
+        self.assertEqual(grp_sent.kwargs["caption"], "<b>Alice in group</b>：\n笑死我了")
+        self.assertEqual(grp_sent.kwargs["buttons"][0][0].text, "🎬 打开抖音极速版")
+
+        # 4) Text-only mode (link_card_images = False) produces clean HTML + CTA button without noise tokens
+        self.b.cfg.bridge.link_card_images = False
+        self.daemon.add_message("dy3", "wxid_alice", dy_text, type_=1)
+        await self.event("dy3", "wxid_alice")
+        txt_sent = self.b.bot.sent[-1]
+        self.assertIsNone(txt_sent.file)
+        self.assertEqual(
+            txt_sent.text,
+            "🎬 <b>记得你叫王老八 记得你叫我忘了吧 不好意思波忘不了...</b>\n乐呵又一天的作品\n<i>来自 抖音极速版</i>",
+        )
+        self.assertNotIn("E@h.OK", txt_sent.text)
+        self.assertNotIn("IiC:/", txt_sent.text)
+        self.assertEqual(txt_sent.kwargs["buttons"][0][0].text, "🎬 打开抖音极速版")
+        self.assertEqual(_btn_url(txt_sent.kwargs["buttons"][0][0]), dy_url)
+
+        # 5) Quoted reply containing a Douyin Lite share text also renders cleanly with quote prefix
+        self.daemon.add_message(
+            "dy4", "wxid_alice", dy_text, type_=49, appMessageType=57,
+            quote={"senderName": "Alice", "embeddedText": "发个搞笑视频"},
+        )
+        await self.event("dy4", "wxid_alice")
+        q_sent = self.b.bot.sent[-1]
+        self.assertIn("<blockquote>Alice：发个搞笑视频</blockquote>", q_sent.text)
+        self.assertIn("🎬 <b>记得你叫王老八 记得你叫我忘了吧 不好意思波忘不了...</b>", q_sent.text)
+        self.assertEqual(q_sent.kwargs["buttons"][0][0].text, "🎬 打开抖音极速版")
 
 
 class _FakeMediaSocket:

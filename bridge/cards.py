@@ -73,6 +73,88 @@ _LATIN_FALLBACK_BOLD = (
 _VARIATION_SELECTORS = ("\ufe0e", "\ufe0f")
 _SKIN_TONE_MODIFIERS = set(chr(cp) for cp in range(0x1F3FB, 0x1F400))
 _NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u2060\ufeff]")
+_TEXT_URL_RE = re.compile(r"https?://[^\s<>\"'，。！？、；：（）【】《》“”‘’]+")
+_URL_TRAILING_PUNCT = ".,;!?)]}"
+
+_AUTHOR_BRACKET_SUFFIXES = (
+    "的作品", "的图文作品", "的视频", "的图文", "的直播", "的主页",
+    "的合集", "的音乐", "的日常", "发布的视频", "发布的作品",
+)
+_BRACKET_PREFIX_RE = re.compile(r"^【([^】]{1,80})】\s*(.*)$", re.DOTALL)
+
+_DOUYIN_APP_PAT = r"(抖音极速版|抖音火山版|抖音精选|抖音|Dou音|dou音)"
+_DOUYIN_STRONG_NOISE_RE = re.compile(
+    r"^(?:"
+    r"[A-Za-z0-9_-]{1,3}@[A-Za-z0-9_-]{1,3}\.[A-Za-z0-9_-]{1,3}"
+    r"|[A-Za-z0-9._-]{0,12}:/"
+    r")$",
+    re.IGNORECASE,
+)
+_DOUYIN_WEAK_NOISE_RE = re.compile(
+    r"^(?:"
+    r"\d+\.\d+"
+    r"|(?:\d{2,4}[/-])?\d{1,2}[/-]\d{1,2}"
+    r"|:\d{1,2}(?::\d{2})?(?:[ap]m)?"
+    r"|\d{1,2}:\d{2}(?:[ap]m)?"
+    r"|\d{1,2}[ap]m"
+    r"|[$￥%€₴][A-Za-z0-9]{2,12}[$￥%€₴]?"
+    r")$",
+    re.IGNORECASE,
+)
+_DOUYIN_OPEN_RE = re.compile(
+    r"(?:"
+    r"(?:长按)?复制(?:此条消息|此链接|本条信息|整段话|口令)?[，,、\s]*"
+    r"打开[【\[]?" + _DOUYIN_APP_PAT + r"[】\]]?(?:App|APP)?[，,、\s]*(?:看看)?"
+    r"|"
+    r"打开[【\[]?" + _DOUYIN_APP_PAT + r"[】\]]?(?:App|APP)?(?:[，,、\s]*看看|(?=\s*搜索[，,、\s]*(?:查看|直接观看)))"
+    r")",
+    re.IGNORECASE,
+)
+_DOUYIN_AFTER_CTA_RE = re.compile(
+    r"^(?:长按)?(?:复制(?:此链接|此条消息|本条信息|整段话|口令)?[，,、\s]*)?"
+    r"打开[【\[]?" + _DOUYIN_APP_PAT + r"[】\]]?(?:搜索|App|APP)?[，,、\s]*"
+    r"(?:直接观看[^。\n]*|查看[^。\n]*)?[！!。.\s…]*$",
+    re.IGNORECASE,
+)
+_DOUYIN_SEARCH_BOILERPLATE_RE = re.compile(
+    r"^(?:搜索[，,、\s]*)?(?:查看(?:TA|他|她)的更多作品|直接观看(?:视频|直播|作品)?)[！!。.\s…]*$",
+    re.IGNORECASE,
+)
+_DOUYIN_LIFE_RE = re.compile(
+    r"^在(抖音(?:极速版|火山版|精选)?)[，,、\s]*记录美好生活[！!。.\s]*(.*)$",
+    re.DOTALL,
+)
+_DOUYIN_PUBLISHED_RE = re.compile(
+    r"^(.{1,40}?)发布了(?:一篇|一个)(抖音(?:极速版|火山版|精选)?)(?:作品|视频|图文)"
+    r"[，,！!。.\s]*快来看(?:看)?吧[！!。.\s]*(.*)$",
+    re.DOTALL,
+)
+
+_KUAISHOU_APP_PAT = r"(快手极速版|快手)"
+_KUAISHOU_OPEN_RE = re.compile(
+    r"(?:长按)?复制(?:此消息|此条消息|此链接|本条信息|整段话|口令)?[，,、\s]*"
+    r"打开[【\[]?" + _KUAISHOU_APP_PAT + r"[】\]]?(?:App|APP)?[，,、\s]*(?:看看|即可观看|直接观看)?",
+    re.IGNORECASE,
+)
+_KUAISHOU_AFTER_CTA_RE = re.compile(
+    r"^(?:(该作品在快手(?:极速版)?被播放过[^，,\n]+)[，,\s]*)?"
+    r"(?:点击链接[，,\s]*|(?:长按)?复制(?:此消息|此条消息|此链接|本条信息|整段话)?[，,、\s]*)*"
+    r"打开[【\[]?" + _KUAISHOU_APP_PAT + r"[】\]]?(?:App|APP)?(?:直接观看|即可观看|查看)[^。\n]*[！!。.\s…]*$",
+    re.IGNORECASE,
+)
+
+_XHS_AFTER_CTA_RE = re.compile(
+    r"^[，,。.\s]*(?:长按)?复制(?:本条信息|此条消息|此链接|整段话|后)?[，,、\s]*"
+    r"打开[【\[]?小红书[】\]]?(?:App|APP)?查看[^。\n]*[！!。.\s…]*$",
+    re.IGNORECASE,
+)
+_XHS_EMOJI_TOKEN_RE = re.compile(r"[\U0001F300-\U0001FAFF]\s*[A-Za-z0-9]{4,24}\s*[\U0001F300-\U0001FAFF]\s*$")
+_XHS_PUBLISHED_RE = re.compile(
+    r"^(?:\d{1,3}\s+)?(.{1,40}?)发布了一篇小红书笔记[，,！!。.\s]*快来看(?:看)?吧[！!。.\s]*$"
+)
+
+_BILI_COPY_RE = re.compile(r"^【(.+?)-哔哩哔哩】(?:\s*【(视频标记点[^】]*)】)?$", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -93,6 +175,243 @@ def _clean_host(url: str | None) -> str:
     return host.removeprefix("www.")
 
 
+def _host_matches(host: str, *domains: str) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _norm_douyin_app(name: str | None) -> str:
+    if not name:
+        return "抖音"
+    if name.lower() == "dou音":
+        return "抖音"
+    return name
+
+
+def _douyin_noise_kind(token: str) -> int:
+    """Return 2 for strong Douyin obfuscation tokens (E@h.OK, IiC:/), 1 for weak ones (0.00, 09/26, :1pm), else 0."""
+    if _DOUYIN_STRONG_NOISE_RE.match(token):
+        return 2
+    if _DOUYIN_WEAK_NOISE_RE.match(token):
+        return 1
+    return 0
+
+
+def _strip_douyin_noise(text: str, *, from_end: bool = False) -> tuple[str, bool]:
+    tokens = list(re.finditer(r"\S+", text))
+    if not tokens:
+        return "", False
+    had_strong = False
+    if from_end:
+        idx = len(tokens)
+        while idx > 0:
+            kind = _douyin_noise_kind(tokens[idx - 1].group(0))
+            if not kind:
+                break
+            had_strong = had_strong or kind == 2
+            idx -= 1
+        if idx == 0:
+            return "", had_strong
+        return text[:tokens[idx - 1].end()].strip(), had_strong
+    idx = 0
+    while idx < len(tokens):
+        kind = _douyin_noise_kind(tokens[idx].group(0))
+        if not kind:
+            break
+        had_strong = had_strong or kind == 2
+        idx += 1
+    if idx == len(tokens):
+        return "", had_strong
+    return text[tokens[idx].start():].strip(), had_strong
+
+
+def _split_bracket_caption(text: str, *, always_author_bracket: bool = False) -> tuple[str, str]:
+    clean = (text or "").strip()
+    if not clean:
+        return "", ""
+    m = _BRACKET_PREFIX_RE.match(clean)
+    if m:
+        bracket = " ".join(m.group(1).split())
+        rest = " ".join(m.group(2).lstrip(":：,，、 \t\r\n").split())
+        if not rest:
+            return bracket, ""
+        if always_author_bracket or bracket.endswith(_AUTHOR_BRACKET_SUFFIXES):
+            return rest, bracket
+        return f"【{bracket}】{rest}", ""
+    lines = [" ".join(ln.split()) for ln in clean.splitlines() if ln.strip()]
+    if len(lines) >= 2:
+        return lines[0], " ".join(lines[1:])
+    return (lines[0], "") if lines else ("", "")
+
+
+def _parse_douyin_share(before: str, after: str, url: str) -> dict | None:
+    after_trim = after.strip(" \t\r\n，,。.!！;；、")
+    after_clean, strong_a1 = _strip_douyin_noise(after_trim, from_end=False)
+    after_clean, strong_a2 = _strip_douyin_noise(after_clean, from_end=True)
+    strong_noise = strong_a1 or strong_a2
+
+    after_app: str | None = None
+    if after_clean:
+        m_after = _DOUYIN_AFTER_CTA_RE.match(after_clean)
+        if not m_after:
+            return None
+        after_app = _norm_douyin_app(m_after.group(1))
+
+    note = ""
+    app_name = after_app or "抖音"
+    title = ""
+    desc = ""
+
+    m_open = _DOUYIN_OPEN_RE.search(before)
+    if m_open:
+        app_name = _norm_douyin_app(m_open.group(1) or m_open.group(2))
+        pre = before[:m_open.start()].strip()
+        note, _ = _strip_douyin_noise(pre, from_end=True)
+        if len(note) > 120:
+            return None
+        rest = before[m_open.end():].strip()
+        if _DOUYIN_SEARCH_BOILERPLATE_RE.match(rest):
+            if "更多作品" in rest:
+                title, desc = f"{app_name}主页", "查看TA的更多作品"
+            else:
+                title, desc = f"{app_name}视频", ""
+        else:
+            title, desc = _split_bracket_caption(rest, always_author_bracket=True)
+            if not title:
+                title = f"{app_name}作品"
+    else:
+        before_clean, strong_b1 = _strip_douyin_noise(before, from_end=False)
+        before_clean, strong_b2 = _strip_douyin_noise(before_clean, from_end=True)
+        strong_noise = strong_noise or strong_b1 or strong_b2
+
+        if m_life := _DOUYIN_LIFE_RE.match(before_clean):
+            app_name = _norm_douyin_app(m_life.group(1))
+            rest = m_life.group(2).strip()
+            if rest:
+                title, desc = _split_bracket_caption(rest)
+            else:
+                title, desc = "在抖音，记录美好生活", ""
+        elif m_pub := _DOUYIN_PUBLISHED_RE.match(before_clean):
+            author = " ".join(m_pub.group(1).split())
+            app_name = _norm_douyin_app(m_pub.group(2))
+            rest = " ".join(m_pub.group(3).split())
+            if rest:
+                title, desc = rest, f"{author}的作品"
+            else:
+                title, desc = f"{author}的{app_name}作品", ""
+        elif after_app is not None or strong_noise:
+            title, desc = _split_bracket_caption(before_clean)
+            if not title:
+                title = f"{app_name}视频"
+        else:
+            return None
+
+    out = {"title": title, "description": desc, "sourceName": app_name, "url": url}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _parse_kuaishou_share(before: str, after: str, url: str) -> dict | None:
+    after_trim = after.strip(" \t\r\n，,。.!！;；、")
+    after_app: str | None = None
+    play_stat = ""
+    if after_trim:
+        m_after = _KUAISHOU_AFTER_CTA_RE.match(after_trim)
+        if not m_after:
+            return None
+        play_stat = (m_after.group(1) or "").strip()
+        after_app = m_after.group(2)
+
+    note = ""
+    app_name = after_app or "快手"
+    m_open = _KUAISHOU_OPEN_RE.search(before)
+    if m_open:
+        app_name = m_open.group(1)
+        pre = before[:m_open.start()].strip()
+        note, _ = _strip_douyin_noise(pre, from_end=True)
+        if len(note) > 120:
+            return None
+        rest = before[m_open.end():].strip()
+        title, desc = _split_bracket_caption(rest, always_author_bracket=True)
+        if not title:
+            title = f"{app_name}作品"
+        if not desc and play_stat:
+            desc = play_stat
+    elif after_app is not None:
+        before_clean, _ = _strip_douyin_noise(before.strip(), from_end=False)
+        title, desc = _split_bracket_caption(before_clean)
+        if not title:
+            title = f"{app_name}作品"
+        if not desc and play_stat:
+            desc = play_stat
+    else:
+        return None
+
+    out = {"title": title, "description": desc, "sourceName": app_name, "url": url}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _parse_xhs_share(before: str, after: str, url: str) -> dict | None:
+    if not _XHS_AFTER_CTA_RE.match(after):
+        return None
+    clean = before.strip()
+    clean = re.sub(r"🔗\s*$", "", clean).strip()
+    clean = _XHS_EMOJI_TOKEN_RE.sub("", clean).strip()
+    clean = re.sub(r"🔗\s*$", "", clean).strip()
+    if m_pub := _XHS_PUBLISHED_RE.match(clean):
+        author = " ".join(m_pub.group(1).split())
+        title, desc = f"{author}的小红书笔记", ""
+    else:
+        title, desc = _split_bracket_caption(clean)
+        if not title:
+            title = "小红书笔记"
+    return {"title": title, "description": desc, "sourceName": "小红书", "url": url}
+
+
+def _parse_bili_share(before: str, after: str, url: str) -> dict | None:
+    if after.strip():
+        return None
+    m = _BILI_COPY_RE.match(before.strip())
+    if not m:
+        return None
+    title = " ".join(m.group(1).split())
+    desc = " ".join((m.group(2) or "").split())
+    return {"title": title, "description": desc, "sourceName": "哔哩哔哩", "url": url}
+
+
+def extract_text_link(text: str | None) -> dict | None:
+    """Parse app-generated plain-text share snippets (e.g. Douyin / Douyin Lite, Kuaishou, XHS, Bilibili)
+    into a normalized link payload compatible with `render_link_card`, or None for ordinary chat messages."""
+    if not text or "http" not in text:
+        return None
+    raw = _ZERO_WIDTH_RE.sub("", text).strip()
+    matches = list(_TEXT_URL_RE.finditer(raw))
+    if len(matches) != 1:
+        return None
+    m = matches[0]
+    url = m.group(0).rstrip(_URL_TRAILING_PUNCT)
+    if not url.startswith(("http://", "https://")):
+        return None
+    host = _clean_host(url)
+    if not host:
+        return None
+    url_end = m.start() + len(url)
+    before = raw[:m.start()]
+    after = raw[url_end:]
+
+    if _host_matches(host, "douyin.com", "iesdouyin.com"):
+        return _parse_douyin_share(before, after, url)
+    if _host_matches(host, "kuaishou.com", "kuaishouapp.com"):
+        return _parse_kuaishou_share(before, after, url)
+    if _host_matches(host, "xhslink.com", "xiaohongshu.com"):
+        return _parse_xhs_share(before, after, url)
+    if _host_matches(host, "b23.tv", "bilibili.com"):
+        return _parse_bili_share(before, after, url)
+    return None
+
+
 def identify_link_source(link: dict | None, app_type: int | None = None) -> LinkSource:
     """Resolve display source name, brand badge style, and Telegram CTA button label."""
     link = link or {}
@@ -101,7 +420,7 @@ def identify_link_source(link: dict | None, app_type: int | None = None) -> Link
     host = _clean_host(url)
 
     def has_domain(*domains: str) -> bool:
-        return any(host == d or host.endswith("." + d) for d in domains)
+        return _host_matches(host, *domains)
 
     if has_domain("xiaohongshu.com", "xhslink.com") or source_name == "小红书":
         return LinkSource("小红书", "xhs", (255, 36, 66), "📕 打开小红书")
@@ -111,8 +430,14 @@ def identify_link_source(link: dict | None, app_type: int | None = None) -> Link
         return LinkSource(source_name or "哔哩哔哩", "bili", (251, 114, 153), "📺 打开哔哩哔哩")
     if has_domain("zhihu.com"):
         return LinkSource(source_name or "知乎", "zhihu", (0, 102, 255), "💡 打开知乎")
-    if has_domain("douyin.com", "iesdouyin.com"):
-        return LinkSource(source_name or "抖音", "douyin", (24, 24, 32), "🎬 打开抖音")
+    if has_domain("douyin.com", "iesdouyin.com") or source_name in ("抖音", "抖音极速版", "抖音火山版", "抖音精选"):
+        label = source_name or "抖音"
+        btn = f"🎬 打开{label}" if label in ("抖音极速版", "抖音火山版", "抖音精选") else "🎬 打开抖音"
+        return LinkSource(label, "douyin", (24, 24, 32), btn)
+    if has_domain("kuaishou.com", "kuaishouapp.com") or source_name in ("快手", "快手极速版"):
+        label = source_name or "快手"
+        btn = "🎬 打开快手极速版" if label == "快手极速版" else "🎬 打开快手"
+        return LinkSource(label, "kuaishou", (255, 80, 0), btn)
     if has_domain("weibo.com", "weibo.cn"):
         return LinkSource(source_name or "微博", "weibo", (230, 22, 45), "🔗 打开微博")
     if has_domain("github.com"):
@@ -422,7 +747,33 @@ def _draw_brand_badge(canvas: Image.Image, x: int, y: int, size: int, source: Li
                 radius=round(s * 0.04),
                 fill=white,
             )
-    elif source.brand in ("bili", "video", "douyin"):
+    elif source.brand == "douyin":
+        # Recognizable Douyin musical note with cyan/red chromatic offset on dark background
+        off = max(2, round(s * 0.04))
+        cyan = (37, 244, 238, 255)
+        pink = (254, 44, 85, 255)
+
+        def _draw_dy_note(dx: int, dy: int, col: tuple[int, int, int, int]) -> None:
+            r_out = round(s * 0.21)
+            stem_w = max(2, round(s * 0.11))
+            cx, cy = round(s * 0.43) + dx, round(s * 0.65) + dy
+            sx = cx + r_out - stem_w
+            top_y = round(s * 0.20) + dy
+            # Bottom-left J-hook note head curving up into the vertical stem
+            d.arc((cx - r_out, cy - r_out, cx + r_out, cy + r_out), start=0, end=275, fill=col, width=stem_w)
+            # Vertical stem
+            d.rectangle((sx, top_y, sx + stem_w, cy), fill=col)
+            # Sweeping Douyin flag curving outward to the right from top of stem
+            r_flag = round(s * 0.24)
+            d.arc(
+                (sx, top_y - r_flag, sx + 2 * r_flag, top_y + r_flag),
+                start=90, end=185, fill=col, width=stem_w,
+            )
+
+        _draw_dy_note(-off, -off, cyan)
+        _draw_dy_note(off, off, pink)
+        _draw_dy_note(0, 0, white)
+    elif source.brand in ("bili", "video", "kuaishou"):
         pts = [(round(s * 0.38), round(s * 0.30)), (round(s * 0.38), round(s * 0.70)), (round(s * 0.72), round(s * 0.50))]
         d.polygon(pts, fill=white)
     elif source.brand == "music":
