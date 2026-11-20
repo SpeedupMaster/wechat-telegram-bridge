@@ -66,10 +66,21 @@ def _digest(*parts) -> str:
     return hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
 
 
+def _member_label(m: dict | None, uid: str = "") -> str:
+    """Best human name on a member or contact dict, skipping values that merely echo `uid`."""
+    if not m:
+        return ""
+    for key in ("remark", "displayName", "roomDisplayName", "nickname", "mentionName"):
+        val = str(m.get(key) or "").strip()
+        if val and val != uid:
+            return val
+    return ""
+
+
 def _label(m: dict) -> str:
     """A member or contact as shown to me: my remark first (agent-wechat's `displayName`), then their own names."""
-    return str(m.get("remark") or m.get("displayName") or m.get("roomDisplayName") or m.get("nickname")
-               or m.get("mentionName") or m.get("id") or "?").strip()
+    uid = str(m.get("id") or m.get("username") or "").strip()
+    return _member_label(m, uid) or uid or "?"
 
 
 def _member_id(m) -> str:
@@ -159,19 +170,44 @@ class GroupsMixin:
             text, buttons = f"⚠️ 操作失败：{_esc(_api_error(e))}", None
         await event.reply(text, parse_mode="html", buttons=buttons)
 
+    async def _group_member_name(self, room: str, uid: str, member: dict | None = None,
+                                 *, fresh: bool = False) -> str:
+        """How to show one group member (owner/admin) to me: '我', my remark, their group name, nickname, or ID."""
+        if uid and uid == self._self_wxid:
+            return "我"
+        remark, nick = await self._contact_names(uid, fresh=fresh)
+        if remark:
+            return remark
+        if member is None:
+            try:
+                member = await self.wx.group_member(room, uid)
+            except WeChatError:
+                member = None
+        if label := _member_label(member, uid):
+            return label
+        return nick or uid
+
     # --- the group card ------------------------------------------------------------------
-    async def group_card(self, room: str, *, note: str = "") -> tuple[str, list | None]:
+    async def group_card(self, room: str, *, note: str = "", fresh_names: bool = False) -> tuple[str, list | None]:
         g = await self.wx.group(room)
         members: list[dict] = []
         try:
             members = await self.wx.group_members(room)
         except WeChatError as e:
             log.info("Could not list members of %s: %s", room, e.code)
-        names = {str(m.get("id")): self._known_remark(str(m.get("id"))) or _label(m) for m in members if m.get("id")}
-        me = self._self_wxid
+        members_by_id = {
+            str(uid): m for m in members if (uid := m.get("id") or m.get("username"))
+        }
+        owner = str(g.get("ownerId") or "")
+        admins = [str(a) for a in g.get("administratorIds") or [] if a and str(a) != owner]
+        role_names: dict[str, str] = {}
+        for uid in (owner, *admins[:5]):
+            if uid and uid not in role_names:
+                role_names[uid] = await self._group_member_name(
+                    room, uid, members_by_id.get(uid), fresh=fresh_names)
 
         def who(uid: str) -> str:
-            return "我" if uid and uid == me else _esc(names.get(uid) or uid)
+            return _esc(role_names.get(uid) or uid)
 
         title = g.get("name") or g.get("displayName") or room
         lines = [f"👥 <b>{_esc(title)}</b>", f"ID：<code>{_esc(room)}</code>"]
@@ -179,9 +215,8 @@ class GroupsMixin:
             lines.append(f"我的备注：{_esc(remark)}")
         if members:
             lines.append(f"成员：{len(members)} 人")
-        if owner := g.get("ownerId"):
+        if owner:
             lines.append(f"群主：{who(owner)}")
-        admins = [a for a in g.get("administratorIds") or [] if a != g.get("ownerId")]
         if admins:
             shown = "、".join(who(a) for a in admins[:5]) + (f" 等 {len(admins)} 人" if len(admins) > 5 else "")
             lines.append(f"管理员：{shown}")
@@ -484,7 +519,7 @@ class GroupsMixin:
                 status, detail = "failed", _api_error(e)
             if status != "ok":
                 notes.append(f"⚠️ 刷新{what}：{_esc(detail)}")
-        text, buttons = await self.group_card(p["room"], note="\n".join(notes) or "✅ 已从微信刷新")
+        text, buttons = await self.group_card(p["room"], note="\n".join(notes) or "✅ 已从微信刷新", fresh_names=True)
         await self._edit_ui_msg(event, text, buttons)
 
     def _pick_for(self, p: dict) -> dict | None:

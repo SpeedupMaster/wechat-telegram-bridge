@@ -470,26 +470,36 @@ class WeChatClient:
     async def group_members(self, room: str, *, search: str | None = None) -> list[dict]:
         items: list[dict] = []
         seen: set[str] = set()
+        seen_cursors: set[str] = set()
         cursor: str | None = None
         q = (search or "").strip()
         while True:
-            params: dict[str, Any] = {"limit": 500}
+            # agent-wechat's PageQuery accepts limit in 1..=200 (larger values fail with 400 invalid_request).
+            params: dict[str, Any] = {"limit": 200}
             if q:
                 params["search"] = q
             if cursor:
                 params["cursor"] = cursor
             data = await self._req("GET", self._a(f"groups/{_id(room)}/members"), params=params)
+            raw_items = data.get("items") or []
             added = 0
-            for m in data.get("items", []):
-                uid = m.get("id")
+            has_tombstone = False
+            for m in raw_items:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("deleted"):
+                    has_tombstone = True
+                    continue
+                uid = m.get("id") or m.get("username")
                 if uid and uid not in seen:
                     seen.add(uid)
                     items.append(m)
                     added += 1
             nxt = data.get("nextCursor")
-            if not nxt or nxt == cursor or added == 0:
+            if not nxt or str(nxt) in seen_cursors or (added == 0 and not has_tombstone):
                 break
             cursor = str(nxt)
+            seen_cursors.add(cursor)
         return items
 
     # --- group management (needs an admin-scoped daemon token) -------------------

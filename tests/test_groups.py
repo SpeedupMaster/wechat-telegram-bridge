@@ -25,6 +25,8 @@ class GroupDaemon(FakeDaemon):
         self.ops_by_key: dict[str, dict] = {}
         self.refreshed: list[str] = []
         self.mutation_error: tuple[int, str] | None = None
+        self.members_error: tuple[int, str] | None = None
+        self.member_lookup: dict[tuple[str, str], dict | None] = {}
 
     def add_group(self, gid, name, **extra):
         self.add_thread(gid, name, kind="group")
@@ -66,6 +68,17 @@ class GroupDaemon(FakeDaemon):
         if rest[0] == "groups" and len(rest) == 2 and m == "GET":
             g = self.groups.get(rest[1])
             return httpx.Response(200, json=g) if g else httpx.Response(404, json={"error": {"code": "not_found"}})
+        if rest[0] == "groups" and len(rest) == 3 and rest[2] == "members" and m == "GET" and self.members_error:
+            st, code = self.members_error
+            return httpx.Response(st, json={"error": {"code": code}})
+        if rest[0] == "groups" and len(rest) == 4 and rest[2] == "members" and m == "GET":
+            key_m = (rest[1], rest[3])
+            if key_m in self.member_lookup:
+                mem = self.member_lookup[key_m]
+            else:
+                mem = next((x for x in self.group_members.get(rest[1], [])
+                            if not x.get("deleted") and (x.get("id") == rest[3] or x.get("username") == rest[3])), None)
+            return httpx.Response(200, json={"state": "present" if mem else "unconfirmed", "member": mem})
         return super().handler(request)
 
 
@@ -277,6 +290,43 @@ class GroupTests(unittest.IsolatedAsyncioTestCase):
         cb = await self.click(kw["buttons"], "建群（1 人）")
         self.assertIn("至少要选 2 位好友", cb.answers[-1][0])
         self.assertEqual(len(self.daemon.mutations), 1)
+
+    async def test_group_card_resolves_owner_and_admins_by_remark_and_nickname(self):
+        self.daemon.groups[ROOM]["administratorIds"] = ["lucifer231", "wxid_nonfriend"]
+        self.daemon.add_contact("wxid_owner", "Olivia", remark="老板", nickname="Olivia")
+        self.daemon.add_contact("lucifer231", "Sophia", remark=None, nickname="Sophia")
+        self.daemon.group_members[ROOM] = [
+            {"id": "wxid_me", "displayName": "Me"},
+            # Older profile where group roster missed my remark, and another row that only echoed its ID.
+            {"id": "wxid_owner", "displayName": "Olivia", "roomDisplayName": "Olivia"},
+            {"id": "lucifer231", "displayName": "lucifer231", "roomDisplayName": None, "nickname": None},
+            {"id": "wxid_nonfriend", "displayName": "财务小王", "roomDisplayName": "财务小王"},
+            {"id": "wxid_gone", "deleted": True, "version": "v2"},
+        ]
+        card = await self.send("/group")
+        self.assertIn("成员：4 人", card.text)
+        self.assertIn("群主：老板", card.text)
+        self.assertIn("管理员：Sophia、财务小王", card.text)
+
+    async def test_group_card_resolves_roles_when_member_list_unavailable(self):
+        self.b.wx._read_retry_delays = ()
+        self.daemon.members_error = (500, "profile_unavailable")
+        self.daemon.groups[ROOM]["administratorIds"] = ["wxid_nick", "wxid_ext", "wxid_unknown"]
+        self.daemon.add_contact("wxid_owner", "李总", remark="李总", nickname="老李")
+        self.daemon.add_contact("wxid_nick", "小陈", remark=None, nickname="小陈")
+        self.daemon.member_lookup[(ROOM, "wxid_ext")] = {"id": "wxid_ext", "displayName": "外部顾问"}
+
+        card = await self.send("/group")
+        self.assertNotIn("成员：", card.text)
+        self.assertIn("群主：李总", card.text)
+        self.assertIn("管理员：小陈、外部顾问、wxid_unknown", card.text)
+
+        # Updating a contact's remark and clicking "从微信刷新" bypasses the cached contact name.
+        self.daemon.add_contact("wxid_owner", "李董事长", remark="李董事长", nickname="老李")
+        self.daemon.members_error = None
+        cb = await self.click(card.kwargs["buttons"], "从微信刷新")
+        self.assertIn("群主：李董事长", cb.edits[-1][0])
+        self.assertIn("成员：4 人", cb.edits[-1][0])
 
     async def test_incoming_mentions_are_tagged(self):
         self.daemon.add_message("g2", ROOM, "看下", sender="wxid_bob",

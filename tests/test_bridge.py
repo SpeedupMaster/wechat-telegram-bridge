@@ -228,6 +228,11 @@ class FakeDaemon:
                 not q or q in (t.get("displayName") or "").lower() or q in t["id"].lower())]
             return httpx.Response(200, json={"items": items})
         if rest[0] == "groups" and rest[2] == "members" and len(rest) == 3:
+            limit_raw = request.url.params.get("limit")
+            if limit_raw is not None:
+                lim = int(limit_raw)
+                if lim == 0 or lim > 200:
+                    return httpx.Response(400, json={"error": {"code": "invalid_request"}})
             search = request.url.params.get("search")
             self.member_searches.append((rest[1], search))
             members = list(self.group_members.get(rest[1], []))
