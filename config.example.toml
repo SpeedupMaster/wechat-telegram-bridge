@@ -3,7 +3,7 @@
 #   本地运行：复制到项目根目录的 config.toml
 # 环境变量（.env）会覆盖这里的同名设置：TG_API_ID、TG_API_HASH、TG_BOT_TOKEN、TG_PROXY、
 # WECHAT_URL、WECHAT_TOKEN、WECHAT_TOKEN_FILE、WECHAT_ACCOUNT、BRIDGE_DATA_DIR、BRIDGE_MODE、TG_FORUM_CHAT、
-# BRIDGE_OFFICIAL_ACCOUNTS、TG_OA_FORUM_CHAT、AUTO_RELOGIN
+# BRIDGE_OFFICIAL_ACCOUNTS、TG_OA_FORUM_CHAT、EMOJI_TO_WECHAT、AUTO_RELOGIN
 
 [wechat]
 # agent-wechat 守护进程（wx serve）的地址。用本项目的 compose.yaml 部署时不用填
@@ -72,6 +72,9 @@ friend_requests = true
 auto_rename = true
 # 将 Telegram 发送的 GIF 动图转为微信表情包发送（需 agent-wechat >= 2.4.0，失败时自动回退为视频）
 gif_as_sticker = true
+# 可选：将 Telegram 发送的常见 Unicode Emoji 反向转为微信自带小黄脸代码（环境变量 EMOJI_TO_WECHAT，默认关闭）
+#   例如 😁 → [呲牙]、🤦‍♂️/🤦 → [捂脸]、🫡 → [社会社会]；关闭时原样发送 Unicode Emoji
+emoji_to_wechat = false
 # 可选：微信掉线/退出登录后自动尝试重新登录一次（环境变量 AUTO_RELOGIN，默认关闭）
 #   前提：需先在手机微信中为本设备开启「自动登录该设备」
 #   防风控机制：检测到掉线后先随机延迟一段时间再发起单次登录；失败/需扫码/超时会立即取消并提醒手动登录，

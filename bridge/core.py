@@ -20,6 +20,7 @@ from . import cards, stickers
 from . import callweb, tghtml
 from .callweb import CallActionError, CallWeb
 from .contacts import ContactsMixin, friendly as contact_error
+from .emojis import WX_EMOJIS, replace_wx_emojis, unicode_to_wx_emojis
 from .groups import GROUP_COMMANDS, GroupsMixin
 from .login import LoginMixin
 from .store import Store
@@ -319,35 +320,29 @@ def _esc(s: str | None) -> str:
     return html.escape(s or "")
 
 
-WX_EMOJIS = {
-    "微笑": "🙂", "撇嘴": "😒", "色": "😍", "发呆": "😳", "得意": "😎", "流泪": "😭", "害羞": "😊",
-    "闭嘴": "🤐", "睡": "😴", "大哭": "😭", "尴尬": "😅", "发怒": "😡", "调皮": "😜", "呲牙": "😁",
-    "惊讶": "😮", "难过": "😔", "囧": "😳", "抓狂": "😫", "吐": "🤮", "偷笑": "🤭", "愉快": "😊",
-    "白眼": "🙄", "傲慢": "😤", "困": "😪", "惊恐": "😱", "憨笑": "😄", "悠闲": "😌", "咒骂": "🤬",
-    "疑问": "❓", "嘘": "🤫", "晕": "😵", "衰": "😞", "骷髅": "💀", "敲打": "🔨", "再见": "👋",
-    "擦汗": "😅", "抠鼻": "🤥", "鼓掌": "👏", "坏笑": "😏", "右哼哼": "😤", "鄙视": "😒", "委屈": "😢",
-    "快哭了": "😢", "阴险": "😈", "亲亲": "😘", "可怜": "🥺", "菜刀": "🔪", "西瓜": "🍉", "啤酒": "🍺",
-    "咖啡": "☕", "猪头": "🐷", "玫瑰": "🌹", "凋谢": "🥀", "嘴唇": "💋", "爱心": "❤️", "心碎": "💔",
-    "蛋糕": "🎂", "炸弹": "💣", "便便": "💩", "月亮": "🌙", "太阳": "☀️", "拥抱": "🤗", "强": "👍",
-    "弱": "👎", "握手": "🤝", "胜利": "✌️", "抱拳": "🙏", "勾引": "🤙", "拳头": "✊", "OK": "👌",
-    "笑脸": "😄", "生病": "😷", "脸红": "😳", "恐惧": "😨", "失望": "😞", "无语": "😑", "嘿哈": "🤣",
-    "捂脸": "🤦", "奸笑": "😏", "机智": "🧐", "皱眉": "😟", "耶": "✌️", "吃瓜": "🍉", "加油": "💪",
-    "汗": "😓", "天啊": "😱", "旺柴": "🐶", "好的": "👌", "打脸": "🤦", "哇": "🤩", "翻白眼": "🙄",
-    "破涕为笑": "😂", "笑哭": "😂", "叹气": "😮‍💨", "苦涩": "🥲", "裂开": "💔", "合十": "🙏", "赞": "👍",
-    "庆祝": "🎉", "礼物": "🎁", "红包": "🧧", "烟花": "🎆", "爆竹": "🧨",
-}
-_WX_EMOJI_RE = re.compile(r"\[(" + "|".join(re.escape(k) for k in WX_EMOJIS) + r")\]")
 _WX_TOPIC_RE = re.compile(r"(?<![A-Za-z0-9_/:.?&=])#([^\s#<>/?&=]{1,30})#")
 _TOPIC_BOUNDARY = set(" \t\r\n,，。！？、；：.!?;:)）]】\"'”’")
 
 
+def _clip_text(text: str, limit: int) -> str:
+    """Truncate text to at most `limit` codepoints without splitting a ZWJ/variation-selector emoji cluster."""
+    if len(text) <= limit:
+        return text
+    cut = limit
+    while cut > 0 and (
+        text[cut] in ("\ufe0f", "\u200d")
+        or text[cut - 1] == "\u200d"
+        or 0x1F3FB <= ord(text[cut]) <= 0x1F3FF
+    ):
+        cut -= 1
+    return text[:cut]
+
+
 def _normalize_wx_text(s: str | None) -> str:
-    """Convert WeChat #topic# tags and [emoji] codes into plain Telegram-friendly text."""
-    text = s or ""
+    """Convert WeChat #topic# tags and built-in emoji codes into plain Telegram-friendly text."""
+    text = replace_wx_emojis(s)
     if not text:
         return ""
-    if "[" in text:
-        text = _WX_EMOJI_RE.sub(lambda m: WX_EMOJIS[m.group(1)], text)
     if "#" in text:
         def _topic_sub(m: re.Match) -> str:
             lead = " " if m.start() > 0 and ("\u4e00" <= text[m.start() - 1] <= "\u9fff") else ""
@@ -688,13 +683,28 @@ def _fingerprint(m) -> tuple:
     return (getattr(m, "message", None) or "", type(media).__name__ if media else "")
 
 
+def _dice_text(media) -> str:
+    """Turn a Telegram interactive emoji (`MessageMediaDice`: 🎲/🎯/🏀/⚽/🎳/🎰) into plain text for WeChat."""
+    if not isinstance(media, types.MessageMediaDice):
+        return ""
+    emo = (getattr(media, "emoticon", None) or "").strip()
+    if not emo:
+        return ""
+    val = getattr(media, "value", None)
+    if emo == "🎲" and isinstance(val, int) and 1 <= val <= 6:
+        return f"🎲 {val}"
+    return emo
+
+
 def _tg_msg_fingerprint(m) -> tuple:
     """Fingerprint a user-sent message across user and bot sessions, including Telegram media IDs."""
     media = getattr(m, "media", None)
-    if isinstance(media, types.MessageMediaWebPage):
+    if isinstance(media, (types.MessageMediaWebPage, types.MessageMediaEmpty)):
         media = None
     media_id = None
-    if media is not None:
+    if isinstance(media, types.MessageMediaDice):
+        media_id = (getattr(media, "emoticon", None), getattr(media, "value", None))
+    elif media is not None:
         media_id = getattr(getattr(media, "document", None), "id", None) or getattr(
             getattr(media, "photo", None), "id", None)
     return (getattr(m, "message", None) or "", type(media).__name__ if media else "", media_id)
@@ -717,7 +727,10 @@ def _describe_tg_msg(msg) -> str:
     if getattr(msg, "video", None):
         return f"视频「{snippet}」" if snippet else "视频"
     media = getattr(msg, "media", None)
-    if media and not isinstance(media, types.MessageMediaWebPage):
+    if isinstance(media, types.MessageMediaDice):
+        emo = (getattr(media, "emoticon", None) or "").strip()
+        return f"「{emo}」" if emo else "表情"
+    if media and not isinstance(media, (types.MessageMediaWebPage, types.MessageMediaEmpty)):
         f = getattr(msg, "file", None)
         name = (getattr(f, "name", None) or "").strip()
         return f"文件 {name}" if name else "文件"
@@ -782,8 +795,8 @@ def _is_mention_boundary(name: str, after: str) -> bool:
     return name[-1].isascii() and not ch.isascii()
 
 
-def _match_mentions(text: str, members: list[dict]) -> dict | None:
-    """Resolve @all/@所有人 and @memberName occurrences in `text` to an agent-wechat mentions payload."""
+def _match_mentions_with_spans(text: str, members: list[dict]) -> tuple[dict | None, list[tuple[int, int]]]:
+    """Resolve @all/@所有人 and @memberName occurrences in `text` and return matched character spans."""
     candidates: list[tuple[str, str]] = []
     for m in members:
         uid = m.get("id")
@@ -797,6 +810,7 @@ def _match_mentions(text: str, members: list[dict]) -> dict | None:
 
     mention_all = False
     user_ids: list[str] = []
+    spans: list[tuple[int, int]] = []
     i = 0
     while (pos := text.find("@", i)) != -1:
         if pos > 0 and text[pos - 1].isalnum():
@@ -805,10 +819,12 @@ def _match_mentions(text: str, members: list[dict]) -> dict | None:
         rest = text[pos + 1:]
         if rest.startswith("所有人") and _is_mention_boundary("所有人", rest[3:]):
             mention_all = True
+            spans.append((pos, pos + 4))
             i = pos + 4
             continue
         if rest[:3].lower() == "all" and _is_mention_boundary("all", rest[3:]):
             mention_all = True
+            spans.append((pos, pos + 4))
             i = pos + 4
             continue
         matched_len = 0
@@ -819,10 +835,33 @@ def _match_mentions(text: str, members: list[dict]) -> dict | None:
                 matched_len = len(name)
                 if uid not in user_ids:
                     user_ids.append(uid)
+        if matched_len:
+            spans.append((pos, pos + 1 + matched_len))
         i = pos + 1 + (matched_len or 0)
     if not mention_all and not user_ids:
-        return None
-    return {"all": mention_all, "userIds": user_ids}
+        return None, []
+    return {"all": mention_all, "userIds": user_ids}, spans
+
+
+def _match_mentions(text: str, members: list[dict]) -> dict | None:
+    """Resolve @all/@所有人 and @memberName occurrences in `text` to an agent-wechat mentions payload."""
+    return _match_mentions_with_spans(text, members)[0]
+
+
+def _tg_text_to_wx(text: str, mention_spans: list[tuple[int, int]]) -> str:
+    """Convert Telegram Unicode emojis to WeChat [emoji] codes while preserving matched @mention names."""
+    if not mention_spans:
+        return unicode_to_wx_emojis(text)
+    out: list[str] = []
+    pos = 0
+    for start, end in mention_spans:
+        if start > pos:
+            out.append(unicode_to_wx_emojis(text[pos:start]))
+        out.append(text[start:end])
+        pos = end
+    if pos < len(text):
+        out.append(unicode_to_wx_emojis(text[pos:]))
+    return "".join(out)
 
 
 class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
@@ -1623,7 +1662,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 return note + _link_body(link, inline_url=True)
             return _fmt_wx_text(body)
         if t == SYSTEM:
-            return f"<i>{_esc(body)}</i>"
+            return f"<i>{_esc(replace_wx_emojis(body))}</i>"
         if t == LOCATION:
             loc = msg.get("location") or {}
             return "📍 " + _esc(" ".join(x for x in (loc.get("name"), loc.get("address")) if x) or body)
@@ -1733,7 +1772,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         q = msg.get("quote") or {}
         text = self._quote_inline_text(q) or (self._quote_msg_summary(orig) if orig else "") or "…"
         who = q.get("senderName") or ""
-        return f"<blockquote>{_esc(who + '：' if who else '')}{_fmt_wx_text(text[:200])}</blockquote>"
+        return f"<blockquote>{_esc(who + '：' if who else '')}{_esc(_clip_text(_normalize_wx_text(text), 200))}</blockquote>"
 
     # --- sending to Telegram ----------------------------------------------
     async def forward_to_tg(self, chat: int, thread: dict, msg: dict) -> None:
@@ -2132,7 +2171,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             return
         text = "↩️ 这条消息已在微信中撤回"
         if data.get("replacementText"):
-            text += f"\n<i>{_esc(data['replacementText'])}</i>"
+            text += f"\n<i>{_esc(replace_wx_emojis(data['replacementText']))}</i>"
         try:
             await self.bot.send_message(hit[0], text, reply_to=hit[1], parse_mode="html", silent=True)
         except Exception as e:
@@ -3402,7 +3441,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     if r_wx_msg:
                         quote_ref = {"messageId": r_wx_msg, "serverId": r_server}
 
-        mentions = await self._resolve_mentions(thread_id, text) if text else None
+        dice_text = _dice_text(msg.media)
+        if dice_text and not text:
+            text = dice_text
+
+        mentions, mention_spans = await self._resolve_mentions_with_spans(thread_id, text) if text else (None, [])
+        wx_text = _tg_text_to_wx(text, mention_spans) if (text and self.cfg.bridge.emoji_to_wechat) else text
 
         label = _describe_tg_msg(msg)
         fail_prefix = f"发送{label}到微信失败：" if label.startswith("「") else f"发送[{label}]到微信失败："
@@ -3410,7 +3454,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.pending_sends[thread_id] += 1
         try:
             result = None
-            if msg.media and not isinstance(msg.media, (types.MessageMediaWebPage,)):
+            if msg.media and not isinstance(msg.media, (types.MessageMediaWebPage, types.MessageMediaDice,
+                                                        types.MessageMediaEmpty)):
                 want_sticker = bool(msg.sticker or (msg.gif and self.cfg.bridge.gif_as_sticker))
                 native_stickers = await self.wx.supports_stickers() if want_sticker else False
                 kind, media = await self._tg_media(msg, native_stickers=native_stickers)
@@ -3422,14 +3467,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     else:
                         result = await self.wx.send_media(thread_id, kind, media, key)
                     self._record_send(chat_id, msg.id, thread_id, result, media=True)
-                    if text:  # caption goes as a separate text message
-                        result = await self.wx.send_text(thread_id, text, key + "-caption", mentions=mentions)
+                    if wx_text:  # caption goes as a separate text message
+                        result = await self.wx.send_text(thread_id, wx_text, key + "-caption", mentions=mentions)
                         self._record_send(chat_id, msg.id, thread_id, result)
-            elif text:
+            elif wx_text:
                 result = None
                 if quote_ref:
                     try:
-                        result = await self.wx.send_text(thread_id, text, key, quote_ref, mentions)
+                        result = await self.wx.send_text(thread_id, wx_text, key, quote_ref, mentions)
                     except WeChatError as e:
                         if e.status >= 500:
                             raise
@@ -3438,9 +3483,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         log.info("Quote send failed (%s); sending without it", result.get("errorCode"))
                         result = None
                     if result is None:
-                        result = await self.wx.send_text(thread_id, text, key + "-plain", mentions=mentions)
+                        result = await self.wx.send_text(thread_id, wx_text, key + "-plain", mentions=mentions)
                 else:
-                    result = await self.wx.send_text(thread_id, text, key, mentions=mentions)
+                    result = await self.wx.send_text(thread_id, wx_text, key, mentions=mentions)
                 self._record_send(chat_id, msg.id, thread_id, result)
             if result is not None:
                 state = result.get("state")
@@ -3463,22 +3508,26 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         finally:
             self.pending_sends[thread_id] -= 1
 
-    async def _resolve_mentions(self, thread_id: str, text: str) -> dict | None:
+    async def _resolve_mentions_with_spans(self, thread_id: str, text: str) -> tuple[dict | None, list[tuple[int, int]]]:
         if not thread_id.endswith("@chatroom") or "@" not in text:
-            return None
-        if (m := _match_mentions(text, [])) and not any(
+            return None, []
+        m, spans = _match_mentions_with_spans(text, [])
+        if m and not any(
             (pos := i) >= 0 and (pos == 0 or not text[pos - 1].isalnum())
             and not (text[pos + 1:].startswith("所有人") and _is_mention_boundary("所有人", text[pos + 4:]))
             and not (text[pos + 1:pos + 4].lower() == "all" and _is_mention_boundary("all", text[pos + 4:]))
             for i, ch in enumerate(text) if ch == "@"
         ):
-            return m
+            return m, spans
         try:
             members = await self.wx.group_members(thread_id)
         except WeChatError as e:
             log.info("Could not load group members for %s (%s); sending without mentions", thread_id, e.code)
-            return _match_mentions(text, [])
-        return _match_mentions(text, members)
+            return m, spans
+        return _match_mentions_with_spans(text, members)
+
+    async def _resolve_mentions(self, thread_id: str, text: str) -> dict | None:
+        return (await self._resolve_mentions_with_spans(thread_id, text))[0]
 
     async def _send_members(self, chat_id: int, reply_to: int, thread_id: str, query: str) -> None:
         if not thread_id.endswith("@chatroom"):

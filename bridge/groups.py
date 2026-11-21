@@ -13,6 +13,7 @@ import secrets
 from telethon import Button
 
 from .contacts import CONTACT_ERRORS
+from .emojis import replace_wx_emojis
 from .wechat import OP_DONE, OP_OK, WeChatError
 
 log = logging.getLogger("groups")
@@ -223,7 +224,7 @@ class GroupsMixin:
         lines.append(f"我的群昵称：{_esc(g.get('myDisplayName')) or '（未设置）'}")
         muted = g.get("muted")
         lines.append("消息免打扰：" + ("🔕 已开启" if muted else "🔔 未开启" if muted is False else "❔ 未知"))
-        announcement = (g.get("announcement") or "").strip()
+        announcement = replace_wx_emojis((g.get("announcement") or "").strip())
         if announcement:
             short = announcement if len(announcement) <= 300 else announcement[:300] + "…"
             lines += ["", "📌 <b>群公告</b>", _esc(short)]

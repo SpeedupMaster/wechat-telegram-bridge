@@ -65,6 +65,7 @@ class BridgeConfig:
     friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
     auto_rename: bool = True  # follow WeChat remark/group-name changes in Telegram titles
     gif_as_sticker: bool = True
+    emoji_to_wechat: bool = False  # convert common Telegram Unicode emojis to WeChat [emoji] codes when sending
     # Optional one-shot auto-relogin after WeChat signs out (requires "自动登录该设备" enabled on mobile WeChat).
     auto_relogin: bool = False
     auto_relogin_delay_min: float = 45.0       # minimum human-like wait (seconds) before attempting auto-relogin
@@ -95,6 +96,8 @@ class BridgeConfig:
         host, sep, port = str(self.call_web_listen or "").strip().rpartition(":")
         if not sep or not port.isdigit() or not host:
             raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
+        if not isinstance(self.emoji_to_wechat, bool):
+            raise ValueError(f"[bridge] emoji_to_wechat must be true or false, not {self.emoji_to_wechat!r}")
         if not isinstance(self.auto_relogin, bool):
             raise ValueError(f"[bridge] auto_relogin must be true or false, not {self.auto_relogin!r}")
         for name in (
@@ -162,10 +165,11 @@ ENV = {
     "CALL_WEB_URL": ("bridge", "call_web_url"),
     "CALL_WEB_LISTEN": ("bridge", "call_web_listen"),
     "CALL_WEB_APP": ("bridge", "call_web_app"),
+    "EMOJI_TO_WECHAT": ("bridge", "emoji_to_wechat"),
     "AUTO_RELOGIN": ("bridge", "auto_relogin"),
 }
 INT_KEYS = {"api_id", "forum_chat", "official_accounts_forum_chat"}
-BOOL_KEYS = {"auto_relogin", "bridge_official_accounts"}
+BOOL_KEYS = {"auto_relogin", "bridge_official_accounts", "emoji_to_wechat"}
 
 
 def _parse_bool(var: str, value: str) -> bool:

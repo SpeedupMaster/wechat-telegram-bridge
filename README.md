@@ -36,7 +36,7 @@
 - **无损切换**：两种模式的绑定关系在数据库中分开保存，随时修改 `BRIDGE_MODE` 切换不会丢失已有绑定。
 
 ### 2. 全类型消息双向互通
-- **文字与富文本**：自动将微信 `#话题#` 转换为 Telegram 可点击高亮标签，将 `[捂脸]`、`[破涕为笑]` 等百余种微信内置表情转换为对应 Emoji。
+- **文字与富文本**：自动将微信 `#话题#` 转换为 Telegram 可点击高亮标签，完整转换微信内置小黄脸（含简/繁/英、旧式斜杠代码与历史 PUA 表情）为标准 Emoji；支持 Telegram 互动表情（`🎲`/`🎯`/`🏀`/`⚽`/`🎳`/`🎰`）转发，并可通过 `EMOJI_TO_WECHAT` 按需将 Telegram 常见 Emoji 反向转为微信小黄脸。
 - **原图、视频与大文件直传**：
   - **突破 Bot API 体积限制**：直连 Telegram MTProto 协议（协议层最高支持 2 GB，桥接默认限制 `max_media_mb = 200`）。
   - **流式下载与断点续传**：微信附件采用流式分块下载（`≤ 8 MiB` 留存内存，超出部分自动落盘至临时文件并支持 HTTP `Range` 断点续传，转发后自动清理），传输大视频/大文件不会撑爆内存。
@@ -330,6 +330,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `CALL_WEB_APP` | 否 | 空 | `@BotFather` `/newapp` 注册的 Mini App 短名称 |
 | `COMPOSE_PROFILES` | 否 | 空 | 设为 `cloudflare` 时随 Compose 启动内置的 `cloudflared` 隧道容器 |
 | `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
+| `EMOJI_TO_WECHAT` | 否 | `false` | 是否将 Telegram 发送的常见 Emoji 反向转为微信自带小黄脸代码（如 `😁` → `[呲牙]`、`🤦` → `[捂脸]`、`🫡` → `[社会社会]`） |
 | `AUTO_RELOGIN` | 否 | `false` | 微信掉线后是否自动尝试重新登录一次（需手机微信开启「自动登录该设备」，内置随机延迟与冷却保护，失败则提醒手动登录） |
 | `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v2.9.0`） |
 
@@ -359,6 +360,7 @@ cp config.example.toml config/config.toml
 | `friend_requests` | `true` | 是否把新的微信好友请求推送到机器人私聊（需 `agent-wechat >= 2.7.0`） |
 | `auto_rename` | `true` | 微信备注/群名变化后是否自动更新 Telegram 群/话题标题（关闭后可发 `/rename` 手动同步） |
 | `gif_as_sticker` | `true` | 是否将 Telegram 发送的 GIF 动图转为微信原生表情发送 |
+| `emoji_to_wechat` | `false` | 是否将 Telegram 发送的常见 Unicode Emoji 反向转为微信小黄脸代码（环境变量 `EMOJI_TO_WECHAT`，如 `😁` → `[呲牙]`、`🤦` → `[捂脸]`、`🫡` → `[社会社会]`） |
 | `auto_relogin` | `false` | 微信退出登录后是否自动尝试重新登录一次（环境变量 `AUTO_RELOGIN`；需在手机微信开启「自动登录该设备」，失败/需扫码/超时会取消并提醒手动登录，不循环重试） |
 | `auto_relogin_delay_min` | `45` | 检测到掉线后发起自动登录前的最短随机延迟（秒），避免瞬时重登触发风控 |
 | `auto_relogin_delay_max` | `180` | 检测到掉线后发起自动登录前的最长随机延迟（秒） |

@@ -340,6 +340,12 @@ class GroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📢<b>@所有人</b>", self.b.bot.sent[-1].text)
         self.assertNotIn("@我", self.b.bot.sent[0].text)
 
+    async def test_group_announcement_renders_wechat_emojis(self):
+        self.daemon.groups[ROOM]["announcement"] = "欢迎新朋友[社会社会][玫瑰]"
+        card = await self.send("/group")
+        self.assertIn("欢迎新朋友🫡🌹", card.text)
+        self.assertNotIn("[社会社会]", card.text)
+
 
 if __name__ == "__main__":
     unittest.main()

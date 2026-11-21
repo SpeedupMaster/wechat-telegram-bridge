@@ -1999,6 +1999,135 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         sent2 = self.b.bot.sent[-1].text
         self.assertIn("看看 #日常 #搞笑 还挺好😂 https://a.b/#x#1 &lt;tag&gt;", sent2)
 
+        # Newly covered official WeChat emojis (e.g. [社会社会]), system pat notices, and quote truncation boundaries
+        self.daemon.add_message("m3", "wxid_alice", "有的，最近我们找供应商把材料价格压了，正在核算新价格[社会社会]")
+        await self.event("m3", "wxid_alice")
+        self.assertEqual(self.b.bot.sent[-1].text, "有的，最近我们找供应商把材料价格压了，正在核算新价格🫡")
+
+        self.daemon.add_message("m4", "wxid_alice", "Alice 拍了拍我[社会社会]", type=10000)
+        await self.event("m4", "wxid_alice")
+        self.assertEqual(self.b.bot.sent[-1].text, "<i>Alice 拍了拍我🫡</i>")
+
+        # Quote preview truncates after emoji conversion so [社会社会] straddling index 200 isn't chopped in half
+        long_quoted = "a" * 198 + "[社会社会]尾"
+        self.daemon.add_message("m5", "wxid_alice", "同意", type=49, appMessageType=57,
+                                quote={"senderName": "Alice", "embeddedText": long_quoted})
+        await self.event("m5", "wxid_alice")
+        self.assertIn("<blockquote>Alice：" + "a" * 198 + "🫡尾</blockquote>", self.b.bot.sent[-1].text)
+        self.assertNotIn("[社会", self.b.bot.sent[-1].text)
+
+    async def test_tg_dice_interactive_emojis_sent_as_text(self):
+        from bridge.core import _describe_tg_msg, _tg_msg_fingerprint
+
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_message("m0", "wxid_alice", "hello", server="100")
+        await self.event("m0", "wxid_alice")
+        chat = self.b.store.chat_for_thread("wxid_alice")
+        orig_tg_id = self.b.bot.sent[-1].id
+
+        async def _fail_download(*args, **kwargs):
+            return None
+
+        def dice_event(msg_id, emoticon, value, reply_to=None):
+            media = types.MessageMediaDice(value=value, emoticon=emoticon)
+            msg = SimpleNamespace(
+                id=msg_id, message="", action=None, via_bot_id=None, media=media,
+                file=None, sticker=None, photo=None, voice=None, video=None, video_note=None, gif=None,
+                download_media=_fail_download,
+                reply_to=SimpleNamespace(reply_to_msg_id=reply_to) if reply_to else None,
+            )
+            return SimpleNamespace(message=msg, chat_id=chat)
+
+        bot_before = len(self.b.bot.sent)
+        cases = [
+            (201, "🎲", 4, "🎲 4"),
+            (202, "🎯", 6, "🎯"),
+            (203, "🏀", 5, "🏀"),
+            (204, "⚽", 3, "⚽"),
+            (205, "🎳", 6, "🎳"),
+            (206, "🎰", 64, "🎰"),
+        ]
+        for mid, emo, val, want in cases:
+            ev = dice_event(mid, emo, val)
+            self.assertEqual(_describe_tg_msg(ev.message), f"「{emo}」")
+            await self.b.on_tg_message(ev)
+            self.assertEqual(self.daemon.sends[-1][0]["text"], want)
+            self.assertIsNotNone(self.b.store.wx_for_tg(chat, mid))
+
+        # No error report posted to Telegram
+        self.assertEqual(len(self.b.bot.sent), bot_before)
+
+        # Distinct dice values produce distinct fingerprints for user/bot pairing
+        self.assertNotEqual(
+            _tg_msg_fingerprint(dice_event(207, "🎲", 1).message),
+            _tg_msg_fingerprint(dice_event(208, "🎲", 6).message),
+        )
+
+        # Replying to a WeChat message with a dice emoji forwards it as a quoted text reply
+        self.b.store.map_message(chat, "user", orig_tg_id, "wxid_alice", "m0", "100")
+        await self.b.on_tg_message(dice_event(209, "🎲", 2, reply_to=orig_tg_id))
+        last_body = self.daemon.sends[-1][0]
+        self.assertEqual(last_body["text"], "🎲 2")
+        self.assertEqual(last_body["quote"], {"messageId": "m0", "serverId": "100"})
+
+    async def test_tg_emoji_to_wechat_optional_reverse_mapping(self):
+        from bridge.config import BridgeConfig, load_config
+
+        # 1) Config & env parsing (defaults to False)
+        base_env = {"TG_API_ID": "1", "TG_API_HASH": "h", "TG_BOT_TOKEN": "b", "WECHAT_TOKEN": "t"}
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(Path(tmp) / "missing.toml", base_env)
+            self.assertFalse(cfg.bridge.emoji_to_wechat)
+            cfg = load_config(Path(tmp) / "missing.toml", {**base_env, "EMOJI_TO_WECHAT": "true"})
+            self.assertTrue(cfg.bridge.emoji_to_wechat)
+            with self.assertRaisesRegex(ValueError, "EMOJI_TO_WECHAT"):
+                load_config(Path(tmp) / "missing.toml", {**base_env, "EMOJI_TO_WECHAT": "maybe"})
+            toml_path = Path(tmp) / "config.toml"
+            toml_path.write_text("[bridge]\nemoji_to_wechat = true\n", encoding="utf-8")
+            self.assertTrue(load_config(toml_path, base_env).bridge.emoji_to_wechat)
+            self.assertFalse(load_config(toml_path, {**base_env, "EMOJI_TO_WECHAT": "0"}).bridge.emoji_to_wechat)
+            with self.assertRaisesRegex(ValueError, "emoji_to_wechat must be true or false"):
+                BridgeConfig(emoji_to_wechat="true")  # type: ignore[arg-type]
+
+        # 2) Direct chat: off by default, converts when enabled (text + media caption)
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_message("m0", "wxid_alice", "hi", server="100")
+        await self.event("m0", "wxid_alice")
+        chat = self.b.store.chat_for_thread("wxid_alice")
+
+        self.assertFalse(self.b.cfg.bridge.emoji_to_wechat)
+        await self.b.on_tg_message(tg_event(chat, 301, "好的😁🤦‍♂️🫡"))
+        self.assertEqual(self.daemon.sends[-1][0]["text"], "好的😁🤦‍♂️🫡")
+
+        self.b.cfg.bridge.emoji_to_wechat = True
+        await self.b.on_tg_message(tg_event(chat, 302, "好的😁🤦‍♂️🫡❤️‍🔥"))
+        self.assertEqual(self.daemon.sends[-1][0]["text"], "好的[呲牙][捂脸][社会社会]❤️‍🔥")
+
+        async def _dl_photo(file=None):
+            return b"\xff\xd8\xff\xe0jpg"
+
+        photo_msg = SimpleNamespace(
+            id=303, message="拍得好👍🏻❤️", action=None, via_bot_id=None,
+            media=object(), photo=object(), sticker=None, voice=None, video=None, video_note=None, gif=None,
+            file=SimpleNamespace(size=10, mime_type="image/jpeg", ext=".jpg", name="a.jpg"),
+            download_media=_dl_photo, reply_to=None,
+        )
+        await self.b.on_tg_message(SimpleNamespace(message=photo_msg, chat_id=chat))
+        self.assertEqual(self.daemon.sends[-1][0]["text"], "拍得好[强][爱心]")
+
+        # 3) Group @mention still resolves member names containing Unicode emoji before emoji conversion
+        room = "room_emoji@chatroom"
+        self.daemon.add_thread(room, "Emoji Room", kind="group")
+        self.daemon.group_members[room] = [{"id": "wxid_bob", "displayName": "Bob🐶"}]
+        self.daemon.add_message("gm0", room, "yo", sender="wxid_bob", server="200")
+        await self.event("gm0", room)
+        gchat = self.b.store.chat_for_thread(room)
+
+        await self.b.on_tg_message(tg_event(gchat, 304, "@Bob🐶 来看下😁"))
+        sent_body = self.daemon.sends[-1][0]
+        self.assertEqual(sent_body.get("mentions"), {"all": False, "userIds": ["wxid_bob"]})
+        self.assertEqual(sent_body["text"], "@Bob🐶 来看下[呲牙]")
+
     async def test_telegram_recall_via_command_and_delete(self):
         self.daemon.add_thread("wxid_alice", "Alice")
         self.daemon.add_message("m0", "wxid_alice", "incoming", server="100")

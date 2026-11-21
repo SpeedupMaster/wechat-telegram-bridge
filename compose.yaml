@@ -107,6 +107,7 @@ services:
       CALL_WEB_URL: ${CALL_WEB_URL:-}
       CALL_WEB_LISTEN: ${CALL_WEB_LISTEN:-}
       CALL_WEB_APP: ${CALL_WEB_APP:-}
+      EMOJI_TO_WECHAT: ${EMOJI_TO_WECHAT:-}
       AUTO_RELOGIN: ${AUTO_RELOGIN:-}
       WECHAT_URL: http://127.0.0.1:6174
       WECHAT_TOKEN_FILE: /token/bridge-token
