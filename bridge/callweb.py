@@ -1074,6 +1074,28 @@ PAGE_HTML = r"""<!doctype html>
 <meta name="robots" content="noindex">
 <meta name="theme-color" content="#14161b">
 <title>微信通话</title>
+<script>
+// Article reader links share this Mini App URL. When the start parameter only arrives in the URL fragment (so the
+// server could not route it), switch to the reader before the call UI is ever painted, on the reader's background.
+(function () {
+  try {
+    if (/\/(call|read)\//.test(location.pathname)) return;
+    var hp = new URLSearchParams(location.hash.slice(1));
+    var sp = new URLSearchParams(hp.get('tgWebAppData') || '').get('start_param') || hp.get('tgWebAppStartParam') ||
+             new URLSearchParams(location.search).get('tgWebAppStartParam') || '';
+    if (sp.indexOf('r_') !== 0) return;
+    window.__wxReader = true;
+    var bg = '';
+    try { bg = JSON.parse(hp.get('tgWebAppThemeParams') || '{}').bg_color || ''; } catch (e) {}
+    if (!/^#[0-9a-fA-F]{3,8}$/.test(bg)) {
+      bg = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? '#17181c' : '#ffffff';
+    }
+    document.documentElement.style.cssText = 'background:' + bg + ';color-scheme:light dark;visibility:hidden';
+    var base = (__CFG__).base;
+    location.replace(location.origin + base + '/read/' + encodeURIComponent(sp.slice(2)) + location.hash);
+  } catch (e) {}
+})();
+</script>
 <style>
 :root{color-scheme:dark;--bg:#14161b;--fg:#f4f5f7;--hint:#8d929c;--glass:rgba(255,255,255,.12);
 --green:#07c160;--red:#f2484b;--amber:#f5a524;--gray:#7b808a}
@@ -1145,6 +1167,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
 </main>
 <script>
 (function () {
+  if (window.__wxReader) return;  // already on the way to the article reader (see <head>)
   const CFG = __CFG__;
   const WORKLET = __WORKLET__;
   const PENDING_MS = 30000;

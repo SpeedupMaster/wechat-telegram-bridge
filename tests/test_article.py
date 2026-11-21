@@ -402,6 +402,12 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
             # The call page itself redirects r_ start parameters in the browser.
             _, _, call_page = await get("/")
             self.assertIn("'/read/'", call_page)
+            # ... from <head>, before the call page's styles or UI exist, so the call screen never flashes.
+            head_redirect = call_page.index("window.__wxReader = true")
+            self.assertLess(head_redirect, call_page.index("<style>"))
+            self.assertLess(head_redirect, call_page.index("<body"))
+            self.assertIn('(window.__wxReader) return;', call_page)
+            self.assertNotIn("__CFG__", call_page)
             s4, _, t4 = await get("/read/unknownid123")
             self.assertEqual(s4, 404)
             self.assertIn("链接已失效", t4)
