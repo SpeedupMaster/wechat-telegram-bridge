@@ -439,11 +439,18 @@ def _link_url(link: dict | None) -> str:
     return url if url.startswith(("http://", "https://")) else ""
 
 
-def _link_buttons(link: dict | None, app_type: int | None, open_url: str | None = None) -> list | None:
-    """CTA button for a link card; open_url (e.g. the article reader Mini App link) replaces the raw URL."""
+def _link_buttons(link: dict | None, app_type: int | None, open_url: str | None = None,
+                  *, original: bool = False) -> list | None:
+    """CTA button for a link card; open_url (the reader Mini App link) replaces the raw URL.
+
+    original=True adds the raw URL as a second button, for pages the Mini App merely opens in place (it has no
+    address bar or "open in browser"), so a page that needs a real browser is still one tap away."""
     if url := _link_url(link):
         src = cards.identify_link_source(link, app_type)
-        return [[Button.url(src.button_label, open_url or url)]]
+        row = [Button.url(src.button_label, open_url or url)]
+        if open_url and original:
+            row.append(Button.url("🔗 原链接", url))
+        return [row]
     return None
 
 
@@ -1038,7 +1045,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.tg_ready.set()
 
     def _reader_link(self, link: dict | None) -> str | None:
-        """t.me Mini App link that opens an article / Xiaohongshu note / Douyin video in the reader (None = plain URL)."""
+        """t.me Mini App link that opens a link card in the Mini App (None = plain URL)."""
         if self.call_web is None or not (url := _link_url(link)):
             return None
         try:
@@ -1046,6 +1053,11 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         except Exception:
             log.exception("Could not create a reader link for %s", url)
             return None
+
+    def _card_buttons(self, link: dict | None, app_type: int | None) -> list | None:
+        open_url = self._reader_link(link)
+        in_place = bool(open_url) and self.call_web.reader_kind(_link_url(link)) == "link"
+        return _link_buttons(link, app_type, open_url, original=in_place)
 
     async def wechat_side(self) -> None:
         await self.ensure_wechat()
@@ -1968,7 +1980,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if isinstance(send_media, Media) and is_link:
                 f = send_media.tg_file()
                 caption = (header + prefix + link_note).rstrip("\n")
-                buttons = _link_buttons(link, link_app_type, self._reader_link(link))
+                buttons = self._card_buttons(link, link_app_type)
                 kw = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
                           silent=silent, force_document=False, buttons=buttons)
                 try:
@@ -2122,7 +2134,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 text = header + prefix + _media_failure_text(msg, send_media)
                 buttons = None
             elif is_link:
-                buttons = _link_buttons(link, link_app_type, self._reader_link(link))
+                buttons = self._card_buttons(link, link_app_type)
                 text = header + prefix + link_note + _link_body(link, link_app_type, inline_url=not buttons)
             else:
                 buttons = None

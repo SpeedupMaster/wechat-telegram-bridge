@@ -303,6 +303,8 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 - **公众号阅读页**：注册 Mini App 后，公众号文章卡片的「📄 阅读全文」按钮也会走同一个 Mini App：桥接服务端使用浏览器 TLS 指纹（`curl_cffi`）与会话 Cookie 抓取文章正文（支持传统图文与“小绿书”图片消息），过滤不安全内容并持久化缓存在本地 SQLite 中，在 Telegram 内直接阅读（适配深色模式与点击放大看图），不再弹出「打开此链接？」确认；若服务器 IP 触发微信「环境异常」或限流，Mini App 会自动在应用内原地跳转至微信原文（走手机/电脑本机网络）。可用 `config.toml` 中的 `article_reader = false` 关闭，也可通过 `ARTICLE_PROXY` 单独指定抓取代理。
 - **小红书阅读页**：小红书笔记卡片（`xhslink.com` 分享链接或 `xiaohongshu.com` 笔记）也会在同一个 Mini App 中打开：收到卡片时服务端立即以移动端页面预抓取笔记（分享链接的 `xsec_token` 会过期），视频直接在页面内播放、图文按原图展示，并附正文与点赞/收藏数；所用图片与视频地址不会随 token 过期，缓存后可长期查看。若服务器被小红书拦截（登录墙、链接已过期），Mini App 会原地跳转到原笔记。可用 `xhs_reader = false` 单独关闭。
 - **抖音视频**：抖音视频卡片（包括「复制打开抖音」口令分享）同样走这个 Mini App，在抖音官方嵌入播放器（`open.douyin.com`）中全屏播放，作者、文案与点赞数由播放器自带。服务端只解析一次 `v.douyin.com` 短链的跳转来拿视频 ID，不下载抖音页面；图文作品、主页链接或已删除的视频会原地跳转到原链接。播放器底部的「去抖音观看」推广条为官方组件自带。可用 `douyin_reader = false` 单独关闭。
+- **哔哩哔哩视频**：B 站视频卡片（含 `b23.tv` 短链）在 Mini App 中用 B 站官方嵌入播放器（`player.bilibili.com`）全屏播放，默认关闭弹幕；未登录时为较低清晰度。直播间、番剧、专栏和空间链接会原地打开原链接。可用 `bilibili_reader = false` 单独关闭。
+- **其他链接卡片**：其余所有网页链接卡片（知乎、微博、GitHub、快手、音乐、普通网页等）的按钮也改为 Mini App 直达链接，打开后在 Mini App 内原地跳转到原网页，不再弹「打开此链接？」确认；服务端不会抓取这些网页。由于 Mini App 没有地址栏和「在浏览器中打开」，卡片旁会多一个「🔗 原链接」按钮，需要完整浏览器（登录、下载等）时可用它。Telegram 自身链接（`t.me` 等）保持原样。可用 `links_in_app = false` 关闭。
 
 ### 通话使用说明与限制
 
@@ -364,7 +366,9 @@ cp config.example.toml config/config.toml
 | `article_reader` | `true` | 配置了 `CALL_WEB_URL` 与 `CALL_WEB_APP` 时，公众号文章卡片的按钮在 Telegram 内置阅读页（Mini App）中打开，免去「打开此链接？」确认 |
 | `xhs_reader` | `true` | 同上，小红书笔记卡片在内置阅读页中打开（视频内嵌播放）；被拦截时自动跳转原笔记 |
 | `douyin_reader` | `true` | 同上，抖音视频卡片在 Mini App 内用官方嵌入播放器播放；图文与主页链接直接打开原链接 |
-| `article_proxy` | `""` | 仅用于抓取公众号文章 / 小红书笔记 / 解析抖音短链的独立代理（环境变量 `ARTICLE_PROXY`，支持 `http://` / `https://` / `socks5://` / `socks5h://`） |
+| `bilibili_reader` | `true` | 同上，B 站视频卡片在 Mini App 内用官方嵌入播放器播放；直播、番剧等直接打开原链接 |
+| `links_in_app` | `true` | 其余链接卡片在 Mini App 内原地打开原网页（免确认），并附「🔗 原链接」按钮 |
+| `article_proxy` | `""` | 仅用于抓取公众号文章 / 小红书笔记 / 解析抖音与 B 站短链的独立代理（环境变量 `ARTICLE_PROXY`，支持 `http://` / `https://` / `socks5://` / `socks5h://`） |
 | `friend_requests` | `true` | 是否把新的微信好友请求推送到机器人私聊（需 `agent-wechat >= 2.7.0`） |
 | `auto_rename` | `true` | 微信备注/群名变化后是否自动更新 Telegram 群/话题标题（关闭后可发 `/rename` 手动同步） |
 | `gif_as_sticker` | `true` | 是否将 Telegram 发送的 GIF 动图转为微信原生表情发送 |

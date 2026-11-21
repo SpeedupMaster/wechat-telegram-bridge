@@ -511,11 +511,12 @@ def _is_captcha_url(url: str) -> bool:
 
 
 async def _fetch_with_session(url: str, session: Any, *, uses_curl: bool) -> Article:
-    from . import douyin, xhs  # they import this module; keep the dependency one-way at import time
+    from . import bilibili, douyin, xhs  # they import this module; keep the dependency one-way at import time
     if xhs.is_note_url(url):
         return await xhs.fetch_note(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
-    if douyin.is_video_url(url):
-        return await douyin.fetch_video(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
+    for site in (douyin, bilibili):
+        if site.is_video_url(url):
+            return await site.fetch_video(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
     if not is_article_url(url):
         raise ArticleError("不是微信公众号文章链接", code="invalid_url")
     current = normalize_url(url)
@@ -703,13 +704,15 @@ def render_page(article: Article | None, *, error: str = "", source_url: str = "
             .replace("__BAR__", bar_inner).replace("__NONCE__", nonce).replace("__BODY__", body))
 
 
-def render_redirect_page(source_url: str, *, reason: str = "", retry_url: str = "", nonce: str = "") -> str:
-    """Mini App handoff page: expands Mini App and navigates in-place to the original WeChat URL."""
+def render_redirect_page(source_url: str, *, reason: str = "", retry_url: str = "", nonce: str = "",
+                         open_label: str = "立即打开原文") -> str:
+    """Mini App handoff page: expands the Mini App and navigates in place to the original URL."""
     safe_url = html.escape(source_url, quote=True)
     safe_reason = html.escape(reason or "微信要求验证访问环境，正在打开原文…")
     retry_btn = (f'<a class="retry" data-inapp="1" href="{html.escape(retry_url, quote=True)}">重试阅读模式</a>'
                  if retry_url else "")
-    open_btn = f'<a class="open" data-inapp="1" href="{safe_url}">立即打开原文</a>' if source_url else ""
+    open_btn = (f'<a class="open" data-inapp="1" href="{safe_url}">{html.escape(open_label)}</a>'
+                if source_url else "")
     return (REDIRECT_HTML
             .replace("__REASON__", safe_reason)
             .replace("__URL_ATTR__", safe_url)

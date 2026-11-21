@@ -68,6 +68,10 @@ class BridgeConfig:
     xhs_reader: bool = True
     # Douyin video cards open Douyin's official embed player in the same Mini App (图文/profiles open the link).
     douyin_reader: bool = True
+    bilibili_reader: bool = True  # same for Bilibili videos (official embed player)
+    # Every other link card opens its page in place inside the Mini App (no "Open this link?" prompt);
+    # a second "原链接" button keeps the plain URL for pages that need a real browser.
+    links_in_app: bool = True
     # Optional proxy used only when fetching mp.weixin.qq.com articles (independent of telegram.proxy).
     article_proxy: str = ""
     friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
@@ -104,7 +108,7 @@ class BridgeConfig:
         host, sep, port = str(self.call_web_listen or "").strip().rpartition(":")
         if not sep or not port.isdigit() or not host:
             raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
-        for name in ("xhs_reader", "douyin_reader"):
+        for name in ("xhs_reader", "douyin_reader", "bilibili_reader", "links_in_app"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"[bridge] {name} must be true or false, not {getattr(self, name)!r}")
         if not isinstance(self.article_reader, bool):

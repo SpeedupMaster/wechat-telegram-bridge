@@ -26,7 +26,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 from aiohttp import WSMsgType, web
 
 from . import article as articles
-from . import douyin, xhs
+from . import bilibili, douyin, xhs
 from .wechat import WeChatError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -49,6 +49,21 @@ MAX_PCM_CHUNK = 65536
 # Mini App start parameters that open the article reader instead of a call: "r_" + Store.article_id().
 READER_PREFIX = "r_"
 _ARTICLE_ID_RE = re.compile(r"[A-Za-z0-9]{8,32}")
+# Telegram's own links already open natively; sending them through the Mini App would only get in the way.
+_NATIVE_HOSTS = ("t.me", "telegram.me", "telegram.dog", "telegram.org")
+MAX_LINK_LEN = 4096
+
+
+def _is_plain_link(url: str | None) -> bool:
+    url = (url or "").strip()
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    if parts.scheme not in ("http", "https") or not host or len(url) > MAX_LINK_LEN or any(c.isspace() for c in url):
+        return False
+    return not any(host == d or host.endswith("." + d) for d in _NATIVE_HOSTS)
 
 CALL_ERRORS = {
     "offer_expired": "来电已结束或已过期",
@@ -310,21 +325,30 @@ class CallWeb:
             return f"https://t.me/{self.bridge.bot_me.username}/{quote(self.app_name)}?startapp={token}"
         return f"{self.base_url}/call/{token}"
 
-    def article_link(self, url: str | None) -> str | None:
-        """Mini App link that opens an Official Account article, Xiaohongshu note or Douyin video in the reader
-        (None = plain URL)."""
+    def reader_kind(self, url: str | None) -> str | None:
+        """How the Mini App shows a link: "fetch" (note / embedded video, resolved ahead of time), "article",
+        "link" (any other web page, opened in place), or None (not through the Mini App)."""
         cfg = self.bridge.cfg.bridge
-        is_note = cfg.xhs_reader and xhs.is_note_url(url)
-        is_video = cfg.douyin_reader and douyin.is_video_url(url)
-        if not (self.app_name and (is_note or is_video or (cfg.article_reader and articles.is_article_url(url)))):
-            return None
+        if (cfg.xhs_reader and xhs.is_note_url(url) or cfg.douyin_reader and douyin.is_video_url(url)
+                or cfg.bilibili_reader and bilibili.is_video_url(url)):
+            return "fetch"
+        if cfg.article_reader and articles.is_article_url(url):
+            return "article"
+        if cfg.links_in_app and _is_plain_link(url):
+            return "link"
+        return None
+
+    def article_link(self, url: str | None) -> str | None:
+        """t.me Mini App link for a link card's button (None = keep the plain URL)."""
+        kind = self.reader_kind(url) if self.app_name else None
         me = getattr(self.bridge, "bot_me", None)
-        if not (me and me.username):
+        if kind is None or not (me and me.username):
             return None
-        norm = articles.normalize_url(url)
-        aid = self.bridge.store.article_id(norm)
-        if is_note or is_video:  # share tokens expire; resolve while the card is fresh
-            self._prefetch(norm)
+        # other pages keep their exact URL (scheme, fragment); readers use the canonical https form
+        key = url.strip() if kind == "link" else articles.normalize_url(url)
+        aid = self.bridge.store.article_id(key)
+        if kind == "fetch":  # share tokens expire; resolve while the card is fresh
+            self._prefetch(key)
         return f"https://t.me/{me.username}/{quote(self.app_name)}?startapp={READER_PREFIX}{aid}"
 
     def _prefetch(self, url: str) -> None:
@@ -814,14 +838,18 @@ class CallWeb:
         if url is None:
             page = articles.render_page(None, error="文章链接已失效", nonce=nonce)
             status = 404
+        elif self.reader_kind(url) in ("link", None):  # nothing to render: open the page itself, in place
+            page = articles.render_redirect_page(url, reason="正在打开链接…", nonce=nonce, open_label="立即打开")
         else:
             retry_url = f"{self.prefix}/read/{aid}?retry=1"
             result = await self._load_article(url, force_refresh=force_refresh)
             if isinstance(result, articles.Article):
-                page = douyin.render_player(result, nonce=nonce)
-                if page is not None:
-                    frame_src = douyin.PLAYER_ORIGIN
-                else:
+                page = None
+                for site in (douyin, bilibili):
+                    if (page := site.render_player(result, nonce=nonce)) is not None:
+                        frame_src = site.PLAYER_ORIGIN
+                        break
+                if page is None:
                     page = articles.render_page(result, nonce=nonce, retry_url=retry_url)
             elif result.fallback_original:
                 page = articles.render_redirect_page(url, reason=str(result), retry_url=retry_url, nonce=nonce)

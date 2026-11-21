@@ -13,7 +13,7 @@ import httpx
 
 from bridge import article as A
 from bridge.config import BridgeConfig, Config, TelegramConfig, WeChatConfig
-from bridge.core import Bridge, _link_buttons
+from bridge.core import Bridge
 from bridge.store import Store
 
 ART_URL = "https://mp.weixin.qq.com/s/abcDEF123"
@@ -360,15 +360,23 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
         m = re.fullmatch(r"https://t\.me/mybot/app\?startapp=r_([A-Za-z0-9]{16})", link or "")
         self.assertIsNotNone(m, link)
         self.assertEqual(self.b.store.article_url(m.group(1)), ART_URL)
-        self.assertIsNone(self.web.article_link("https://www.xiaohongshu.com/discovery/item/1"))
-        # The card button uses it; other links keep their own URL.
-        btn = _link_buttons({"url": ART_URL}, 5, self.b._reader_link({"url": ART_URL}))[0][0]
-        self.assertEqual(_btn_url(btn), link)
-        xhs = "https://www.xiaohongshu.com/x"
-        self.assertEqual(_btn_url(_link_buttons({"url": xhs}, 5, self.b._reader_link({"url": xhs}))[0][0]), xhs)
-        self.b.cfg.bridge.article_reader = False
+        # The card button uses it, alone: the reader page has its own 打开原文.
+        row = self.b._card_buttons({"url": ART_URL}, 5)[0]
+        self.assertEqual([_btn_url(b) for b in row], [link])
+        # Other pages open in place in the Mini App, with the raw URL as a second button.
+        other = "http://www.xiaohongshu.com/x#frag"
+        self.assertEqual(self.web.reader_kind(other), "link")
+        row = self.b._card_buttons({"url": other}, 5)[0]
+        aid = re.fullmatch(r"https://t\.me/mybot/app\?startapp=r_([A-Za-z0-9]{16})", _btn_url(row[0])).group(1)
+        self.assertEqual(self.b.store.article_url(aid), other)  # exact URL: scheme and fragment kept
+        self.assertEqual((row[1].text, _btn_url(row[1])), ("🔗 原链接", other))
+        self.assertIsNone(self.web.article_link("https://t.me/somechannel/12"))  # Telegram opens these natively
+        self.b.cfg.bridge.article_reader = False  # articles then simply open in place
+        self.assertEqual(self.web.reader_kind(ART_URL), "link")
+        self.b.cfg.bridge.links_in_app = False
         self.assertIsNone(self.web.article_link(ART_URL))
-        self.b.cfg.bridge.article_reader = True
+        self.assertEqual(_btn_url(self.b._card_buttons({"url": other}, 5)[0][0]), other)
+        self.b.cfg.bridge.article_reader = self.b.cfg.bridge.links_in_app = True
         self.web.app_name = ""
         self.assertIsNone(self.web.article_link(ART_URL))
 

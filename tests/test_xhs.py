@@ -215,7 +215,9 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(json.dumps(NOTE_URL), page)
 
     def test_toggle(self):
-        self.b.cfg.bridge.xhs_reader = False
+        self.b.cfg.bridge.xhs_reader = False  # no reader: the card still opens in place
+        self.assertEqual(self.web.reader_kind(NOTE_URL), "link")
+        self.b.cfg.bridge.links_in_app = False
         self.assertIsNone(self.web.article_link(NOTE_URL))
         self.assertIsNotNone(self.web.article_link("https://mp.weixin.qq.com/s/abcDEF123"))
 

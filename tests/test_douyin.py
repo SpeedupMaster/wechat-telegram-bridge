@@ -138,7 +138,9 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("frame-src 'none';", csp)
 
     def test_toggle(self):
-        self.b.cfg.bridge.douyin_reader = False
+        self.b.cfg.bridge.douyin_reader = False  # no reader: the card still opens in place
+        self.assertEqual(self.web.reader_kind(SHARE), "link")
+        self.b.cfg.bridge.links_in_app = False
         self.assertIsNone(self.web.article_link(SHARE))
         self.assertIsNotNone(self.web.article_link("https://mp.weixin.qq.com/s/abcDEF123"))
 
