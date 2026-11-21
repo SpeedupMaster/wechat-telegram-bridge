@@ -511,6 +511,9 @@ def _is_captcha_url(url: str) -> bool:
 
 
 async def _fetch_with_session(url: str, session: Any, *, uses_curl: bool) -> Article:
+    from . import xhs  # imports this module; keep the dependency one-way at import time
+    if xhs.is_note_url(url):
+        return await xhs.fetch_note(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
     if not is_article_url(url):
         raise ArticleError("不是微信公众号文章链接", code="invalid_url")
     current = normalize_url(url)
@@ -763,6 +766,9 @@ READER_HTML = """<!doctype html>
   .content img { max-width: 100% !important; height: auto !important; background: var(--img-bg);
                  cursor: zoom-in; border-radius: 4px; }
   .content figure.wx-pic { margin: 14px 0; text-align: center; }
+  .content .xhs-video { margin: 0 0 14px; }
+  .content video { display: block; width: 100%; height: auto; max-height: 78vh; background: #000;
+                   border-radius: 8px; }
   .content section, .content div, .content p, .content table { max-width: 100% !important; }
   .content table { border-collapse: collapse; display: block; overflow-x: auto; }
   .content pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto;

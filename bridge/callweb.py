@@ -26,6 +26,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 from aiohttp import WSMsgType, web
 
 from . import article as articles
+from . import xhs
 from .wechat import WeChatError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -310,14 +311,28 @@ class CallWeb:
         return f"{self.base_url}/call/{token}"
 
     def article_link(self, url: str | None) -> str | None:
-        """Mini App link that opens an Official Account article in the reader, or None to keep the plain URL."""
-        if not (self.app_name and self.bridge.cfg.bridge.article_reader and articles.is_article_url(url)):
+        """Mini App link that opens an Official Account article / Xiaohongshu note in the reader (None = plain URL)."""
+        cfg = self.bridge.cfg.bridge
+        is_note = cfg.xhs_reader and xhs.is_note_url(url)
+        if not (self.app_name and (is_note or (cfg.article_reader and articles.is_article_url(url)))):
             return None
         me = getattr(self.bridge, "bot_me", None)
         if not (me and me.username):
             return None
-        aid = self.bridge.store.article_id(articles.normalize_url(url))
+        norm = articles.normalize_url(url)
+        aid = self.bridge.store.article_id(norm)
+        if is_note:
+            self._prefetch(norm)
         return f"https://t.me/{me.username}/{quote(self.app_name)}?startapp={READER_PREFIX}{aid}"
+
+    def _prefetch(self, url: str) -> None:
+        """Load a note while its share link's xsec_token is still fresh; the result lands in the cache."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self.article_cache.get(url) is None and url not in self._article_fetches:
+            self._spawn(self._load_article(url))
 
     def _new_token(self, kind: str, ref: str) -> str:
         self._prune_tokens()

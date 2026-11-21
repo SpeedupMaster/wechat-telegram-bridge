@@ -64,6 +64,8 @@ class BridgeConfig:
     link_card_images: bool = True
     # With call_web_app set, Official Account article cards open in a built-in reader Mini App (no link prompt).
     article_reader: bool = True
+    # Same reader for Xiaohongshu notes (video plays inline); falls back to the original page when blocked.
+    xhs_reader: bool = True
     # Optional proxy used only when fetching mp.weixin.qq.com articles (independent of telegram.proxy).
     article_proxy: str = ""
     friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
@@ -100,6 +102,8 @@ class BridgeConfig:
         host, sep, port = str(self.call_web_listen or "").strip().rpartition(":")
         if not sep or not port.isdigit() or not host:
             raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
+        if not isinstance(self.xhs_reader, bool):
+            raise ValueError(f"[bridge] xhs_reader must be true or false, not {self.xhs_reader!r}")
         if not isinstance(self.article_reader, bool):
             raise ValueError(f"[bridge] article_reader must be true or false, not {self.article_reader!r}")
         self.article_proxy = str(self.article_proxy or "").strip()
