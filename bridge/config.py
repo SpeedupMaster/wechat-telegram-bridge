@@ -64,6 +64,8 @@ class BridgeConfig:
     link_card_images: bool = True
     # With call_web_app set, Official Account article cards open in a built-in reader Mini App (no link prompt).
     article_reader: bool = True
+    # Optional proxy used only when fetching mp.weixin.qq.com articles (independent of telegram.proxy).
+    article_proxy: str = ""
     friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
     auto_rename: bool = True  # follow WeChat remark/group-name changes in Telegram titles
     gif_as_sticker: bool = True
@@ -100,6 +102,13 @@ class BridgeConfig:
             raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
         if not isinstance(self.article_reader, bool):
             raise ValueError(f"[bridge] article_reader must be true or false, not {self.article_reader!r}")
+        self.article_proxy = str(self.article_proxy or "").strip()
+        if self.article_proxy and not self.article_proxy.lower().startswith(
+                ("http://", "https://", "socks5://", "socks5h://")):
+            raise ValueError(
+                f"[bridge] article_proxy must start with http://, https://, socks5:// or socks5h://, "
+                f"not {self.article_proxy!r}"
+            )
         if not isinstance(self.emoji_to_wechat, bool):
             raise ValueError(f"[bridge] emoji_to_wechat must be true or false, not {self.emoji_to_wechat!r}")
         if not isinstance(self.auto_relogin, bool):
@@ -169,6 +178,7 @@ ENV = {
     "CALL_WEB_URL": ("bridge", "call_web_url"),
     "CALL_WEB_LISTEN": ("bridge", "call_web_listen"),
     "CALL_WEB_APP": ("bridge", "call_web_app"),
+    "ARTICLE_PROXY": ("bridge", "article_proxy"),
     "EMOJI_TO_WECHAT": ("bridge", "emoji_to_wechat"),
     "AUTO_RELOGIN": ("bridge", "auto_relogin"),
 }

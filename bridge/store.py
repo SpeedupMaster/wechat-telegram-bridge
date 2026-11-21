@@ -49,6 +49,21 @@ CREATE TABLE IF NOT EXISTS articles (
     url        TEXT NOT NULL UNIQUE,
     created_at INTEGER NOT NULL
 );
+-- Persistent cache of fetched & sanitized Official Account articles (LRU by accessed_at).
+CREATE TABLE IF NOT EXISTS article_cache (
+    url         TEXT PRIMARY KEY,
+    final_url   TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    account     TEXT NOT NULL DEFAULT '',
+    author      TEXT NOT NULL DEFAULT '',
+    published   INTEGER NOT NULL DEFAULT 0,
+    cover       TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    content     TEXT NOT NULL DEFAULT '',
+    fetched_at  INTEGER NOT NULL,
+    accessed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS article_cache_accessed ON article_cache (accessed_at);
 CREATE INDEX IF NOT EXISTS msgmap_wx_msg ON msgmap (wx_msg);
 CREATE INDEX IF NOT EXISTS msgmap_wx_server ON msgmap (wx_thread, wx_server);
 """
@@ -59,6 +74,7 @@ class Store:
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        self._cache_seq = 0
 
     # --- kv ---------------------------------------------------------------
     def get(self, key: str) -> str | None:
@@ -261,3 +277,61 @@ class Store:
     def article_url(self, aid: str) -> str | None:
         row = self.db.execute("SELECT url FROM articles WHERE id=?", (aid,)).fetchone()
         return row[0] if row else None
+
+    def _next_cache_ts(self) -> int:
+        self._cache_seq = max(self._cache_seq + 1, int(time.time() * 1_000_000))
+        return self._cache_seq
+
+    def get_cached_article(self, url: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT final_url, title, account, author, published, cover, description, content "
+            "FROM article_cache WHERE url=?",
+            (url,),
+        ).fetchone()
+        if not row:
+            return None
+        self.db.execute("UPDATE article_cache SET accessed_at=? WHERE url=?", (self._next_cache_ts(), url))
+        return {
+            "url": row[0],
+            "title": row[1],
+            "account": row[2],
+            "author": row[3],
+            "published": row[4],
+            "cover": row[5],
+            "description": row[6],
+            "content": row[7],
+        }
+
+    def save_cached_article(self, url: str, data: dict, *, max_entries: int = 500) -> None:
+        now_s = int(time.time())
+        now_seq = self._next_cache_ts()
+        self.db.execute(
+            "INSERT INTO article_cache(url, final_url, title, account, author, published, cover, description, content, "
+            "fetched_at, accessed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(url) DO UPDATE SET final_url=excluded.final_url, title=excluded.title, "
+            "account=excluded.account, author=excluded.author, published=excluded.published, cover=excluded.cover, "
+            "description=excluded.description, content=excluded.content, fetched_at=excluded.fetched_at, "
+            "accessed_at=excluded.accessed_at",
+            (
+                url,
+                data.get("url") or url,
+                data.get("title") or "",
+                data.get("account") or "",
+                data.get("author") or "",
+                int(data.get("published") or 0),
+                data.get("cover") or "",
+                data.get("description") or "",
+                data.get("content") or "",
+                now_s,
+                now_seq,
+            ),
+        )
+        if max_entries > 0:
+            self.db.execute(
+                "DELETE FROM article_cache WHERE url IN ("
+                "SELECT url FROM article_cache ORDER BY accessed_at DESC LIMIT -1 OFFSET ?)",
+                (max_entries,),
+            )
+
+    def delete_cached_article(self, url: str) -> None:
+        self.db.execute("DELETE FROM article_cache WHERE url=?", (url,))

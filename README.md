@@ -300,7 +300,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
    ```
 - **注册后**：「📞 接听」按钮会直接在 Telegram 内以原生 Mini App 弹出，并额外通过 Telegram 签名校验访问者是否为桥接主人本人。
 - **不注册时**：「📞 接听」按钮作为普通链接在内置浏览器中打开，依靠链接内的一次性高强度随机令牌进行鉴权。
-- **公众号阅读页**：注册 Mini App 后，公众号文章卡片的「📄 阅读全文」按钮也会走同一个 Mini App：桥接服务端抓取文章正文、过滤脚本等不安全内容后在 Telegram 内直接显示，不再弹出「打开此链接？」确认；视频、音频、小程序等嵌入内容会提示「请打开原文查看」。可用 `config.toml` 中的 `article_reader = false` 关闭。
+- **公众号阅读页**：注册 Mini App 后，公众号文章卡片的「📄 阅读全文」按钮也会走同一个 Mini App：桥接服务端使用浏览器 TLS 指纹（`curl_cffi`）与会话 Cookie 抓取文章正文（支持传统图文与“小绿书”图片消息），过滤不安全内容并持久化缓存在本地 SQLite 中，在 Telegram 内直接阅读（适配深色模式与点击放大看图），不再弹出「打开此链接？」确认；若服务器 IP 触发微信「环境异常」或限流，Mini App 会自动在应用内原地跳转至微信原文（走手机/电脑本机网络）。可用 `config.toml` 中的 `article_reader = false` 关闭，也可通过 `ARTICLE_PROXY` 单独指定抓取代理。
 
 ### 通话使用说明与限制
 
@@ -329,6 +329,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `CALL_WEB_URL` | 否 | 空 | 微信语音接听页面的公网 HTTPS 地址，留空则关闭网页接听 |
 | `CALL_WEB_LISTEN` | 否 | `127.0.0.1:8780` | 语音接听页面在容器/宿主机本机监听的地址与端口 |
 | `CALL_WEB_APP` | 否 | 空 | `@BotFather` `/newapp` 注册的 Mini App 短名称 |
+| `ARTICLE_PROXY` | 否 | 空 | 仅用于抓取公众号阅读页（`mp.weixin.qq.com`）的独立代理（与 `TG_PROXY` 独立），留空直连 |
 | `COMPOSE_PROFILES` | 否 | 空 | 设为 `cloudflare` 时随 Compose 启动内置的 `cloudflared` 隧道容器 |
 | `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
 | `EMOJI_TO_WECHAT` | 否 | `false` | 是否将 Telegram 发送的常见 Emoji 反向转为微信自带小黄脸代码（如 `😁` → `[呲牙]`、`🤦` → `[捂脸]`、`🫡` → `[社会社会]`） |
@@ -359,6 +360,7 @@ cp config.example.toml config/config.toml
 | `call_notifications` | `true` | 是否推送微信语音/视频来电通知与一键拒接按钮（关闭后也无法接听或用 `/call` 拨打） |
 | `link_card_images` | `true` | 是否将微信分享链接渲染为横向图文卡片 |
 | `article_reader` | `true` | 配置了 `CALL_WEB_URL` 与 `CALL_WEB_APP` 时，公众号文章卡片的按钮在 Telegram 内置阅读页（Mini App）中打开，免去「打开此链接？」确认 |
+| `article_proxy` | `""` | 仅用于抓取公众号阅读页（`mp.weixin.qq.com`）的独立代理（环境变量 `ARTICLE_PROXY`，支持 `http://` / `https://` / `socks5://` / `socks5h://`） |
 | `friend_requests` | `true` | 是否把新的微信好友请求推送到机器人私聊（需 `agent-wechat >= 2.7.0`） |
 | `auto_rename` | `true` | 微信备注/群名变化后是否自动更新 Telegram 群/话题标题（关闭后可发 `/rename` 手动同步） |
 | `gif_as_sticker` | `true` | 是否将 Telegram 发送的 GIF 动图转为微信原生表情发送 |

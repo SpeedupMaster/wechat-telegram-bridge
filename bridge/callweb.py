@@ -300,6 +300,7 @@ class CallWeb:
         self._runner: web.AppRunner | None = None
         self.bound_port = self.port
         self.article_cache = articles.ArticleCache()
+        self.article_fetcher = articles.ArticleFetcher(proxy=bridge.cfg.bridge.article_proxy)
         self._article_fetches: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------ links / tokens
@@ -761,6 +762,7 @@ class CallWeb:
             await sess.close()
         for task in [*self._tasks, *self._article_fetches.values()]:
             task.cancel()
+        await self.article_fetcher.close()
         for conns in list(self.clients.values()):
             for ws in list(conns):
                 await ws.close()
@@ -784,9 +786,10 @@ class CallWeb:
         )
 
     async def _read(self, request: web.Request) -> web.Response:
-        return await self._reader_response(request.match_info["aid"])
+        retry = request.query.get("retry", "") in ("1", "true", "yes")
+        return await self._reader_response(request.match_info["aid"], force_refresh=retry)
 
-    async def _reader_response(self, aid: str) -> web.Response:
+    async def _reader_response(self, aid: str, *, force_refresh: bool = False) -> web.Response:
         url = self.bridge.store.article_url(aid) if _ARTICLE_ID_RE.fullmatch(aid) else None
         nonce = secrets.token_urlsafe(12)
         status = 200
@@ -794,11 +797,16 @@ class CallWeb:
             page = articles.render_page(None, error="文章链接已失效", nonce=nonce)
             status = 404
         else:
-            result = await self._load_article(url)
+            retry_url = f"{self.prefix}/read/{aid}?retry=1"
+            result = await self._load_article(url, force_refresh=force_refresh)
             if isinstance(result, articles.Article):
-                page = articles.render_page(result, nonce=nonce)
+                page = articles.render_page(result, nonce=nonce, retry_url=retry_url)
+            elif result.fallback_original:
+                page = articles.render_redirect_page(url, reason=str(result), retry_url=retry_url, nonce=nonce)
+                status = 200
             else:
-                page = articles.render_page(None, error=str(result), source_url=url, nonce=nonce)
+                page = articles.render_page(None, error=str(result), source_url=url,
+                                            nonce=nonce, retry_url=retry_url)
                 status = 502
         return web.Response(
             text=page, status=status, content_type="text/html", charset="utf-8",
@@ -808,10 +816,23 @@ class CallWeb:
                          f"style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'")},
         )
 
-    async def _load_article(self, url: str) -> articles.Article | articles.ArticleError:
-        cached = self.article_cache.get(url)
-        if cached is not None:
-            return cached
+    async def _load_article(self, url: str, *, force_refresh: bool = False) -> articles.Article | articles.ArticleError:
+        if force_refresh:
+            self.article_cache.delete(url)
+            self.bridge.store.delete_cached_article(url)
+        else:
+            cached = self.article_cache.get(url)
+            if cached is not None:
+                return cached
+            stored = self.bridge.store.get_cached_article(url)
+            if stored is not None:
+                art = articles.Article(
+                    url=stored["url"], title=stored["title"], account=stored["account"],
+                    author=stored["author"], published=stored["published"], cover=stored["cover"],
+                    description=stored["description"], content=stored["content"],
+                )
+                self.article_cache.put(url, art)
+                return art
         task = self._article_fetches.get(url)
         if task is None:  # one download per article even if the button is tapped repeatedly
             task = asyncio.create_task(self._fetch_article(url))
@@ -821,7 +842,8 @@ class CallWeb:
 
     async def _fetch_article(self, url: str) -> articles.Article | articles.ArticleError:
         try:
-            result: articles.Article | articles.ArticleError = await articles.fetch_article(url)
+            with articles.use_fetcher(self.article_fetcher):
+                result: articles.Article | articles.ArticleError = await articles.fetch_article(url)
         except articles.ArticleError as e:
             log.info("Could not load WeChat article %s: %s", url, e)
             result = e
@@ -829,6 +851,12 @@ class CallWeb:
             log.exception("Reading WeChat article %s failed", url)
             result = articles.ArticleError(f"加载失败（{type(e).__name__}）")
         self.article_cache.put(url, result)
+        if isinstance(result, articles.Article):
+            self.bridge.store.save_cached_article(url, {
+                "url": result.url, "title": result.title, "account": result.account,
+                "author": result.author, "published": result.published, "cover": result.cover,
+                "description": result.description, "content": result.content,
+            })
         return result
 
     def _authorize(self, msg: dict) -> tuple[str | None, str]:
