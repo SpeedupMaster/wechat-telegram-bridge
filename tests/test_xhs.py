@@ -67,6 +67,7 @@ class UrlTests(unittest.TestCase):
     def test_is_note_url(self):
         for good in (NOTE_URL, SHARE_URL, "https://xhslink.cn/a/sT7omKb6ijX6",
                      f"https://www.xiaohongshu.com/discovery/item/{NOTE_ID}?xsec_token=t",
+                     f"https://www.rednote.com/explore/{NOTE_ID}?xsec_token=t",
                      f"https://www.xiaohongshu.com/user/profile/67fbbf04000000000e01f7a6/{NOTE_ID}"):
             self.assertTrue(xhs.is_note_url(good), good)
         for bad in ("https://www.xiaohongshu.com/explore", "https://www.xiaohongshu.com/login",
@@ -128,6 +129,9 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
                     "location": f"https://www.xiaohongshu.com/discovery/item/{NOTE_ID}?xsec_token=T&xsec_source=app_share"})
             if req.url.host == "xhslink.com" and req.url.path == "/o/expired":
                 return httpx.Response(302, headers={"location": "https://www.xiaohongshu.com/"})
+            if req.url.host == "xhslink.com" and req.url.path == "/o/intl":
+                return httpx.Response(302, headers={
+                    "location": f"https://www.rednote.com/discovery/item/{NOTE_ID}?xsec_token=T"})
             if req.url.host == "xhslink.com" and req.url.path == "/o/away":
                 return httpx.Response(302, headers={"location": "https://evil.example/"})
             if req.url.path.startswith("/discovery/item/"):
@@ -144,6 +148,11 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
                              f"https://www.xiaohongshu.com/discovery/item/{NOTE_ID}?xsec_token=T&xsec_source=app_share")
             self.assertEqual(seen[0][0], "https://xhslink.com/o/AbC123xyz")
             self.assertIn("iPhone", seen[0][1])  # the mobile page carries the note without a login
+            art = await A.fetch_article("https://xhslink.com/o/intl", client)  # overseas: international domain
+            self.assertEqual(art.url, f"https://www.rednote.com/discovery/item/{NOTE_ID}?xsec_token=T")
+            with self.assertLogs("bridge.xhs", "INFO") as logs, self.assertRaises(A.ArticleError):
+                await A.fetch_article("https://xhslink.com/o/away", client)
+            self.assertIn("another site: evil.example/", logs.output[0])
             for url, code in (("https://xhslink.com/o/expired", "xhs_blocked"),
                               ("https://xhslink.com/o/away", "xhs_off_host"),
                               (NOTE_URL, "xhs_blocked")):

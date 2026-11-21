@@ -22,7 +22,9 @@ from .article import USER_AGENT, Article, ArticleError, MAX_PAGE_BYTES, MAX_REDI
 
 import httpx
 
-NOTE_HOSTS = ("xiaohongshu.com", "xhslink.com", "xhslink.cn")
+# rednote.com is the international domain; overseas visitors may be sent there with the same note paths
+SITE_HOSTS = ("xiaohongshu.com", "rednote.com")
+NOTE_HOSTS = (*SITE_HOSTS, "xhslink.com", "xhslink.cn")
 IMAGE_BASE = "https://sns-na-i2.xhscdn.com/"
 _NOTE_PATH_RE = re.compile(r"^/(?:explore|discovery/item|user/profile/[0-9a-zA-Z]+)/([0-9a-f]{24})/?$")
 _FILE_ID_RE = re.compile(r"^[0-9A-Za-z_./-]{8,200}$")
@@ -60,7 +62,7 @@ def is_note_url(url: str | None) -> bool:
         return False
     if _on_host(host, "xhslink.com", "xhslink.cn"):
         return len(parts.path.strip("/")) >= 3
-    return _on_host(host, "xiaohongshu.com") and bool(_NOTE_PATH_RE.match(parts.path))
+    return _on_host(host, *SITE_HOSTS) and bool(_NOTE_PATH_RE.match(parts.path))
 
 
 def normalize_url(url: str) -> str:
@@ -222,9 +224,11 @@ async def fetch_note(url: str, session: Any, *, uses_curl: bool, net_errors: tup
                     nxt = urljoin(current, resp.headers.get("location", ""))
                     host = _host(nxt)
                     if not _on_host(host, *NOTE_HOSTS):
+                        log.info("Xiaohongshu redirected %s to another site: %s%s", urlsplit(current).path,
+                                 host, urlsplit(nxt).path)
                         raise ArticleError(_FALLBACK, code="xhs_off_host", fallback_original=True)
                     path = urlsplit(nxt).path
-                    if _on_host(host, "xiaohongshu.com") and not _NOTE_PATH_RE.match(path):
+                    if _on_host(host, *SITE_HOSTS) and not _NOTE_PATH_RE.match(path):
                         # login wall, captcha, 404 page or the home page (expired token)
                         log.info("Xiaohongshu redirected %s to %s", urlsplit(current).path, path)
                         raise ArticleError(_FALLBACK, code="xhs_blocked", fallback_original=True)
