@@ -439,10 +439,11 @@ def _link_url(link: dict | None) -> str:
     return url if url.startswith(("http://", "https://")) else ""
 
 
-def _link_buttons(link: dict | None, app_type: int | None) -> list | None:
+def _link_buttons(link: dict | None, app_type: int | None, open_url: str | None = None) -> list | None:
+    """CTA button for a link card; open_url (e.g. the article reader Mini App link) replaces the raw URL."""
     if url := _link_url(link):
         src = cards.identify_link_source(link, app_type)
-        return [[Button.url(src.button_label, url)]]
+        return [[Button.url(src.button_label, open_url or url)]]
     return None
 
 
@@ -1035,6 +1036,16 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         text += "\n\n接下来会自动发起微信登录（支持手机确认或扫码）。"
         await event.reply(text, parse_mode="html")
         self.tg_ready.set()
+
+    def _reader_link(self, link: dict | None) -> str | None:
+        """t.me Mini App link that opens an Official Account article in the built-in reader (None = plain URL)."""
+        if self.call_web is None or not (url := _link_url(link)):
+            return None
+        try:
+            return self.call_web.article_link(url)
+        except Exception:
+            log.exception("Could not create a reader link for %s", url)
+            return None
 
     async def wechat_side(self) -> None:
         await self.ensure_wechat()
@@ -1957,7 +1968,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if isinstance(send_media, Media) and is_link:
                 f = send_media.tg_file()
                 caption = (header + prefix + link_note).rstrip("\n")
-                buttons = _link_buttons(link, link_app_type)
+                buttons = _link_buttons(link, link_app_type, self._reader_link(link))
                 kw = dict(caption=caption[:TG_CAPTION_LIMIT] or None, parse_mode="html", reply_to=reply,
                           silent=silent, force_document=False, buttons=buttons)
                 try:
@@ -2111,7 +2122,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 text = header + prefix + _media_failure_text(msg, send_media)
                 buttons = None
             elif is_link:
-                buttons = _link_buttons(link, link_app_type)
+                buttons = _link_buttons(link, link_app_type, self._reader_link(link))
                 text = header + prefix + link_note + _link_body(link, link_app_type, inline_url=not buttons)
             else:
                 buttons = None

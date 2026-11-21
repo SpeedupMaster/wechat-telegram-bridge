@@ -62,6 +62,8 @@ class BridgeConfig:
     call_web_listen: str = "127.0.0.1:8780"
     call_web_app: str = ""  # optional BotFather Mini App short name: buttons open t.me/<bot>/<app> instead
     link_card_images: bool = True
+    # With call_web_app set, Official Account article cards open in a built-in reader Mini App (no link prompt).
+    article_reader: bool = True
     friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
     auto_rename: bool = True  # follow WeChat remark/group-name changes in Telegram titles
     gif_as_sticker: bool = True
@@ -96,6 +98,8 @@ class BridgeConfig:
         host, sep, port = str(self.call_web_listen or "").strip().rpartition(":")
         if not sep or not port.isdigit() or not host:
             raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
+        if not isinstance(self.article_reader, bool):
+            raise ValueError(f"[bridge] article_reader must be true or false, not {self.article_reader!r}")
         if not isinstance(self.emoji_to_wechat, bool):
             raise ValueError(f"[bridge] emoji_to_wechat must be true or false, not {self.emoji_to_wechat!r}")
         if not isinstance(self.auto_relogin, bool):

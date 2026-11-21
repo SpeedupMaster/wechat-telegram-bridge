@@ -1,6 +1,7 @@
 """SQLite state: event cursor, WeChat thread <-> Telegram group or forum topic, message id mapping."""
 from __future__ import annotations
 
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -41,6 +42,12 @@ CREATE TABLE IF NOT EXISTS sent (
     wx_thread TEXT NOT NULL,
     wx_server TEXT NOT NULL,
     PRIMARY KEY (wx_thread, wx_server)
+);
+-- Official Account articles opened through the reader Mini App: id is the start parameter in the card button.
+CREATE TABLE IF NOT EXISTS articles (
+    id         TEXT PRIMARY KEY,
+    url        TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS msgmap_wx_msg ON msgmap (wx_msg);
 CREATE INDEX IF NOT EXISTS msgmap_wx_server ON msgmap (wx_thread, wx_server);
@@ -232,3 +239,25 @@ class Store:
 
     def seen_wx_msg(self, wx_msg: str) -> bool:
         return self.db.execute("SELECT 1 FROM msgmap WHERE wx_msg=? LIMIT 1", (wx_msg,)).fetchone() is not None
+
+    # --- reader articles --------------------------------------------------
+    def article_id(self, url: str) -> str:
+        """Stable short id for an article URL (created on first use)."""
+        row = self.db.execute("SELECT id FROM articles WHERE url=?", (url,)).fetchone()
+        if row:
+            return row[0]
+        while True:
+            # [A-Za-z0-9] only: it travels in a Mini App start parameter and must not clash with call tokens
+            aid = "".join(secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+                          for _ in range(16))
+            try:
+                self.db.execute("INSERT INTO articles(id,url,created_at) VALUES(?,?,?)", (aid, url, int(time.time())))
+                return aid
+            except sqlite3.IntegrityError:
+                row = self.db.execute("SELECT id FROM articles WHERE url=?", (url,)).fetchone()
+                if row:
+                    return row[0]
+
+    def article_url(self, aid: str) -> str | None:
+        row = self.db.execute("SELECT url FROM articles WHERE id=?", (aid,)).fetchone()
+        return row[0] if row else None

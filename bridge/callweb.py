@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import struct
 import time
@@ -24,6 +25,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 
 from aiohttp import WSMsgType, web
 
+from . import article as articles
 from .wechat import WeChatError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -43,6 +45,9 @@ DIAL_REQUEST_TTL = 600.0
 MAX_INVITEES = 100
 INIT_DATA_MAX_AGE = 24 * 3600
 MAX_PCM_CHUNK = 65536
+# Mini App start parameters that open the article reader instead of a call: "r_" + Store.article_id().
+READER_PREFIX = "r_"
+_ARTICLE_ID_RE = re.compile(r"[A-Za-z0-9]{8,32}")
 
 CALL_ERRORS = {
     "offer_expired": "来电已结束或已过期",
@@ -294,6 +299,8 @@ class CallWeb:
         self._tasks: set[asyncio.Task] = set()
         self._runner: web.AppRunner | None = None
         self.bound_port = self.port
+        self.article_cache = articles.ArticleCache()
+        self._article_fetches: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------------ links / tokens
     def link(self, token: str) -> str:
@@ -301,9 +308,21 @@ class CallWeb:
             return f"https://t.me/{self.bridge.bot_me.username}/{quote(self.app_name)}?startapp={token}"
         return f"{self.base_url}/call/{token}"
 
+    def article_link(self, url: str | None) -> str | None:
+        """Mini App link that opens an Official Account article in the reader, or None to keep the plain URL."""
+        if not (self.app_name and self.bridge.cfg.bridge.article_reader and articles.is_article_url(url)):
+            return None
+        me = getattr(self.bridge, "bot_me", None)
+        if not (me and me.username):
+            return None
+        aid = self.bridge.store.article_id(articles.normalize_url(url))
+        return f"https://t.me/{me.username}/{quote(self.app_name)}?startapp={READER_PREFIX}{aid}"
+
     def _new_token(self, kind: str, ref: str) -> str:
         self._prune_tokens()
         token = secrets.token_urlsafe(18)
+        while token.startswith(READER_PREFIX):  # reserved for reader start parameters
+            token = secrets.token_urlsafe(18)
         self.tokens[token] = (kind, ref)
         return token
 
@@ -721,6 +740,7 @@ class CallWeb:
         if p:
             app.router.add_get(p, self._page)
         app.router.add_get(p + "/call/{token}", self._page)
+        app.router.add_get(p + "/read/{aid}", self._read)
         app.router.add_get(p + "/ws", self._ws)
         app.router.add_get(p + "/healthz", self._health)
         return app
@@ -739,7 +759,7 @@ class CallWeb:
     async def stop(self) -> None:
         for sess in list(self.sessions.values()):
             await sess.close()
-        for task in list(self._tasks):
+        for task in [*self._tasks, *self._article_fetches.values()]:
             task.cancel()
         for conns in list(self.clients.values()):
             for ws in list(conns):
@@ -752,6 +772,9 @@ class CallWeb:
         return web.Response(text="ok")
 
     async def _page(self, request: web.Request) -> web.Response:
+        start = request.query.get("tgWebAppStartParam", "")
+        if start.startswith(READER_PREFIX):  # reader links share the Mini App's single URL
+            return await self._reader_response(start[len(READER_PREFIX):])
         cfg = json.dumps({"base": self.prefix}, ensure_ascii=False)
         return web.Response(
             text=PAGE_HTML.replace("__CFG__", cfg).replace("__WORKLET__", json.dumps(WORKLET_JS)),
@@ -759,6 +782,54 @@ class CallWeb:
             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
                      "X-Content-Type-Options": "nosniff"},
         )
+
+    async def _read(self, request: web.Request) -> web.Response:
+        return await self._reader_response(request.match_info["aid"])
+
+    async def _reader_response(self, aid: str) -> web.Response:
+        url = self.bridge.store.article_url(aid) if _ARTICLE_ID_RE.fullmatch(aid) else None
+        nonce = secrets.token_urlsafe(12)
+        status = 200
+        if url is None:
+            page = articles.render_page(None, error="文章链接已失效", nonce=nonce)
+            status = 404
+        else:
+            result = await self._load_article(url)
+            if isinstance(result, articles.Article):
+                page = articles.render_page(result, nonce=nonce)
+            else:
+                page = articles.render_page(None, error=str(result), source_url=url, nonce=nonce)
+                status = 502
+        return web.Response(
+            text=page, status=status, content_type="text/html", charset="utf-8",
+            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
+                     "Content-Security-Policy": (
+                         "default-src 'none'; img-src https: data:; media-src https:; font-src https: data:; "
+                         f"style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'")},
+        )
+
+    async def _load_article(self, url: str) -> articles.Article | articles.ArticleError:
+        cached = self.article_cache.get(url)
+        if cached is not None:
+            return cached
+        task = self._article_fetches.get(url)
+        if task is None:  # one download per article even if the button is tapped repeatedly
+            task = asyncio.create_task(self._fetch_article(url))
+            self._article_fetches[url] = task
+            task.add_done_callback(lambda _t: self._article_fetches.pop(url, None))
+        return await asyncio.shield(task)  # a closed page must not cancel the shared download
+
+    async def _fetch_article(self, url: str) -> articles.Article | articles.ArticleError:
+        try:
+            result: articles.Article | articles.ArticleError = await articles.fetch_article(url)
+        except articles.ArticleError as e:
+            log.info("Could not load WeChat article %s: %s", url, e)
+            result = e
+        except Exception as e:
+            log.exception("Reading WeChat article %s failed", url)
+            result = articles.ArticleError(f"加载失败（{type(e).__name__}）")
+        self.article_cache.put(url, result)
+        return result
 
     def _authorize(self, msg: dict) -> tuple[str | None, str]:
         token = str(msg.get("token") or "")
@@ -1112,6 +1183,10 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     return q.get('tgWebAppStartParam') || q.get('t') || '';
   }
   const token = findToken();
+  if (token.indexOf('r_') === 0) {  // article reader link opened through the shared Mini App URL
+    location.replace(location.origin + CFG.base + '/read/' + encodeURIComponent(token.slice(2)) + location.hash);
+    return;
+  }
   const pageUrl = location.origin + CFG.base + '/call/' + token;
   const workletUrl = URL.createObjectURL(new Blob([WORKLET], {type: 'application/javascript'}));
 

@@ -66,6 +66,9 @@ call_notifications = true
 # call_web_app = ""
 # 将微信链接分享（小红书、公众号、抖音/抖音极速版口令、网页等）渲染为微信风格卡片图并附带直达按钮
 link_card_images = true
+# 公众号文章卡片的按钮改为在内置阅读页（Mini App）中打开：不再弹「打开此链接？」确认，页面里可再点「打开原文」
+# 需要同时配置 call_web_url 与 call_web_app；关闭后按钮仍直接打开原文链接
+article_reader = true
 # 把收到的微信好友请求推送到与机器人的私聊，可一键通过（需 agent-wechat >= 2.7.0）
 friend_requests = true
 # 微信备注 / 群名变化后自动更新 Telegram 群或话题标题（关闭后可在群里发 /rename 手动同步）
