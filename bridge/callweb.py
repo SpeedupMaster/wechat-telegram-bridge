@@ -868,10 +868,10 @@ class CallWeb:
             with articles.use_fetcher(self.article_fetcher):
                 result: articles.Article | articles.ArticleError = await articles.fetch_article(url)
         except articles.ArticleError as e:
-            log.info("Could not load WeChat article %s: %s", url, e)
+            log.info("Reader could not load %s: [%s] %s", url, e.code, e)
             result = e
         except Exception as e:
-            log.exception("Reading WeChat article %s failed", url)
+            log.exception("Reader fetch of %s failed", url)
             result = articles.ArticleError(f"加载失败（{type(e).__name__}）")
         self.article_cache.put(url, result)
         if isinstance(result, articles.Article):

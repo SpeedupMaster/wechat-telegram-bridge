@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import re
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -32,6 +33,8 @@ _EMOJI_CODE_RE = re.compile(r"\[[^\[\]\n]{1,10}R\]")
 _SPACES_RE = re.compile(r"[ \t　]{2,}")
 _HASHTAG_RE = re.compile(r"#[^\s#]+")
 _FALLBACK = "小红书限制了服务器访问，正在打开原笔记…"
+_TITLE_RE = re.compile(r"<title[^>]*>([^<]{0,80})", re.I)
+log = logging.getLogger(__name__)
 
 
 def _host(url: str) -> str:
@@ -222,11 +225,13 @@ async def fetch_note(url: str, session: Any, *, uses_curl: bool, net_errors: tup
                         raise ArticleError(_FALLBACK, code="xhs_off_host", fallback_original=True)
                     path = urlsplit(nxt).path
                     if _on_host(host, "xiaohongshu.com") and not _NOTE_PATH_RE.match(path):
-                        # login wall, 404 page or the home page (expired token)
+                        # login wall, captcha, 404 page or the home page (expired token)
+                        log.info("Xiaohongshu redirected %s to %s", urlsplit(current).path, path)
                         raise ArticleError(_FALLBACK, code="xhs_blocked", fallback_original=True)
                     current = normalize_url(nxt)
                     continue
                 if resp.status_code != 200:
+                    log.info("Xiaohongshu answered HTTP %s for %s", resp.status_code, urlsplit(current).path)
                     raise ArticleError(_FALLBACK, code=f"xhs_http_{resp.status_code}", fallback_original=True)
                 buf = bytearray()
                 aiter = resp.aiter_content() if hasattr(resp, "aiter_content") else resp.aiter_bytes()
@@ -235,7 +240,13 @@ async def fetch_note(url: str, session: Any, *, uses_curl: bool, net_errors: tup
                     if len(buf) > MAX_PAGE_BYTES:
                         raise ArticleError("笔记页面过大", code="too_large", fallback_original=True)
                 page = buf.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
-                return parse_note(page, current)
+                try:
+                    return parse_note(page, current)
+                except ArticleError:
+                    m = _TITLE_RE.search(page)
+                    log.info("Xiaohongshu page without a note (%d bytes, title %r)", len(page),
+                             html.unescape(m.group(1)).strip() if m else "")
+                    raise
         raise ArticleError(_FALLBACK, code="too_many_redirects", fallback_original=True)
     except (httpx.HTTPError, *net_errors) as e:
         raise ArticleError(f"无法连接小红书（{type(e).__name__}），正在打开原笔记…", code="network",

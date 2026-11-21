@@ -696,7 +696,7 @@ def render_page(article: Article | None, *, error: str = "", source_url: str = "
         body = f'<p class="err">{html.escape(error or "文章不存在或链接已失效")}</p>'
         retry_btn = (f'<a class="retry" data-inapp="1" href="{html.escape(retry_url)}">重试</a>'
                      if retry_url else "")
-    open_btn = (f'<a class="open" id="open" href="{html.escape(url)}" target="_blank" rel="noopener">打开原文</a>'
+    open_btn = (f'<a class="open" id="open" data-inapp="1" href="{html.escape(url)}">打开原文</a>'
                 if url else "")
     bar_inner = f'<div class="bar-inner">{retry_btn}{open_btn}</div>' if (retry_btn or open_btn) else ""
     return (READER_HTML.replace("__TITLE__", html.escape(title)).replace("__HEAD__", head)

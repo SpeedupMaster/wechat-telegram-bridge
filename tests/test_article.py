@@ -153,7 +153,9 @@ class ParseTests(unittest.TestCase):
         page = A.render_page(art, nonce="abc")
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
         self.assertIn("<p>正文</p>", page)
-        self.assertIn(f'href="{ART_URL}"', page)
+        # 打开原文 stays inside the Mini App (no web_app_open_link hand-off to an external browser)
+        self.assertIn(f'<a class="open" id="open" data-inapp="1" href="{ART_URL}">打开原文</a>', page)
+        self.assertNotIn('target="_blank"', page)
         self.assertIn('<meta name="referrer" content="no-referrer">', page)
         dated = A.render_page(A.Article(url=ART_URL, title="t", account="号", published=1607438787), nonce="")
         self.assertIn("号 · 2020-12-08 22:46", dated)  # Beijing time, whatever the server's timezone
