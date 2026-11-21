@@ -34,6 +34,8 @@ _TOPIC_RE = re.compile(r"#([^#\[\]\n]{1,40})\[话题\]#")
 _EMOJI_CODE_RE = re.compile(r"\[[^\[\]\n]{1,10}R\]")
 _SPACES_RE = re.compile(r"[ \t　]{2,}")
 _HASHTAG_RE = re.compile(r"#[^\s#]+")
+_VIDEO_KEY_RE = re.compile(r"^[0-9A-Za-z_-]+(?:/[0-9A-Za-z_-]+)*$")
+VIDEO_ORIGIN_BASE = "https://sns-video-bd.xhscdn.com/"
 _FALLBACK = "小红书限制了服务器访问，正在打开原笔记…"
 _TITLE_RE = re.compile(r"<title[^>]*>([^<]{0,80})", re.I)
 log = logging.getLogger(__name__)
@@ -127,24 +129,56 @@ def _find_note(state: dict) -> dict | None:
     return None
 
 
+def _streams(video: dict) -> list[tuple[str, dict]]:
+    """(codec, stream) pairs from media.stream (camelCase) and from mediaV2, a JSON string (snake_case).
+
+    Which of the two carries the streams varies with the page variant a server is shown."""
+    out: list[tuple[str, dict]] = []
+    media_v2 = video.get("mediaV2")
+    if isinstance(media_v2, str):
+        try:
+            media_v2 = json.loads(media_v2)
+        except ValueError:
+            media_v2 = None
+    for media in (video.get("media"), media_v2):
+        streams = (media or {}).get("stream") if isinstance(media, dict) else None
+        if not isinstance(streams, dict):
+            continue
+        for codec in ("h264", "h265", "av1"):  # h264 plays everywhere; others only as later fallbacks
+            out += [(codec, s) for s in streams.get(codec) or [] if isinstance(s, dict)]
+    return out
+
+
 def _video_sources(video: dict) -> list[str]:
-    streams = ((video.get("media") or {}).get("stream") or {})
     urls: list[str] = []
-    for codec in ("h264", "h265", "av1"):  # h264 plays everywhere; others only as later fallbacks
-        for s in streams.get(codec) or []:
-            if not isinstance(s, dict):
-                continue
-            for u in [*(s.get("backupUrls") or []), s.get("masterUrl") or ""]:
-                if (u := _https_media(u)) and u not in urls:
-                    urls.append(u)
+    for _, s in sorted(_streams(video), key=lambda cs: ("h264", "h265", "av1").index(cs[0])):
+        for u in [*(s.get("backupUrls") or s.get("backup_urls") or []), s.get("masterUrl") or s.get("master_url") or ""]:
+            if isinstance(u, str) and (u := _https_media(u)) and u not in urls:
+                urls.append(u)
+    # The untranscoded upload, served unsigned by the video CDN; last because it can be large or HEVC.
+    key = str(((video.get("consumer") or {}) if isinstance(video.get("consumer"), dict) else {})
+              .get("originVideoKey") or "").strip().lstrip("/")
+    if _VIDEO_KEY_RE.match(key) and ".." not in key:
+        urls.append(VIDEO_ORIGIN_BASE + key)
     return urls
 
 
 def _video_size(video: dict) -> tuple[int, int]:
-    for s in ((video.get("media") or {}).get("stream") or {}).get("h264") or []:
-        if isinstance(s, dict) and _int(s.get("width")) and _int(s.get("height")):
+    for codec, s in _streams(video):
+        if codec == "h264" and _int(s.get("width")) and _int(s.get("height")):
             return _int(s["width"]), _int(s["height"])
     return 0, 0
+
+
+def _describe_video(video: dict | None) -> str:
+    """What a video note's data held, for the log when no stream could be found."""
+    if not isinstance(video, dict):
+        return f"video={type(video).__name__}"
+    media = video.get("media") if isinstance(video.get("media"), dict) else {}
+    streams = media.get("stream") if isinstance(media.get("stream"), dict) else {}
+    counts = ",".join(f"{k}:{len(x) if isinstance(x, list) else '?'}" for k, x in streams.items())
+    return (f"keys={sorted(video)} media={sorted(media)} stream={{{counts}}} "
+            f"mediaV2={type(video.get('mediaV2')).__name__}")
 
 
 def parse_note(page: str, url: str) -> Article:
@@ -168,6 +202,7 @@ def parse_note(page: str, url: str) -> Article:
         thumb = ((video.get("image") or {}).get("thumbnailFileid") or "")
         cover = (_image_url(images[0].get("fileId") or "") if images else "") or _image_url(thumb)
         if not sources:
+            log.info("Xiaohongshu video note without a playable stream (%s)", _describe_video(video))
             raise ArticleError(_FALLBACK, code="xhs_no_video", fallback_original=True)
         w, h = _video_size(video)
         size = f' width="{w}" height="{h}"' if w and h else ""
@@ -246,9 +281,9 @@ async def fetch_note(url: str, session: Any, *, uses_curl: bool, net_errors: tup
                 page = buf.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
                 try:
                     return parse_note(page, current)
-                except ArticleError:
+                except ArticleError as e:
                     m = _TITLE_RE.search(page)
-                    log.info("Xiaohongshu page without a note (%d bytes, title %r)", len(page),
+                    log.info("Xiaohongshu page not usable [%s] (%d bytes, title %r)", e.code, len(page),
                              html.unescape(m.group(1)).strip() if m else "")
                     raise
         raise ArticleError(_FALLBACK, code="too_many_redirects", fallback_original=True)

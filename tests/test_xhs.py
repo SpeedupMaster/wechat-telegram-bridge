@@ -100,6 +100,36 @@ class ParseTests(unittest.TestCase):
         self.assertNotIn("sprite", art.content)
         self.assertNotIn("evil", art.content)
 
+    def test_video_streams_outside_media(self):
+        # Some page variants (seen from overseas servers) leave media.stream empty: the streams are then only
+        # in mediaV2, a JSON string with snake_case keys, and the original upload in consumer.originVideoKey.
+        media_v2 = {"video": {"width": 1920}, "stream": {
+            "h265": [{"master_url": "http://sns-video-v2.xhscdn.com/stream/b265.mp4?sign=y"}],
+            "h264": [{"width": 1920, "height": 1080, "master_url": "http://sns-video-v2.xhscdn.com/stream/b.mp4?sign=z",
+                      "backup_urls": ["http://sns-bak-v6.xhscdn.com/stream/b.mp4", "http://evil.example/b.mp4"]}]}}
+        video = {"media": {"stream": {"h264": [], "h265": [], "h266": [], "av1": []}},
+                 "mediaV2": json.dumps(media_v2), "consumer": {"originVideoKey": "pre_post/1040g0cg327nh03m"}}
+        art = xhs.parse_note(_page({**VIDEO_NOTE, "video": video}), NOTE_URL)
+        self.assertEqual(re.findall(r'<source src="([^"]+)"', art.content),
+                         ["https://sns-bak-v6.xhscdn.com/stream/b.mp4",
+                          "https://sns-video-v2.xhscdn.com/stream/b.mp4?sign=z",
+                          "https://sns-video-v2.xhscdn.com/stream/b265.mp4?sign=y",
+                          "https://sns-video-bd.xhscdn.com/pre_post/1040g0cg327nh03m"])
+        self.assertIn('width="1920" height="1080"', art.content)
+        self.assertNotIn("evil", art.content)
+        # the original upload alone is enough; a malformed key or mediaV2 is ignored
+        for consumer, ok in (({"originVideoKey": "pre_post/abc"}, True), ({"originVideoKey": "../x"}, False),
+                             ({"originVideoKey": "a b"}, False), (None, False)):
+            note = {**VIDEO_NOTE, "video": {"media": {"stream": {}}, "mediaV2": "{bad", "consumer": consumer}}
+            if ok:
+                self.assertIn('<source src="https://sns-video-bd.xhscdn.com/pre_post/abc"',
+                              xhs.parse_note(_page(note), NOTE_URL).content)
+            else:
+                with self.assertRaises(A.ArticleError) as cm, self.assertLogs("bridge.xhs", "INFO") as logs:
+                    xhs.parse_note(_page(note), NOTE_URL)
+                self.assertEqual(cm.exception.code, "xhs_no_video")
+                self.assertIn("stream={}", logs.output[0])
+
     def test_image_note_and_desktop_state(self):
         for page in (_page(IMAGE_NOTE), _page(IMAGE_NOTE, desktop=True)):
             art = xhs.parse_note(page, NOTE_URL)
