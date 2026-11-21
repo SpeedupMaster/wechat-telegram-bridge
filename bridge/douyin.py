@@ -2,8 +2,8 @@
 
 Douyin's share pages no longer carry the video in their HTML (the page script fetches it from signed APIs),
 but the official embed player at https://open.douyin.com/player/video?vid=<id> plays any public video
-without a login, a signature or a Referer, and allows being framed. So the server only resolves a share
-link's redirect to learn the video id (no page download), and the Mini App shows the player full screen.
+without a login, a signature or a Referer. So the server only resolves a share
+link's redirect to learn the video id (no page download), and the Mini App opens the player in place (see embed.py).
 Anything that is not a plain video (图文 notes, profiles, deleted posts) opens the original link instead.
 """
 from __future__ import annotations
@@ -16,7 +16,8 @@ from . import embed
 from .article import Article, ArticleError
 
 SHARE_HOSTS = ("douyin.com", "iesdouyin.com")
-PLAYER_URL = "https://open.douyin.com/player/video?vid={vid}&autoplay=0"
+# width/height: the player otherwise draws a fixed 324x672 box (it accepts %, vw/vh or px > 324)
+PLAYER_URL = "https://open.douyin.com/player/video?vid={vid}&autoplay=0&width=100vw&height=100vh"
 PLAYER_ORIGIN = "https://open.douyin.com"
 _VIDEO_PATH_RE = re.compile(r"^/(?:share/)?video/(\d{8,25})/?$")
 _ID_RE = re.compile(r"^\d{8,25}$")

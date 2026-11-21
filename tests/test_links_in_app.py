@@ -41,7 +41,8 @@ class BilibiliUrlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bilibili.player_url('BV1"><script>x')
         page = bilibili.render_player(bilibili.article_for(BV, 2), nonce="N")
-        self.assertIn(f'src="https://player.bilibili.com/player.html?bvid={BV}&amp;p=2&amp;', page)
+        self.assertIn(f'var target = "https://player.bilibili.com/player.html?bvid={BV}&p=2&', page)
+        self.assertNotIn("<iframe", page)
         self.assertIn("<title>哔哩哔哩视频</title>", page)
 
 
@@ -108,7 +109,7 @@ class MiniAppWebTests(unittest.IsolatedAsyncioTestCase):
             page, csp = await self._get(link)
         self.assertEqual(calls, ["https://b23.tv/vid1"])
         self.assertIn(f"https://player.bilibili.com/player.html?bvid={BV}", page)
-        self.assertIn("frame-src https://player.bilibili.com;", csp)
+        self.assertIn("frame-src 'none';", csp)
 
     async def test_other_links_open_in_place_without_fetching(self):
         url = "http://example.com/a?b=1&c=<x>#top"

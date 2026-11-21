@@ -1,7 +1,7 @@
 """Bilibili videos in the built-in reader Mini App, through Bilibili's official embed player.
 
 https://player.bilibili.com/player.html?bvid=<BV id> plays public videos without a login (at a modest
-quality) and allows being framed; the mobile site, by contrast, keeps asking to install the app. The server
+quality); the mobile site, by contrast, keeps asking to install the app. The server
 only resolves b23.tv share links (Location headers, no page download). Live rooms, bangumi, articles and
 profiles open the original link instead.
 """

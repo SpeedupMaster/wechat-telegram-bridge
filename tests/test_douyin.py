@@ -38,8 +38,12 @@ class UrlTests(unittest.TestCase):
 
     def test_player_page(self):
         page = douyin.render_player(douyin.article_for(VID, SHARE), nonce="N0")
-        self.assertIn(f'src="https://open.douyin.com/player/video?vid={VID}&amp;autoplay=0"', page)
-        self.assertIn('referrerpolicy="no-referrer"', page)
+        # handed over in place (no iframe), without a Referer
+        self.assertIn(f'var target = "https://open.douyin.com/player/video?vid={VID}&autoplay=0&width=100vw&height=100vh";', page)
+        self.assertIn("window.location.replace(target)", page)
+        self.assertIn(f'href="https://open.douyin.com/player/video?vid={VID}&amp;autoplay=0&amp;width=100vw&amp;height=100vh"', page)
+        self.assertIn('<meta name="referrer" content="no-referrer">', page)
+        self.assertNotIn("<iframe", page)
         self.assertIn('<script nonce="N0">', page)
         self.assertIsNone(douyin.render_player(A.Article(url="https://mp.weixin.qq.com/s/x", title="t", account="",
                                                          author="", published=0, cover="", description="",
@@ -124,7 +128,7 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
                 csp = r.headers["Content-Security-Policy"]
         self.assertEqual(calls, [SHARE])
         self.assertIn(f"https://open.douyin.com/player/video?vid={VID}", page)
-        self.assertIn("frame-src https://open.douyin.com;", csp)
+        self.assertIn("frame-src 'none';", csp)  # opened top-level, not framed (iOS blocks framed cookies)
 
     async def test_other_reader_pages_keep_frames_blocked_and_notes_fall_back(self):
         with mock.patch.object(A, "fetch_article", side_effect=A.ArticleError(

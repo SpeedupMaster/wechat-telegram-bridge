@@ -834,7 +834,6 @@ class CallWeb:
         url = self.bridge.store.article_url(aid) if _ARTICLE_ID_RE.fullmatch(aid) else None
         nonce = secrets.token_urlsafe(12)
         status = 200
-        frame_src = "'none'"
         if url is None:
             page = articles.render_page(None, error="文章链接已失效", nonce=nonce)
             status = 404
@@ -844,11 +843,8 @@ class CallWeb:
             retry_url = f"{self.prefix}/read/{aid}?retry=1"
             result = await self._load_article(url, force_refresh=force_refresh)
             if isinstance(result, articles.Article):
-                page = None
-                for site in (douyin, bilibili):
-                    if (page := site.render_player(result, nonce=nonce)) is not None:
-                        frame_src = site.PLAYER_ORIGIN
-                        break
+                # embedded videos hand over to the official player page; everything else is rendered here
+                page = douyin.render_player(result, nonce=nonce) or bilibili.render_player(result, nonce=nonce)
                 if page is None:
                     page = articles.render_page(result, nonce=nonce, retry_url=retry_url)
             elif result.fallback_original:
@@ -863,7 +859,7 @@ class CallWeb:
             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
                      "Content-Security-Policy": (
                          "default-src 'none'; img-src https: data:; media-src https:; font-src https: data:; "
-                         f"frame-src {frame_src}; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; "
+                         f"frame-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; "
                          "base-uri 'none'; form-action 'none'")},
         )
 

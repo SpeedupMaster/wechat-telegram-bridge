@@ -1,11 +1,16 @@
 """Shared pieces for videos shown through a site's official embed player (Douyin, Bilibili).
 
 The server never downloads the video page: it follows a share link's redirects (Location headers only) until
-the URL names a video, and the Mini App frames the official player full screen.
+the URL names a video, and the Mini App then navigates in place to the official player.
+
+The player is opened as the page itself rather than framed: iOS WebKit blocks third-party cookies in frames
+(the players need theirs to fetch the video, so a framed player shows "加载失败") and does not reliably size
+an iframe to the Mini App view.
 """
 from __future__ import annotations
 
 import html
+import json
 from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -59,25 +64,29 @@ async def resolve(url: str, session: Any, *, uses_curl: bool, net_errors: tuple[
 
 
 def render_player(src: str, *, title: str, nonce: str = "") -> str:
-    return (PLAYER_HTML.replace("__SRC__", html.escape(src)).replace("__TITLE__", html.escape(title))
-            .replace("__NONCE__", nonce))
+    """Black handoff page: paints Telegram's header black, then replaces itself with the player."""
+    return (PLAYER_HTML.replace("__SRC_ATTR__", html.escape(src, quote=True))
+            .replace("__SRC_JS__", json.dumps(src).replace("<", "\\u003c").replace(">", "\\u003e"))
+            .replace("__TITLE__", html.escape(title)).replace("__NONCE__", nonce))
 
 
-PLAYER_HTML = """<!doctype html>
+PLAYER_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
+<noscript><meta http-equiv="refresh" content="0;url=__SRC_ATTR__"></noscript>
 <title>__TITLE__</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  iframe { display: block; width: 100vw; height: 100vh; height: 100dvh; border: 0; background: #000; }
+  html, body { margin: 0; height: 100%; background: #000; color: #8a8a8a; }
+  body { display: flex; align-items: center; justify-content: center;
+         font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  a { color: #8a8a8a; }
 </style>
 </head>
 <body>
-<iframe src="__SRC__" referrerpolicy="no-referrer" allow="autoplay; fullscreen; picture-in-picture"
-        allowfullscreen title="__TITLE__"></iframe>
+<a href="__SRC_ATTR__">正在打开__TITLE__…</a>
 <script nonce="__NONCE__">
 (function () {
   function post(type, data) {
@@ -91,11 +100,14 @@ PLAYER_HTML = """<!doctype html>
       }
     } catch (e) {}
   }
+  // The player pages are dark; set Telegram's chrome before leaving, since they cannot.
   post('web_app_set_header_color', {color: '#000000'});
   post('web_app_set_background_color', {color: '#000000'});
   post('web_app_set_bottom_bar_color', {color: '#000000'});
   post('web_app_expand');
   post('web_app_ready');
+  var target = __SRC_JS__;
+  if (/^https:\/\//.test(target)) window.location.replace(target);
 })();
 </script>
 </body>
