@@ -1038,7 +1038,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.tg_ready.set()
 
     def _reader_link(self, link: dict | None) -> str | None:
-        """t.me Mini App link that opens an Official Account article in the built-in reader (None = plain URL)."""
+        """t.me Mini App link that opens an article / Xiaohongshu note / Douyin video in the reader (None = plain URL)."""
         if self.call_web is None or not (url := _link_url(link)):
             return None
         try:

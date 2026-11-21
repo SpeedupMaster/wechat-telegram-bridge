@@ -72,7 +72,10 @@ article_reader = true
 # 小红书笔记卡片同样走内置阅读页：视频直接内嵌播放、图文按原图展示；收到卡片时即预抓取（分享链接的 xsec_token 会过期）
 # 服务器被小红书拦截（登录墙、链接过期）时，Mini App 会在应用内原地打开原笔记
 xhs_reader = true
-# 可选：仅用于抓取公众号文章 / 小红书笔记的独立代理（环境变量 ARTICLE_PROXY），与 [telegram].proxy 相互独立
+# 抖音视频卡片在同一个 Mini App 中用抖音官方嵌入播放器（open.douyin.com）全屏播放；服务端只解析分享短链拿到视频 ID
+# 图文作品、主页链接或已删除的视频会在应用内原地打开原链接
+douyin_reader = true
+# 可选：仅用于抓取公众号文章 / 小红书笔记 / 解析抖音短链的独立代理（环境变量 ARTICLE_PROXY），与 [telegram].proxy 相互独立
 # 支持 http://、https://、socks5://、socks5h://；留空则直连（遇微信「环境异常」时 Mini App 会自动在应用内跳转原文）
 # article_proxy = ""
 # 把收到的微信好友请求推送到与机器人的私聊，可一键通过（需 agent-wechat >= 2.7.0）

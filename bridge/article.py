@@ -511,9 +511,11 @@ def _is_captcha_url(url: str) -> bool:
 
 
 async def _fetch_with_session(url: str, session: Any, *, uses_curl: bool) -> Article:
-    from . import xhs  # imports this module; keep the dependency one-way at import time
+    from . import douyin, xhs  # they import this module; keep the dependency one-way at import time
     if xhs.is_note_url(url):
         return await xhs.fetch_note(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
+    if douyin.is_video_url(url):
+        return await douyin.fetch_video(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
     if not is_article_url(url):
         raise ArticleError("不是微信公众号文章链接", code="invalid_url")
     current = normalize_url(url)

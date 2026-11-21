@@ -26,7 +26,7 @@ from urllib.parse import parse_qsl, quote, urlsplit
 from aiohttp import WSMsgType, web
 
 from . import article as articles
-from . import xhs
+from . import douyin, xhs
 from .wechat import WeChatError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -311,17 +311,19 @@ class CallWeb:
         return f"{self.base_url}/call/{token}"
 
     def article_link(self, url: str | None) -> str | None:
-        """Mini App link that opens an Official Account article / Xiaohongshu note in the reader (None = plain URL)."""
+        """Mini App link that opens an Official Account article, Xiaohongshu note or Douyin video in the reader
+        (None = plain URL)."""
         cfg = self.bridge.cfg.bridge
         is_note = cfg.xhs_reader and xhs.is_note_url(url)
-        if not (self.app_name and (is_note or (cfg.article_reader and articles.is_article_url(url)))):
+        is_video = cfg.douyin_reader and douyin.is_video_url(url)
+        if not (self.app_name and (is_note or is_video or (cfg.article_reader and articles.is_article_url(url)))):
             return None
         me = getattr(self.bridge, "bot_me", None)
         if not (me and me.username):
             return None
         norm = articles.normalize_url(url)
         aid = self.bridge.store.article_id(norm)
-        if is_note:
+        if is_note or is_video:  # share tokens expire; resolve while the card is fresh
             self._prefetch(norm)
         return f"https://t.me/{me.username}/{quote(self.app_name)}?startapp={READER_PREFIX}{aid}"
 
@@ -808,6 +810,7 @@ class CallWeb:
         url = self.bridge.store.article_url(aid) if _ARTICLE_ID_RE.fullmatch(aid) else None
         nonce = secrets.token_urlsafe(12)
         status = 200
+        frame_src = "'none'"
         if url is None:
             page = articles.render_page(None, error="文章链接已失效", nonce=nonce)
             status = 404
@@ -815,7 +818,11 @@ class CallWeb:
             retry_url = f"{self.prefix}/read/{aid}?retry=1"
             result = await self._load_article(url, force_refresh=force_refresh)
             if isinstance(result, articles.Article):
-                page = articles.render_page(result, nonce=nonce, retry_url=retry_url)
+                page = douyin.render_player(result, nonce=nonce)
+                if page is not None:
+                    frame_src = douyin.PLAYER_ORIGIN
+                else:
+                    page = articles.render_page(result, nonce=nonce, retry_url=retry_url)
             elif result.fallback_original:
                 page = articles.render_redirect_page(url, reason=str(result), retry_url=retry_url, nonce=nonce)
                 status = 200
@@ -828,7 +835,8 @@ class CallWeb:
             headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
                      "Content-Security-Policy": (
                          "default-src 'none'; img-src https: data:; media-src https:; font-src https: data:; "
-                         f"style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'")},
+                         f"frame-src {frame_src}; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; "
+                         "base-uri 'none'; form-action 'none'")},
         )
 
     async def _load_article(self, url: str, *, force_refresh: bool = False) -> articles.Article | articles.ArticleError:
