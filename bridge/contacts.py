@@ -10,7 +10,7 @@ import time
 
 from telethon import Button
 
-from .wechat import OP_OK, WeChatError
+from .wechat import OP_OK, WeChatError, is_group_id
 
 log = logging.getLogger("contacts")
 
@@ -133,7 +133,7 @@ class ContactsMixin:
         self._forget_names(wx_id)
         if not self.cfg.bridge.auto_rename:
             return False
-        if not asked and not wx_id.endswith("@chatroom") and (
+        if not asked and not is_group_id(wx_id) and (
                 self._names_syncing or time.monotonic() < self._names_quiet_until):
             return False  # a /syncnames reports every contact as updated: renaming them all hits flood limits
         dest = self._dest_for_thread(wx_id)
@@ -151,7 +151,7 @@ class ContactsMixin:
         try:
             thread = await self.wx.thread(wx_id)
         except WeChatError:
-            if wx_id.endswith("@chatroom"):
+            if is_group_id(wx_id):
                 return None
             try:
                 contact = await self.wx.contact(wx_id)
@@ -169,7 +169,7 @@ class ContactsMixin:
         async def say(text: str) -> None:
             await self.bot.send_message(chat_id, text, parse_mode="html", reply_to=reply_to, link_preview=False)
 
-        if wx_id.endswith("@chatroom"):
+        if is_group_id(wx_id):
             return await say("这是微信群聊，<code>/remark</code> 只能改好友的备注。")
         if not self.wx_ready:
             return await say("🔐 微信尚未登录，登录后再改备注。")
@@ -257,7 +257,7 @@ class ContactsMixin:
             self.names.clear()
             outdated: list[tuple[str, str]] = []
             for wx_id, _, _ in self._link_rows():
-                if not wx_id.endswith("@chatroom") and (title := await self._outdated_title(wx_id)):
+                if not is_group_id(wx_id) and (title := await self._outdated_title(wx_id)):
                     outdated.append((self._link_title(wx_id) or wx_id, title))
             has_standalone = self.topics and any(
                 not self._is_forum_chat(c) for _, c, _, _ in self.store.list_topic_groups()
@@ -423,7 +423,7 @@ class ContactsMixin:
 
     # --- contact card (/contact in a bridged chat) -----------------------------------
     async def contact_card(self, wx_id: str, *, note: str = "") -> tuple[str, list | None]:
-        if wx_id.endswith("@chatroom"):
+        if is_group_id(wx_id):
             return "👥 这是微信群聊，没有好友资料和朋友圈权限可设置。", None
         contact = await self.wx.contact(wx_id)
         name = contact.get("displayName") or contact.get("remark") or contact.get("nickname") or wx_id

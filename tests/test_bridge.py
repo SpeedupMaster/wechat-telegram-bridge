@@ -1653,8 +1653,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         for mid in ("oi1", "of1", "wf1"):
             await self.event(mid, "room@chatroom")
         img, f, plain = (m.text for m in self.b.bot.sent[-3:])
-        self.assertTrue(img.endswith("[图片，无法获取：企业微信发来的图片/文件，agent-wechat 暂不支持下载，请在手机微信查看]"), img)
-        self.assertTrue(f.endswith("[文件「报价单.xlsx」，无法获取：企业微信发来的图片/文件，agent-wechat 暂不支持下载，请在手机微信查看]"), f)
+        self.assertTrue(img.endswith("[图片，无法获取：企业微信发来的图片/文件需 agent-wechat 3.0 及以上版本才能下载，请升级或先在手机微信查看]"), img)
+        self.assertTrue(f.endswith("[文件「报价单.xlsx」，无法获取：企业微信发来的图片/文件需 agent-wechat 3.0 及以上版本才能下载，请升级或先在手机微信查看]"), f)
         # an ordinary sender keeps the generic reason, and the file name is HTML-escaped
         self.assertTrue(plain.endswith("[文件「a&lt;b&gt;.pdf」，无法获取：不支持]"), plain)
 
@@ -6949,7 +6949,7 @@ class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
             events = [ev async for ev in sock.events()]
             await sock.close()
             self.assertEqual(auth[0], "Bearer tok")
-            self.assertEqual(seen[0], {"type": "media.attach", "supportedProtocolVersions": [2],
+            self.assertEqual(seen[0], {"type": "media.attach", "supportedProtocolVersions": [3, 2],
                                        "clientId": "ctl-1", "ownerToken": "own-1"})
             self.assertEqual([m["type"] for m in seen[1:]], ["audio.start", "audio.chunk"])
             self.assertEqual(base64.b64decode(events[0]["pcmBase64"]), pcm)

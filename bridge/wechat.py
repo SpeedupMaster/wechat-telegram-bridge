@@ -28,9 +28,91 @@ log = logging.getLogger("wechat")
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_WS_FRAME = 4 * 1024 * 1024
 
+# Calls Protocol v3 (agent-wechat >= 3.0) with v2 fallback (agent-wechat <= 2.9).
+CALL_PROTOCOL_VERSIONS = (3, 2)
+WXCM_MAGIC = b"WXCM"
+WXCM_VERSION = 3
+WXCM_HEADER_STRUCT = struct.Struct("!4sBBHIIQQI")  # 36-byte big-endian header
+WXCM_KIND_PCM_S16LE = 1
+WXCM_KIND_H265 = 2
+WXCM_KIND_H264 = 3
+WXCM_KIND_JPEG = 4
+WXCM_MAX_AUDIO_PAYLOAD = 64 * 1024
+WXCM_MAX_VIDEO_PAYLOAD = 512 * 1024
+_WXCM_VIDEO_KINDS = (WXCM_KIND_H265, WXCM_KIND_H264, WXCM_KIND_JPEG)
+_WXCM_KNOWN_VIDEO_FLAGS = 0x000F
+
+
+def encode_wxcm_frame(track_id: int, generation: int, payload: bytes, *,
+                      kind: int = WXCM_KIND_PCM_S16LE, flags: int = 0,
+                      sequence: int = 0, timestamp_micros: int = 0) -> bytes:
+    """Pack a binary WXCM v3 media frame (36-byte big-endian header + raw payload)."""
+    if track_id <= 0 or generation <= 0:
+        raise ValueError("WXCM track_id and generation must be positive")
+    if not payload:
+        raise ValueError("WXCM payload must not be empty")
+    if kind == WXCM_KIND_PCM_S16LE:
+        if flags != 0:
+            raise ValueError("WXCM PCM frames must have flags == 0")
+        if len(payload) > WXCM_MAX_AUDIO_PAYLOAD:
+            raise ValueError("WXCM PCM payload exceeds limit")
+    elif kind in _WXCM_VIDEO_KINDS:
+        if flags & ~_WXCM_KNOWN_VIDEO_FLAGS:
+            raise ValueError("WXCM video frame has unknown flag bits")
+        if len(payload) > WXCM_MAX_VIDEO_PAYLOAD:
+            raise ValueError("WXCM video payload exceeds limit")
+    else:
+        raise ValueError(f"Unsupported WXCM payload kind: {kind}")
+    header = WXCM_HEADER_STRUCT.pack(
+        WXCM_MAGIC, WXCM_VERSION, kind, flags,
+        track_id, generation, sequence, timestamp_micros, len(payload),
+    )
+    return header + payload
+
+
+def decode_wxcm_frame(data: bytes) -> dict | None:
+    """Parse and validate a binary WXCM v3 media frame, returning None if malformed."""
+    if len(data) <= WXCM_HEADER_STRUCT.size:
+        return None
+    magic, version, kind, flags, track_id, generation, sequence, ts_micros, payload_len = (
+        WXCM_HEADER_STRUCT.unpack_from(data, 0)
+    )
+    if magic != WXCM_MAGIC or version != WXCM_VERSION or track_id == 0 or generation == 0:
+        return None
+    payload = data[WXCM_HEADER_STRUCT.size:]
+    if payload_len == 0 or payload_len != len(payload):
+        return None
+    if kind == WXCM_KIND_PCM_S16LE:
+        if flags != 0 or payload_len > WXCM_MAX_AUDIO_PAYLOAD:
+            return None
+    elif kind in _WXCM_VIDEO_KINDS:
+        if (flags & ~_WXCM_KNOWN_VIDEO_FLAGS) or payload_len > WXCM_MAX_VIDEO_PAYLOAD:
+            return None
+    else:
+        return None
+    return {
+        "kind": kind,
+        "flags": flags,
+        "trackId": track_id,
+        "generation": generation,
+        "sequence": sequence,
+        "timestampMicros": ts_micros,
+        "payload": payload,
+    }
+
 # WeChat numeric message types (NativeMessage.type)
 TEXT, IMAGE, VOICE, VIDEO, STICKER, LOCATION, APP, SYSTEM = 1, 3, 34, 43, 47, 48, 49, 10000
-APP_FILE, APP_CHANNELS, APP_QUOTE, APP_UPLOAD_NOTICE = 6, 51, 57, 74
+APP_FILE, APP_FORWARDED, APP_BIG_XML, APP_CHANNELS, APP_QUOTE, APP_UPLOAD_NOTICE = 6, 19, 40, 51, 57, 74
+
+
+def is_wecom_group_id(wx_id: str | None) -> bool:
+    """True for Enterprise WeChat (WeCom) external group IDs (`…@im.chatroom`)."""
+    return bool(wx_id) and wx_id.endswith("@im.chatroom")
+
+
+def is_group_id(wx_id: str | None) -> bool:
+    """True for both ordinary WeChat groups (`@chatroom`) and WeCom external groups (`@im.chatroom`)."""
+    return bool(wx_id) and wx_id.endswith(("@chatroom", "@im.chatroom"))
 
 SEND_DONE = {"accepted", "completed", "succeeded", "available", "failed", "needs_review", "cancelled"}
 SEND_OK = {"accepted", "completed", "succeeded", "available"}
@@ -1079,6 +1161,7 @@ class CallsSocket:
         self._reader_task: asyncio.Task | None = None
         self._closed = False
         self._closing = False
+        self.protocol_version: int = 2
 
     @property
     def closed(self) -> bool:
@@ -1155,7 +1238,10 @@ class CallsSocket:
         data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
         await self._send_frame(0x1, data)
 
-    async def _recv_text(self, read_timeout: float = 90.0) -> str | None:
+    async def send_bytes(self, data: bytes) -> None:
+        await self._send_frame(0x2, data)
+
+    async def _recv_frame(self, read_timeout: float = 90.0) -> tuple[int, bytes] | None:
         chunks: list[bytes] = []
         data_opcode: int | None = None
         while True:
@@ -1205,12 +1291,21 @@ class CallsSocket:
             if fin:
                 body = b"".join(chunks)
                 chunks.clear()
-                if data_opcode == 0x1:
-                    return body.decode("utf-8")
+                if data_opcode in (0x1, 0x2):
+                    return data_opcode, body
                 data_opcode = None
 
+    async def _recv_text(self, read_timeout: float = 90.0) -> str | None:
+        while True:
+            frame = await self._recv_frame(read_timeout=read_timeout)
+            if frame is None:
+                return None
+            opcode, body = frame
+            if opcode == 0x1:
+                return body.decode("utf-8")
+
     async def handshake(self, timeout: float = 10.0) -> dict:
-        await self.send_json({"type": "call.hello", "supportedProtocolVersions": [2]})
+        await self.send_json({"type": "call.hello", "supportedProtocolVersions": list(CALL_PROTOCOL_VERSIONS)})
         raw = await self._recv_text(read_timeout=timeout)
         if raw is None:
             raise WeChatError(503, "closed", True)
@@ -1221,6 +1316,11 @@ class CallsSocket:
             raise WeChatError(status, code, False)
         if msg.get("type") != "hello":
             raise WeChatError(502, "unexpected_hello", True)
+        ver = msg.get("protocolVersion")
+        if ver is not None:
+            if ver not in CALL_PROTOCOL_VERSIONS:
+                raise WeChatError(400, "unsupported_protocol_version", False)
+            self.protocol_version = int(ver)
         self._reader_task = asyncio.create_task(self._read_loop())
         return msg
 
@@ -1228,7 +1328,7 @@ class CallsSocket:
         """Media socket handshake: media.attach -> media.ready (the send and receive tracks)."""
         await self.send_json({
             "type": "media.attach",
-            "supportedProtocolVersions": [2],
+            "supportedProtocolVersions": list(CALL_PROTOCOL_VERSIONS),
             "clientId": client_id,
             "ownerToken": owner_token,
         })
@@ -1243,18 +1343,47 @@ class CallsSocket:
                 raise WeChatError(403 if code in ("forbidden", "not_owner") else 400, code, False)
             if mtype == "media.ready":
                 break
-        if msg.get("protocolVersion") != 2:
+        ver = msg.get("protocolVersion")
+        if ver not in CALL_PROTOCOL_VERSIONS:
             raise WeChatError(400, "unsupported_protocol_version", False)
+        self.protocol_version = int(ver)
         self._reader_task = asyncio.create_task(self._read_loop())
         return msg
 
     async def _read_loop(self) -> None:
         try:
             while True:
-                raw = await self._recv_text()
-                if raw is None:
+                frame = await self._recv_frame()
+                if frame is None:
                     break
-                ev = json.loads(raw)
+                opcode, body = frame
+                if opcode == 0x2:
+                    wxcm = decode_wxcm_frame(body)
+                    if wxcm is None:
+                        log.debug("Ignoring malformed binary media frame (%d bytes)", len(body))
+                        continue
+                    if wxcm["kind"] == WXCM_KIND_PCM_S16LE:
+                        await self._queue.put({
+                            "type": "audio.chunk",
+                            "trackId": wxcm["trackId"],
+                            "generation": wxcm["generation"],
+                            "sequence": wxcm["sequence"],
+                            "timestampMicros": wxcm["timestampMicros"],
+                            "pcm": wxcm["payload"],
+                        })
+                    else:
+                        await self._queue.put({
+                            "type": "video.frame",
+                            "kind": wxcm["kind"],
+                            "flags": wxcm["flags"],
+                            "trackId": wxcm["trackId"],
+                            "generation": wxcm["generation"],
+                            "sequence": wxcm["sequence"],
+                            "timestampMicros": wxcm["timestampMicros"],
+                            "payload": wxcm["payload"],
+                        })
+                    continue
+                ev = json.loads(body.decode("utf-8"))
                 if ev.get("type") == "command.result":
                     req_id = ev.get("requestId")
                     if (fut := self._pending_cmds.get(req_id)) and not fut.done():

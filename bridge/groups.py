@@ -14,7 +14,7 @@ from telethon import Button
 
 from .contacts import CONTACT_ERRORS
 from .emojis import replace_wx_emojis
-from .wechat import OP_DONE, OP_OK, WeChatError
+from .wechat import OP_DONE, OP_OK, WeChatError, is_group_id
 
 log = logging.getLogger("groups")
 
@@ -127,7 +127,7 @@ class GroupsMixin:
         if not self.wx_ready:
             await say("🔐 微信尚未登录，登录后再管理群聊。")
             return
-        is_group = thread_id.endswith("@chatroom")
+        is_group = is_group_id(thread_id)
         try:
             if cmd in ("/mute", "/unmute"):
                 await self._cmd_mute(say, thread_id, cmd == "/mute")
@@ -383,7 +383,7 @@ class GroupsMixin:
         def ok(c: dict) -> bool:
             cid = str(c.get("id") or "")
             category = (c.get("classification") or {}).get("category")
-            return bool(cid) and cid not in seen and not cid.endswith("@chatroom") and not cid.startswith("gh_") \
+            return bool(cid) and cid not in seen and not is_group_id(cid) and not cid.startswith("gh_") \
                 and cid not in _SYSTEM_IDS and cid != self._self_wxid and category not in ("business", "system")
 
         def add(c: dict) -> None:

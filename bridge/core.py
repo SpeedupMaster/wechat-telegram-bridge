@@ -24,8 +24,9 @@ from .emojis import WX_EMOJIS, replace_wx_emojis, unicode_to_wx_emojis
 from .groups import GROUP_COMMANDS, GroupsMixin
 from .login import LoginMixin
 from .store import Store
-from .wechat import (APP, APP_CHANNELS, APP_FILE, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE, LOCATION, SEND_OK, STICKER,
-                     SYSTEM, TEXT, VIDEO, VOICE, CursorExpired, Media, WeChatClient, WeChatError)
+from .wechat import (APP, APP_BIG_XML, APP_CHANNELS, APP_FILE, APP_FORWARDED, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE,
+                     LOCATION, SEND_OK, STICKER, SYSTEM, TEXT, VIDEO, VOICE, CursorExpired, Media, WeChatClient,
+                     WeChatError, is_group_id, is_wecom_group_id)
 
 log = logging.getLogger("bridge")
 
@@ -516,6 +517,13 @@ MEDIA_REASONS = {
     "unsupported_media": "不支持",
     "unsupported_media_transport": "不支持",
     "unsupported_attachment_transport": "上游暂不支持该附件类型",
+    "unsupported_media_variant": "暂不支持该媒体格式",
+    "tp_media_source_not_allowed": "企业微信媒体地址不在允许的服务器上",
+    "tp_media_dns_failed": "企业微信媒体服务器解析失败",
+    "tp_media_dns_not_public": "企业微信媒体服务器解析失败",
+    "tp_media_size_limit": "企业微信媒体文件超过大小限制",
+    "tp_media_encoding_refused": "企业微信媒体响应编码不被支持",
+    "tp_media_fetch_failed": "企业微信媒体下载失败",
     "media_integrity_failed": "文件校验失败",
     "video_representation_mismatch": "视频版本校验不一致",
     "cdn_download_failed": "微信 CDN 下载失败",
@@ -558,6 +566,7 @@ APP_TYPE_NAMES = {
     24: "收藏笔记",
     33: "小程序",
     36: "小程序",
+    40: "聊天记录",
     51: "视频号",
     57: "引用消息",
     63: "视频号直播",
@@ -567,11 +576,10 @@ APP_TYPE_NAMES = {
 }
 
 
-# agent-wechat only knows the ordinary WeChat CDN fields; images and files from WeCom (企业微信, `@openim`)
-# senders carry their reference in another shape, so it rejects them with one of these codes
-# (thisnick/agent-wechat#467).
+# agent-wechat < 3.0 only knows ordinary WeChat CDN fields; images and files from WeCom (`@openim` / `@im.chatroom`)
+# use encrypted HTTP (`tp*`) downloads added in agent-wechat 3.0.0-beta.1 (thisnick/agent-wechat#660).
 UNSUPPORTED_TRANSPORT_CODES = {"unsupported_media", "unsupported_media_transport", "unsupported_attachment_transport"}
-OPENIM_MEDIA_NOTE = "企业微信发来的图片/文件，agent-wechat 暂不支持下载，请在手机微信查看"
+OPENIM_MEDIA_NOTE = "企业微信发来的图片/文件需 agent-wechat 3.0 及以上版本才能下载，请升级或先在手机微信查看"
 
 
 def _is_openim(wx_id: str | None) -> bool:
@@ -587,11 +595,17 @@ def _media_failure_text(msg: dict, reason: str) -> str:
         name = ((msg.get("link") or {}).get("title") or msg.get("body") or "").strip()
         if name:
             label += f"「{name}」"
-    if reason in UNSUPPORTED_TRANSPORT_CODES and (_is_openim(msg.get("senderId")) or _is_openim(msg.get("threadId"))):
+    if reason in UNSUPPORTED_TRANSPORT_CODES and (
+        _is_openim(msg.get("senderId")) or _is_openim(msg.get("threadId")) or is_wecom_group_id(msg.get("threadId"))
+    ):
         why = OPENIM_MEDIA_NOTE
     else:
         why = MEDIA_REASONS.get(reason, reason)
     return f"[{_esc(label)}，无法获取：{_esc(why)}]"
+
+
+_CHAT_HISTORY_UNAVAILABLE = "[Chat History unavailable]"
+_CHAT_HISTORY_UNAVAILABLE_ZH = "<i>（合并转发聊天记录暂不可用，加载成功后将自动更新，也可在手机微信查看）</i>"
 
 
 def _unsupported_label(t: int | None, sub: int | None) -> str:
@@ -1190,6 +1204,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 else:
                     log.info("Skipped WeChat message %s in %s: origin %s", data.get("messageId"),
                              data.get("threadId"), origin)
+            elif kind == "message.updated":
+                await self.on_wx_message_updated(data)
             elif kind == "message.recalled":
                 await self.on_wx_recall(data)
             elif kind == "friend_request.updated":
@@ -1228,7 +1244,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         """agent-wechat has no "who am I" call: learn our own WeChat ID from the sender of our own messages,
         so the group-call member picker can leave us out."""
         sender = (sender or "").strip()
-        if not sender or sender == thread_id or sender.endswith("@chatroom") or sender == self._self_wxid:
+        if not sender or sender == thread_id or is_group_id(sender) or sender == self._self_wxid:
             return
         self._self_wxid = sender
         self.store.set("self_wxid", sender)
@@ -1551,7 +1567,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             try:
                 thread = await self.wx.thread(thread_id)
             except WeChatError:
-                if thread_id.endswith("@chatroom"):
+                if is_group_id(thread_id):
                     raise
                 contact = await self.wx.contact(thread_id)
                 thread = {"id": thread_id, "kind": "direct", "displayName": contact.get("displayName") or thread_id}
@@ -1604,7 +1620,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         Threads and group members are meant to report the remark as `displayName` already, but
         profiles saved before agent-wechat 2.6 can miss it there, so the remark is read directly.
         """
-        if not wx_id or wx_id.endswith("@chatroom"):
+        if not wx_id or is_group_id(wx_id):
             return "", ""
         now = time.monotonic()
         hit = self._contact_name_cache.get(wx_id)
@@ -1635,7 +1651,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         """The thread with my remark as its name when it is a direct chat with one; the contact's
         own nickname is kept as `nickname`."""
         tid = thread.get("id") or ""
-        if thread.get("kind") not in (None, "direct") or tid.endswith("@chatroom"):
+        if thread.get("kind") not in (None, "direct") or is_group_id(tid):
             return thread
         remark, nick = await self._contact_names(tid, fresh=fresh)
         out = dict(thread)
@@ -1666,7 +1682,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         try:
             if remark:
                 name = remark
-            elif msg["threadId"].endswith("@chatroom"):
+            elif is_group_id(msg["threadId"]):
                 member = await self.wx.group_member(msg["threadId"], sid)
                 if member and (m_name := member.get("displayName") or member.get("nickname")):
                     name = m_name
@@ -1696,8 +1712,18 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if t == APP and msg.get("appMessageType") == APP_QUOTE and (link := cards.extract_text_link(body)):
             note = f"{_fmt_wx_text(link['note'])}\n" if link.get("note") else ""
             return note + _link_body(link, inline_url=True)
-        if t == APP and msg.get("appMessageType") == 19:
+        if t == APP and msg.get("appMessageType") == APP_FORWARDED:
             return "📜 聊天记录\n" + _fmt_wx_text(body)
+        if t == APP and msg.get("appMessageType") == APP_BIG_XML:
+            raw = body.strip()
+            if not raw or raw == _CHAT_HISTORY_UNAVAILABLE:
+                return f"📜 聊天记录\n{_CHAT_HISTORY_UNAVAILABLE_ZH}"
+            if raw.endswith(_CHAT_HISTORY_UNAVAILABLE):
+                head = raw[:-len(_CHAT_HISTORY_UNAVAILABLE)].rstrip()
+                if head:
+                    return f"📜 聊天记录\n{_fmt_wx_text(head)}\n{_CHAT_HISTORY_UNAVAILABLE_ZH}"
+                return f"📜 聊天记录\n{_CHAT_HISTORY_UNAVAILABLE_ZH}"
+            return "📜 聊天记录\n" + _fmt_wx_text(raw)
         if t == STICKER:
             return "[表情]"
         return _fmt_wx_text(body) or _unsupported_label(t, msg.get("appMessageType"))
@@ -1739,7 +1765,13 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 return val.strip()
         qt, qsub = q.get("type"), q.get("appMessageType")
         if qt == APP:
-            return {APP_FILE: "[文件]", 19: "[聊天记录]", APP_CHANNELS: "[视频号]", APP_QUOTE: "[引用消息]"}.get(qsub, "")
+            return {
+                APP_FILE: "[文件]",
+                APP_FORWARDED: "[聊天记录]",
+                APP_BIG_XML: "[聊天记录]",
+                APP_CHANNELS: "[视频号]",
+                APP_QUOTE: "[引用消息]",
+            }.get(qsub, "")
         return {IMAGE: "[图片]", VOICE: "[语音]", VIDEO: "[视频]", STICKER: "[表情]", LOCATION: "[位置]"}.get(qt, "")
 
     @staticmethod
@@ -1765,8 +1797,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 if title and not _is_channels_placeholder(title):
                     return f"🎬 {title}"
                 return f"🎬 视频号 · {link['sourceName']}" if link.get("sourceName") else "[视频号]"
-            if sub == 19:
-                return f"📜 聊天记录 {body}".strip() if body else "[聊天记录]"
+            if sub in (APP_FORWARDED, APP_BIG_XML):
+                clean = body.replace(_CHAT_HISTORY_UNAVAILABLE, "").strip()
+                return f"📜 聊天记录 {clean}".strip() if clean else "[聊天记录]"
             if link:
                 return (link.get("title") or link.get("description") or link.get("url") or "").strip()
         return body
@@ -1797,16 +1830,19 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         who = q.get("senderName") or ""
         return f"<blockquote>{_esc(who + '：' if who else '')}{_esc(_clip_text(_normalize_wx_text(text), 200))}</blockquote>"
 
+    async def _msg_header(self, thread: dict, msg: dict) -> str:
+        if msg.get("direction") == "outgoing":
+            return "<b>我</b>（手机端）：\n"
+        if thread.get("kind") == "group" and msg.get("senderId"):
+            mentions = msg.get("mentions") if isinstance(msg.get("mentions"), dict) else {}
+            tag = " 🔔<b>@我</b>" if mentions.get("self") else " 📢<b>@所有人</b>" if mentions.get("all") else ""
+            return f"<b>{_esc(await self._sender_name(msg))}</b>{tag}：\n"
+        return ""
+
     # --- sending to Telegram ----------------------------------------------
     async def forward_to_tg(self, chat: int, thread: dict, msg: dict) -> None:
         outgoing = msg.get("direction") == "outgoing"
-        header = ""
-        if outgoing:
-            header = "<b>我</b>（手机端）：\n"
-        elif thread.get("kind") == "group" and msg.get("senderId"):
-            mentions = msg.get("mentions") if isinstance(msg.get("mentions"), dict) else {}
-            tag = " 🔔<b>@我</b>" if mentions.get("self") else " 📢<b>@所有人</b>" if mentions.get("all") else ""
-            header = f"<b>{_esc(await self._sender_name(msg))}</b>{tag}：\n"
+        header = await self._msg_header(thread, msg)
 
         reply_to = None
         prefix = ""
@@ -2182,6 +2218,54 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             reply_to = None  # the message it replied to went away with the old group/topic
             return await go(new_chat)
 
+    async def on_wx_message_updated(self, data: dict) -> None:
+        """Refresh a previously forwarded message in place when agent-wechat fills in its body (e.g. 49:40 -> 49:19)."""
+        message_id = data.get("messageId")
+        if not message_id:
+            return
+        try:
+            msg = await self.wx.message(message_id)
+        except WeChatError as e:
+            log.debug("Could not fetch updated WeChat message %s: %s", message_id, e)
+            return
+        if msg.get("recall"):
+            return
+        t = msg.get("type")
+        if t in (IMAGE, VIDEO, VOICE, STICKER) or (t == APP and msg.get("appMessageType") == APP_FILE):
+            return
+        thread_id = msg.get("threadId") or data.get("threadId") or ""
+        if not thread_id:
+            return
+        dest = self._dest_for_thread(thread_id)
+        hit = self.store.tg_for_wx(thread_id, message_id, msg.get("serverId"), tg_chat=dest[0] if dest else None)
+        if not hit:
+            return
+        chat_id, msg_id = hit
+        try:
+            thread = await self.wx.thread(thread_id)
+        except WeChatError:
+            thread = {"id": thread_id, "kind": "group" if is_group_id(thread_id) else "direct"}
+        header = await self._msg_header(thread, msg)
+        parts = _chunks(header + self._body(msg))
+        try:
+            await self.bot.edit_message(chat_id, msg_id, parts[0], parse_mode="html", link_preview=False)
+        except errors.MessageNotModifiedError:
+            return
+        except Exception as e:
+            log.info("Could not update Telegram message %s/%s for WeChat %s: %s", chat_id, msg_id, message_id, e)
+            return
+        for extra in parts[1:]:
+            try:
+                sent = await self.bot.send_message(
+                    chat_id, extra, parse_mode="html", reply_to=msg_id, silent=True, link_preview=False,
+                )
+            except Exception as e:
+                log.info("Could not send overflow chunk for updated WeChat %s: %s", message_id, e)
+                break
+            self.store.map_message(chat_id, "bot", sent.id, thread_id, msg["id"], msg.get("serverId"))
+            if chat_id < -1000000000000:
+                self.store.map_message(chat_id, "user", sent.id, thread_id, msg["id"], msg.get("serverId"))
+
     async def on_wx_recall(self, data: dict) -> None:
         tid = data.get("threadId") or ""
         sid = data.get("serverId")
@@ -2309,16 +2393,16 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             thread = await self.wx.thread(thread_id)
         except WeChatError:
             name = thread_id
-            if not thread_id.endswith("@chatroom"):
+            if not is_group_id(thread_id):
                 try:
                     name = (await self.wx.contact(thread_id)).get("displayName") or thread_id
                 except WeChatError:
                     pass
-            thread = {"id": thread_id, "kind": "group" if kind == "conference" or thread_id.endswith("@chatroom") else "direct",
+            thread = {"id": thread_id, "kind": "group" if kind == "conference" or is_group_id(thread_id) else "direct",
                       "displayName": name}
         if not self._allowed(thread):
             return None, ""
-        if caller_id == thread_id and not thread_id.endswith("@chatroom"):
+        if caller_id == thread_id and not is_group_id(thread_id):
             caller_name = (await self._named_thread(thread)).get("displayName") or caller_id
         else:
             caller_name = await self._sender_name({"threadId": thread_id, "senderId": caller_id})
@@ -2849,7 +2933,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
     # ---------------------------------------------------------------- outgoing calls (/call)
     def _dial_unavailable(self, thread_id: str) -> str:
-        conf = thread_id.endswith("@chatroom")
+        conf = is_group_id(thread_id)
         if thread_id == "filehelper" or thread_id.startswith("gh_"):
             return "文件传输助手和公众号不能接听微信电话。"
         if self.call_web is None:
@@ -2924,7 +3008,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         out = []
         for m in members:
             cid = m.get("id") or m.get("username")
-            if not cid or cid == self._self_wxid or cid.endswith("@chatroom"):
+            if not cid or cid == self._self_wxid or is_group_id(cid):
                 continue
             out.append({"id": cid, "label": self._known_remark(cid) or _member_name(m) or cid,
                         "search": " ".join(str(m.get(k) or "") for k in
@@ -2936,7 +3020,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if why := self._dial_unavailable(thread_id):
             await self.bot.send_message(chat_id, why, parse_mode="html", reply_to=reply_to)
             return
-        conf = thread_id.endswith("@chatroom")
+        conf = is_group_id(thread_id)
         name = self._link_title(thread_id) or thread_id
         try:
             name = await self._thread_name(thread_id)
@@ -3532,7 +3616,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             self.pending_sends[thread_id] -= 1
 
     async def _resolve_mentions_with_spans(self, thread_id: str, text: str) -> tuple[dict | None, list[tuple[int, int]]]:
-        if not thread_id.endswith("@chatroom") or "@" not in text:
+        if not is_group_id(thread_id) or "@" not in text:
             return None, []
         m, spans = _match_mentions_with_spans(text, [])
         if m and not any(
@@ -3553,7 +3637,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         return (await self._resolve_mentions_with_spans(thread_id, text))[0]
 
     async def _send_members(self, chat_id: int, reply_to: int, thread_id: str, query: str) -> None:
-        if not thread_id.endswith("@chatroom"):
+        if not is_group_id(thread_id):
             await self.bot.send_message(chat_id, "只有在微信群聊里才能查看群成员", reply_to=reply_to)
             return
         try:
@@ -3845,7 +3929,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if not tid or tid in seen:
                 return
             seen.add(tid)
-            kind = raw.get("kind") or default_kind or ("group" if tid.endswith("@chatroom") else "direct")
+            kind = raw.get("kind") or default_kind or ("group" if is_group_id(tid) else "direct")
             name = (raw.get("displayName") or raw.get("remark") or raw.get("nickname") or tid).strip()
             items.append({
                 "id": tid, "name": name, "kind": kind, "relation": raw.get("relation"),
@@ -4064,7 +4148,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             try:
                 title = (await self.wx.thread(wx_id)).get("displayName") or ""
             except WeChatError:
-                if not wx_id.endswith("@chatroom"):
+                if not is_group_id(wx_id):
                     try:
                         title = (await self.wx.contact(wx_id)).get("displayName") or ""
                     except WeChatError:

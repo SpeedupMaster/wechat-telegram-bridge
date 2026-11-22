@@ -27,7 +27,7 @@ from aiohttp import WSMsgType, web
 
 from . import article as articles
 from . import bilibili, douyin, xhs
-from .wechat import WeChatError
+from .wechat import WXCM_KIND_PCM_S16LE, WeChatError, encode_wxcm_frame
 
 if TYPE_CHECKING:  # pragma: no cover
     from .core import Bridge
@@ -48,6 +48,8 @@ INIT_DATA_MAX_AGE = 24 * 3600
 MAX_PCM_CHUNK = 65536
 # How long after the media socket attaches to check that audio is flowing both ways (logged, not enforced).
 AUDIO_CHECK_SECONDS = 8
+# Brief wait when the media socket closes while the call still looks live, in case call.state(ended) is racing in.
+MEDIA_CLOSE_GRACE_SECONDS = 0.5
 # Mini App start parameters that open the article reader instead of a call: "r_" + Store.article_id().
 READER_PREFIX = "r_"
 _ARTICLE_ID_RE = re.compile(r"[A-Za-z0-9]{8,32}")
@@ -122,6 +124,17 @@ def _err_text(code: str | None, default: str) -> str:
     return CALL_ERRORS.get(code or "", f"{default}（{code or 'error'}）")
 
 
+def _find_audio_send_track(ready: dict) -> dict:
+    """Extract the audio send track from media.ready (v3 sendTracks[] or v2 sendTrack)."""
+    tracks = ready.get("sendTracks")
+    if isinstance(tracks, list):
+        for t in tracks:
+            if isinstance(t, dict) and t.get("media") in (None, "audio") and t.get("direction") in (None, "send"):
+                return t
+    track = ready.get("sendTrack")
+    return track if isinstance(track, dict) else {}
+
+
 class CallSession:
     """One call answered/joined from Telegram: owns the media socket and the page that plays its audio."""
 
@@ -132,10 +145,14 @@ class CallSession:
         self.owner_token = owner_token
         self.readied = readied
         self.media = None
+        self.protocol_version: int = 2
         self.send_track: int | None = None
         self.send_gen: int | None = None
         self.rate = 16000
         self.frame = 320
+        self._tx_seq = 0
+        self._tx_samples = 0
+        self._tx_last_ts = -1
         self.active_ws: web.WebSocketResponse | None = None
         self.muted = False
         self.changed = asyncio.Event()
@@ -178,7 +195,8 @@ class CallSession:
                 return
             sock, ready = await bridge.wx.call_media(self.call_id, bridge._calls_client_id, self.owner_token)
             self.media = sock
-            send = ready.get("sendTrack") or {}
+            self.protocol_version = int(ready.get("protocolVersion") or getattr(sock, "protocol_version", 2) or 2)
+            send = _find_audio_send_track(ready)
             fmt = send.get("format") or bridge._calls_audio_format
             if int(fmt.get("channels") or 1) != 1:
                 raise CallActionError(f"不支持的通话音频格式：{fmt}")
@@ -190,8 +208,8 @@ class CallSession:
                 return
             await self._start_send()
             await self.web.push_state(self.entry)
-            log.info("Call %s media attached: %d Hz, frame %d, send track %s", self.call_id, self.rate, self.frame,
-                     self.send_track)
+            log.info("Call %s media attached (v%d): %d Hz, frame %d, send track %s",
+                     self.call_id, self.protocol_version, self.rate, self.frame, self.send_track)
             self.watch_task = asyncio.create_task(self._watch_audio())
             async for ev in sock.events():
                 etype = ev.get("type")
@@ -199,6 +217,17 @@ class CallSession:
                     await self._to_page(ev)
                 elif etype == "track.removed":
                     await self._send_page_json({"type": "drop", "trackId": ev.get("trackId")})
+            if not self.closed and not self.entry["terminal"] and MEDIA_CLOSE_GRACE_SECONDS > 0:
+                grace_deadline = loop.time() + MEDIA_CLOSE_GRACE_SECONDS
+                while not self.closed and not self.entry["terminal"]:
+                    remaining = grace_deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    self.changed.clear()
+                    try:
+                        await asyncio.wait_for(self.changed.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
             if not self.closed and not self.entry["terminal"]:
                 log.warning("Call %s media socket closed while the call was still live", self.call_id)
                 await self.web.report(self.entry, "通话音频连接已断开")
@@ -235,10 +264,16 @@ class CallSession:
 
     async def _start_send(self) -> None:
         if self.media is not None and self.send_track is not None and self.send_gen is not None:
-            await self.media.send_json({"type": "audio.start", "trackId": self.send_track, "generation": self.send_gen})
+            self._tx_seq = 0
+            self._tx_samples = 0
+            self._tx_last_ts = -1
+            msg_type = "track.start" if self.protocol_version >= 3 else "audio.start"
+            await self.media.send_json({"type": msg_type, "trackId": self.send_track, "generation": self.send_gen})
 
     async def on_track_updated(self, track: dict) -> None:
-        if track.get("direction") != "send" or track.get("id") != self.send_track:
+        if (track.get("media") not in (None, "audio")
+                or track.get("direction") != "send"
+                or track.get("id") != self.send_track):
             return
         self.send_gen = track.get("generation")
         try:
@@ -251,10 +286,14 @@ class CallSession:
         ws = self.active_ws
         if ws is None or ws.closed:
             return
-        try:
-            pcm = base64.b64decode(ev.get("pcmBase64") or "")
-        except ValueError:
-            return
+        raw_pcm = ev.get("pcm")
+        if isinstance(raw_pcm, (bytes, bytearray)):
+            pcm = bytes(raw_pcm)
+        else:
+            try:
+                pcm = base64.b64decode(ev.get("pcmBase64") or "")
+            except ValueError:
+                return
         if not pcm:
             return
         try:
@@ -280,12 +319,25 @@ class CallSession:
             return
         self.tx_chunks += 1
         try:
-            await self.media.send_json({
-                "type": "audio.chunk",
-                "trackId": self.send_track,
-                "generation": self.send_gen,
-                "pcmBase64": base64.b64encode(data).decode("ascii"),
-            })
+            if self.protocol_version >= 3 and self.send_track is not None:
+                self._tx_seq += 1
+                ts = self._tx_samples * 1_000_000 // max(1, self.rate)
+                if ts <= self._tx_last_ts:
+                    ts = self._tx_last_ts + 1
+                self._tx_last_ts = ts
+                self._tx_samples += len(data) // 2
+                frame = encode_wxcm_frame(
+                    self.send_track, self.send_gen, data,
+                    kind=WXCM_KIND_PCM_S16LE, sequence=self._tx_seq, timestamp_micros=ts,
+                )
+                await self.media.send_bytes(frame)
+            else:
+                await self.media.send_json({
+                    "type": "audio.chunk",
+                    "trackId": self.send_track,
+                    "generation": self.send_gen,
+                    "pcmBase64": base64.b64encode(data).decode("ascii"),
+                })
         except (OSError, WeChatError):
             pass
 
