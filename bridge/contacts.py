@@ -1,4 +1,4 @@
-"""WeChat friend requests and contact settings (agent-wechat >= 2.7), shown as Telegram cards with buttons."""
+"""WeChat friend requests and contact settings, shown as Telegram cards with buttons."""
 from __future__ import annotations
 
 import asyncio
@@ -190,8 +190,7 @@ class ContactsMixin:
             version = str(contact.get("privacyVersion") or "")
             if not version:
                 why = contact.get("privacyUnavailable")
-                return await say("⚠️ 暂时不能改这个联系人的备注：" + _esc(
-                    friendly(why) if why else "读不到资料版本（需要 agent-wechat 2.8 及以上）"))
+                return await say("⚠️ 暂时不能改这个联系人的备注：" + _esc(friendly(why) if why else "读不到资料版本"))
             try:
                 op = await self.wx.set_contact_remark(wx_id, remark, version, key)
                 break
@@ -446,18 +445,10 @@ class ContactsMixin:
         version = ""
         why = ""
         if relation != "non_contact":
-            if any(k in contact for k in ("privacy", "privacyVersion", "privacyUnavailable")):
-                # agent-wechat >= 2.8 returns the privacy with the contact (its separate route is gone)
-                privacy, version = contact.get("privacy") or None, str(contact.get("privacyVersion") or "")
-                if not privacy and contact.get("privacyUnavailable"):
-                    why = friendly(contact["privacyUnavailable"])
-            else:
-                try:
-                    p = await self.wx.contact_privacy(wx_id)
-                    privacy, version = p.get("privacy") or None, str(p.get("version") or "")
-                except WeChatError as e:
-                    if e.status != 404:  # 404: a 2.8+ daemon with no privacy for this contact
-                        why = friendly(e.code)
+            privacy = contact.get("privacy") or None
+            version = str(contact.get("privacyVersion") or "")
+            if not privacy and contact.get("privacyUnavailable"):
+                why = friendly(contact["privacyUnavailable"])
         buttons: list = []
         if privacy:
             current = {k: bool(privacy.get(k)) for k in PRIVACY_FIELDS}
@@ -640,8 +631,7 @@ class ContactsMixin:
                 if op.get("state") not in OP_OK:
                     note = f"<i>向微信刷新没有完成：{_esc(op_error(op))}</i>"
             except WeChatError as e:
-                if e.status not in (404, 405):  # older agent-wechat without the route: show what is saved
-                    note = f"<i>向微信刷新失败：{_esc(friendly(e.code))}</i>"
+                note = f"<i>向微信刷新失败：{_esc(friendly(e.code))}</i>"
             self._forget_names(wx_id)
         text, buttons = await self.contact_card(wx_id, note=note)
         await self._edit_ui_msg(event, text, buttons)

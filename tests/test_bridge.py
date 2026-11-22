@@ -83,8 +83,6 @@ class FakeDaemon:
         self.uploads: list[tuple[str, bytes]] = []
         self.sticker_preparations: list[tuple[dict, str]] = []
         self.expired_sticker_preps: set[str] = set()
-        self.stickers_supported = True
-        self.daemon_version = "2.5.0"
         self.sse_body = ""
         self.marked_read: list[str] = []
         self.avatar_refreshed: list[str] = []
@@ -97,23 +95,19 @@ class FakeDaemon:
         self.transfer_fail_variants: set[str] = set()
         self.transfer_fail_reasons: dict[str, str] = {}
         self.transfer_jobs: dict[str, dict] = {}
-        self.reject_image_quality = False
         self.group_members: dict[str, list[dict]] = {}
         self.member_searches: list[tuple[str, str | None]] = []
-        self.ignore_member_search = False
         self.recalls: list[tuple[str, dict, str]] = []
         self.recall_error: tuple[int, str] | None = None
         self.recall_op = {"id": "rcop", "state": "succeeded"}
-        # friend requests / contact settings (agent-wechat >= 2.7)
+        # friend requests / contact settings
         self.requests: dict[str, dict] = {}
         self.request_calls: list[tuple[str, str, dict, str | None]] = []  # (method, path, body, idempotency key)
         self.contact_op = {"id": "ctop", "state": "succeeded"}
         self.discovery: dict = {}
-        self.privacy: dict[str, dict] = {}
         self.sync_rounds: list[dict] = []  # result of each POST contact-sync; [] = one complete round
         self.sync_remarks: dict[str, str] = {}  # remarks a full contact sync brings in
         self.contact_syncs = 0
-        self.relations_supported = True
         self.contact_searches: list[dict] = []
         self.media_errors: dict[str, str] = {}  # message id -> 409 error code for its media list
 
@@ -140,14 +134,10 @@ class FakeDaemon:
         path = request.url.path.removeprefix("/v1/")
         parts = path.split("/")
         m = request.method
-        if path == "status" and m == "GET":
-            return httpx.Response(200, json={"state": "ready", "version": {"version": self.daemon_version}})
         if path == "accounts":
             return httpx.Response(200, json={"items": [{"id": ACC, "alias": "me"}]})
         assert parts[:2] == ["accounts", ACC], path
         rest = parts[2:]
-        if rest[0] == "capabilities" and m == "GET":
-            return httpx.Response(200, json={"nativeRuntime": True, "stickers": self.stickers_supported})
         if rest[0] == "messages" and len(rest) == 2:
             return httpx.Response(200, json=self.messages[rest[1]])
         if rest[0] == "messages" and len(rest) == 3 and rest[2] == "recall" and m == "POST":
@@ -236,7 +226,7 @@ class FakeDaemon:
             search = request.url.params.get("search")
             self.member_searches.append((rest[1], search))
             members = list(self.group_members.get(rest[1], []))
-            if search and not self.ignore_member_search:
+            if search:
                 terms = search.lower().split()
                 members = [m for m in members if all(
                     any(
@@ -278,13 +268,9 @@ class FakeDaemon:
                     return httpx.Response(404, json={"error": {"code": "not_found"}})
                 if body.get("expectedVersion") != req["version"]:
                     return httpx.Response(412, json={"error": {"code": "stale_contact_request"}})
-            if rest[0] == "contacts" and m == "PATCH" and "remark" in body:
+            if rest[0] == "contacts" and m == "PATCH":
                 cur = self.contacts.get(rest[1]) or {}
                 if body.get("expectedVersion") != cur.get("privacyVersion"):
-                    return httpx.Response(412, json={"error": {"code": "stale_contact_privacy"}})
-            elif rest[0] == "contacts" and m == "PATCH":
-                cur = self.privacy.get(rest[1]) or {}
-                if body.get("expectedVersion") != cur.get("version"):
                     return httpx.Response(412, json={"error": {"code": "stale_contact_privacy"}})
             if self.contact_op["state"] == "succeeded":
                 if rest[0] == "contact-requests" and len(rest) == 3:  # accept
@@ -294,7 +280,8 @@ class FakeDaemon:
                 elif rest[0] == "contacts" and m == "PATCH" and "remark" in body:
                     cur.update(remark=body["remark"], displayName=body["remark"] or cur.get("nickname"))
                 elif rest[0] == "contacts" and m == "PATCH":
-                    self.privacy[rest[1]] = {"privacy": body["privacy"], "version": cur["version"] + "x"}
+                    cur["privacy"] = body["privacy"]
+                    cur["privacyVersion"] = str(cur.get("privacyVersion") or "") + "x"
                 elif rest[0] == "contacts" and m == "DELETE":
                     self.contacts.setdefault(rest[1], {"id": rest[1]})["relation"] = "non_contact"
             return httpx.Response(202, json={"id": "ctop", "state": "queued"})
@@ -310,15 +297,9 @@ class FakeDaemon:
         if rest[0] == "contact-requests" and len(rest) == 2:
             req = self.requests.get(rest[1])
             return httpx.Response(200, json=req) if req else httpx.Response(404, json={"error": {"code": "not_found"}})
-        if rest[0] == "contacts" and len(rest) == 3 and rest[2] == "privacy":
-            if rest[1] not in self.privacy:
-                return httpx.Response(409, json={"error": {"code": "contact_privacy_unresolved"}})
-            return httpx.Response(200, json=self.privacy[rest[1]])
         if rest[0] == "contacts" and len(rest) == 1:
             params = dict(request.url.params)
             self.contact_searches.append(params)
-            if "relation" in params and not self.relations_supported:
-                return httpx.Response(400, json={"error": {"code": "invalid_request"}})
             q = (params.get("search") or "").lower()
             pool = {**{k: v for k, v in self.threads.items() if v.get("kind") != "group"}, **self.contacts}
             items = [c for c in pool.values() if not q or q in (c.get("displayName") or "").lower() or q in c["id"].lower()]
@@ -342,8 +323,6 @@ class FakeDaemon:
                                              "result": {"id": rest[1], "width": 240, "height": 240}})
         if rest[0] == "sends" and m == "POST":
             body = json.loads(request.content)
-            if self.reject_image_quality and "imageQuality" in body:
-                return httpx.Response(400, json={"error": {"code": "invalid_request"}})
             if body.get("kind") == "sticker":
                 pid = (body.get("source") or {}).get("preparationId")
                 if pid in self.expired_sticker_preps:
@@ -372,6 +351,8 @@ class FakeDaemon:
             return httpx.Response(200, json={"id": rest[1], "state": "accepted", "serverMessageId": f"80{n}",
                                              "result": {"messageIds": [f"local-media-{n}"]}})
         if rest[0] == "events" and len(rest) == 1:
+            if request.url.params.get("newest") == "true":
+                return httpx.Response(200, json={"items": [{"cursor": "42"}], "nextCursor": "42"})
             after = int(request.url.params.get("after", "0"))
             if after < 42:
                 return httpx.Response(200, json={"items": [{"cursor": "42"}], "nextCursor": "42"})
@@ -796,25 +777,6 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.daemon.sends[-1][0]["source"]["preparationId"], "prep2")
         self.assertEqual(self.daemon.sends[-1][1], f"tg-{chat}-8013-retry")
 
-    async def test_telegram_sticker_falls_back_when_daemon_lacks_sticker_support(self):
-        self.daemon.stickers_supported = False
-        self.daemon.add_thread("wxid_bob", "Bob")
-        self.daemon.add_message("m0", "wxid_bob", "hi", server="100")
-        await self.event("m0", "wxid_bob")
-        chat = self.b.store.chat_for_thread("wxid_bob")
-
-        webp = StickerTests.webp()
-        async def dl_webp(file=None):
-            return webp
-        ev_webp = SimpleNamespace(chat_id=chat, message=SimpleNamespace(
-            id=8003, message="", action=None, via_bot_id=None, reply_to=None,
-            photo=None, sticker=True, voice=None, video=None, video_note=None, gif=None,
-            file=SimpleNamespace(size=len(webp), mime_type="image/webp", name=None, ext=".webp"),
-            media=types.MessageMediaDocument(), download_media=dl_webp))
-        await self.b.on_tg_message(ev_webp)
-        self.assertEqual(self.daemon.sticker_preparations, [])
-        self.assertEqual(self.daemon.sends[-1][0]["kind"], "image")
-
     async def test_telegram_gif_converted_to_wechat_sticker_with_fallbacks(self):
         import io
         from unittest import mock
@@ -858,17 +820,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.daemon.sticker_preparations), preps_before)
         self.assertEqual(self.daemon.sends[-1][0]["kind"], "video")
 
-        # 4) Daemon lacks native sticker support -> sends as video directly without sticker conversion
-        self.b.cfg.bridge.gif_as_sticker = True
-        self.daemon.stickers_supported = False
-        self.b.wx._supports_stickers = None
-        with mock.patch("bridge.stickers.gif_to_wechat_sticker") as m_conv:
-            await self.b.on_tg_message(make_gif_ev(8104, b"mp4-bytes", "video/mp4", "clip.mp4", ".mp4"))
-        m_conv.assert_not_called()
-        self.assertEqual(len(self.daemon.sticker_preparations), preps_before)
-        self.assertEqual(self.daemon.sends[-1][0]["kind"], "video")
-
-    async def test_telegram_stickers_adapt_resolution_to_daemon_version(self):
+    async def test_telegram_stickers_use_high_res_limits(self):
         import io
         import re
         from PIL import Image
@@ -901,21 +853,11 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 file=SimpleNamespace(size=len(payload), mime_type=mime, name=f"s{ext}", ext=ext),
                 media=types.MessageMediaDocument(), download_media=dl))
 
-        # 1) agent-wechat >= 2.5.0 -> 512px static WebP, 384px animated TGS
-        self.daemon.daemon_version = "2.5.0"
-        self.b.wx._daemon_version = None
+        # 512px static WebP, 384px animated TGS
         await self.b.on_tg_message(make_ev(8201, webp, "image/webp", ".webp"))
         self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (512, 512))
         await self.b.on_tg_message(make_ev(8202, tgs, "application/x-tgsticker", ".tgs"))
         self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (384, 384))
-
-        # 2) agent-wechat < 2.5.0 -> safely stays at 240px for both
-        self.daemon.daemon_version = "2.4.2"
-        self.b.wx._daemon_version = None
-        await self.b.on_tg_message(make_ev(8203, webp, "image/webp", ".webp"))
-        self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (240, 240))
-        await self.b.on_tg_message(make_ev(8204, tgs, "application/x-tgsticker", ".tgs"))
-        self.assertEqual(extract_gif(*self.daemon.uploads[-1]).size, (240, 240))
 
     async def test_sticker_that_cannot_be_downloaded_says_why(self):
         self.daemon.add_thread("wxid_bob", "Bob")
@@ -1143,13 +1085,6 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((body["kind"], body["sourceId"], body["imageQuality"], key),
                          ("image", "src1", "original", "k1"))
         self.assertIn("multipart/form-data", self.daemon.uploads[0][0])
-
-        self.daemon.reject_image_quality = True
-        r_old = await self.b.wx.send_media("wxid_bob", "image", Media(b"jpeg", "image/jpeg", "photo.jpg"), "k-old")
-        self.assertEqual(r_old["state"], "accepted")
-        old_body, old_key = self.daemon.sends[-1]
-        self.assertNotIn("imageQuality", old_body)
-        self.assertEqual(old_key, "k-old-std")
 
     async def test_image_download_prefers_original_over_cached_previews(self):
         self.daemon.add_thread("wxid_bob", "Bob")
@@ -1767,14 +1702,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.b.on_tg_message(tg_event(chat, 14, "/members serena quiet"))
         self.assertIn("没有匹配的群成员", self.b.bot.sent[-1].text)
 
-        # 3) Fallback when an older daemon ignores `?search=` -> client-side AND filter still matches nickname/alias
-        self.daemon.ignore_member_search = True
-        await self.b.on_tg_message(tg_event(chat, 15, "/members sreads42"))
-        self.assertIn("<code>@Lantern</code> （Book club · Serena · 微信号 sreads42）", self.b.bot.sent[-1].text)
-        self.assertNotIn("Quiet", self.b.bot.sent[-1].text)
-        self.daemon.ignore_member_search = False
-
-        # 4) @nickname and @alias resolve to the member even behind a remark and roomDisplayName
+        # 3) @nickname and @alias resolve to the member even behind a remark and roomDisplayName
         await self.b.on_tg_message(tg_event(chat, 16, "@Serena 看下这个"))
         self.assertEqual(self.daemon.sends[-1][0]["mentions"], {"all": False, "userIds": ["wxid_a1"]})
         await self.b.on_tg_message(tg_event(chat, 17, "ping @sreads42"))
@@ -3094,36 +3022,6 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await wx2.latest_cursor(), "0")
         finally:
             await wx2.close()
-
-    async def test_latest_cursor_falls_back_on_legacy_daemon_without_newest(self):
-        seen_params: list[dict[str, str]] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            params = dict(request.url.params)
-            seen_params.append(params)
-            if "newest" in params:
-                # agent-wechat < 2.9.0 uses serde(deny_unknown_fields) and returns plain-text 400
-                return httpx.Response(400, text="Failed to deserialize query string: unknown field `newest`")
-            after = int(params.get("after", "0"))
-            if after == 0:
-                return httpx.Response(200, json={"items": [{"cursor": "10"}], "nextCursor": "10"})
-            if after == 10:
-                return httpx.Response(200, json={"items": [{"cursor": "25"}], "nextCursor": "25"})
-            return httpx.Response(200, json={"items": [], "nextCursor": "25"})
-
-        wx = WeChatClient("http://daemon", "secret-token", ACC, read_retry_delays=())
-        await wx.http.aclose()
-        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        try:
-            self.assertEqual(await wx.latest_cursor(), "25")
-            self.assertEqual(seen_params, [
-                {"newest": "true", "limit": "1"},
-                {"after": "0", "limit": "200"},
-                {"after": "10", "limit": "200"},
-                {"after": "25", "limit": "200"},
-            ])
-        finally:
-            await wx.close()
 
     async def test_stream_raises_cursor_expired_on_http_410_and_preserves_error_codes(self):
         from bridge.wechat import WeChatError
@@ -4447,62 +4345,10 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             ]}]}]}
         return gzip.compress(json.dumps(lottie).encode())
 
-    def frame(self, mp4: bytes):
-        import subprocess
-        from PIL import Image
-        src, png = Path(self.tmp.name, "out.mp4"), Path(self.tmp.name, "frame.png")
-        src.write_bytes(mp4)
-        subprocess.run([self.ffmpeg, "-y", "-loglevel", "error", "-i", str(src), "-vf", r"select=eq(n\,5)",
-                        "-frames:v", "1", str(png)], check=True)
-        return Image.open(png).convert("RGB")
-
     def assertColor(self, got, want):
         self.assertTrue(all(abs(a - b) <= 12 for a, b in zip(got, want)), f"{got} != {want}")
 
-    async def test_static_sticker_flattened_on_white(self):
-        import io
-        from PIL import Image
-        kind, data = await self.stickers.convert(self.webp(), "image/webp")
-        im = Image.open(io.BytesIO(data))
-        self.assertEqual((kind, im.format), ("image", "JPEG"))
-        self.assertColor(im.getpixel((5, 5)), (255, 255, 255))
-        self.assertColor(im.getpixel((250, 250)), (255, 0, 0))
-
-    async def test_video_sticker_keeps_transparency(self):
-        if not self.ffmpeg:
-            self.skipTest("ffmpeg not installed")
-        import subprocess
-        webm = Path(self.tmp.name, "in.webm")
-        subprocess.run([self.ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i",
-                        "color=c=green:s=512x512:d=1,format=rgba,"
-                        "geq=r=0:g=200:b=0:a='if(between(X,100,300)*between(Y,100,300),255,0)'",
-                        "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-auto-alt-ref", "0", str(webm)], check=True)
-        kind, data = await self.stickers.convert(webm.read_bytes(), "video/webm")
-        self.assertEqual(kind, "video")
-        im = self.frame(data)
-        self.assertEqual(im.size, (384, 384))
-        self.assertColor(im.getpixel((5, 5)), (255, 255, 255))
-        self.assertColor(im.getpixel((150, 150)), (0, 200, 0))
-
-    async def test_animated_sticker_rendered_to_video(self):
-        if not self.ffmpeg:
-            self.skipTest("ffmpeg not installed")
-        kind, data = await self.stickers.convert(self.tgs(), "application/x-tgsticker")
-        self.assertEqual(kind, "video")
-        im = self.frame(data)
-        self.assertColor(im.getpixel((5, 5)), (255, 255, 255))
-        self.assertColor(im.getpixel((192, 192)), (255, 0, 0))
-
-    async def test_animated_sticker_falls_back_to_first_frame(self):
-        import io
-        from unittest import mock
-        from PIL import Image
-        with mock.patch.object(self.stickers, "find_ffmpeg", return_value=None):
-            kind, data = await self.stickers.convert(self.tgs(), "application/x-tgsticker")
-        self.assertEqual(kind, "image")
-        self.assertColor(Image.open(io.BytesIO(data)).getpixel((192, 192)), (255, 0, 0))
-
-    async def test_bridge_sends_sticker_as_native_gif_and_legacy_fallback(self):
+    async def test_bridge_sends_sticker_as_native_gif(self):
         b = Bridge.__new__(Bridge)
         b.max_media = 50 * 1048576
         data = self.webp()
@@ -4511,13 +4357,9 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
             return data
         msg = SimpleNamespace(file=SimpleNamespace(size=len(data), mime_type="image/webp", name=None, ext=".webp"),
                               sticker=True, photo=None, download_media=download_media)
-        kind, media = await b._tg_media(msg, native_stickers=True)
+        kind, media = await b._tg_media(msg)
         self.assertEqual((kind, media.mime, media.filename), ("sticker", "image/gif", "sticker.gif"))
         self.assertTrue(media.data.startswith(b"GIF8"))
-
-        kind_old, media_old = await b._tg_media(msg, native_stickers=False)
-        self.assertEqual((kind_old, media_old.mime, media_old.filename), ("image", "image/jpeg", "sticker.jpg"))
-        self.assertTrue(media_old.data.startswith(b"\xff\xd8"))
 
     async def test_to_wechat_sticker_preserves_alpha_and_limits(self):
         import io
@@ -5545,64 +5387,6 @@ class WeChatClientTimeoutAndRetryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(httpx.ReadTimeout):
                 await wx.send_text("wxid_alice", "hi", "k-no-retry")
             self.assertEqual(attempts[f"POST /v1/accounts/{ACC}/sends"], 1)
-        finally:
-            await wx.close()
-
-    async def test_supports_stickers_does_not_cache_transient_failure(self):
-        calls = 0
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                return httpx.Response(503, json={"error": {"code": "starting", "retryable": False}})
-            return httpx.Response(200, json={"stickers": True})
-
-        wx = WeChatClient("http://localhost:6174", "secret-token", ACC, read_retry_delays=())
-        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler),
-                                    headers={"Authorization": "Bearer secret-token"},
-                                    timeout=wx.http.timeout)
-        try:
-            self.assertFalse(await wx.supports_stickers())
-            self.assertTrue(await wx.supports_stickers())
-            self.assertTrue(await wx.supports_stickers())
-            self.assertEqual(calls, 2)
-        finally:
-            await wx.close()
-
-    async def test_sticker_edge_limits_detects_daemon_version_and_retries_transient_failure(self):
-        calls = 0
-        ver = "2.5.0"
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal calls
-            assert request.url.path == "/v1/status"
-            calls += 1
-            if calls == 1:
-                return httpx.Response(503, json={"error": {"code": "starting", "retryable": False}})
-            return httpx.Response(200, json={"state": "ready", "version": {"version": ver}})
-
-        wx = WeChatClient("http://localhost:6174", "secret-token", ACC, read_retry_delays=())
-        wx.http = httpx.AsyncClient(transport=httpx.MockTransport(handler),
-                                    headers={"Authorization": "Bearer secret-token"},
-                                    timeout=wx.http.timeout)
-        try:
-            # Transient failure returns safe legacy 240px limits without caching failure
-            self.assertEqual(await wx.sticker_edge_limits(), (240, 240))
-            # 2.5.0 unlocks 384px animated / 512px static and caches result
-            self.assertEqual(await wx.sticker_edge_limits(), (384, 512))
-            self.assertEqual(await wx.sticker_edge_limits(), (384, 512))
-            self.assertEqual(calls, 2)
-
-            # < 2.5.0 stays at 240px
-            ver = "2.4.2"
-            wx._daemon_version = None
-            self.assertEqual(await wx.sticker_edge_limits(), (240, 240))
-
-            # Pre-release / v-prefixed 2.5+ versions also unlock high-res limits
-            ver = "v2.5.1-rc.1"
-            wx._daemon_version = None
-            self.assertEqual(await wx.sticker_edge_limits(), (384, 512))
         finally:
             await wx.close()
 

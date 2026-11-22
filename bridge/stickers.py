@@ -1,11 +1,8 @@
-"""Bidirectional sticker conversion between Telegram and WeChat (agent-wechat >= 2.4.0).
+"""Bidirectional sticker conversion between Telegram and WeChat.
 
 Telegram -> WeChat (native sticker, type=47):
-  - agent-wechat >= 2.5.0 preserves stickers up to 1024px:
-    - static stickers (.webp, 1-frame .tgs) -> <= 512px <= 1 MB transparent GIF
-    - animated stickers (.tgs/.webm/.webp) & GIFs -> <= 384px <= 1 MB transparent GIF
-  - agent-wechat < 2.5.0 caps stickers at 240px (auto-detected via /v1/status).
-  Legacy fallback (for agent-wechat < 2.4.0) converts to white-background JPEG or MP4 via `convert()`.
+  - static stickers (.webp, 1-frame .tgs) -> <= 512px <= 1 MB transparent GIF
+  - animated stickers (.tgs/.webm/.webp) & GIFs -> <= 384px <= 1 MB transparent GIF
 
 WeChat -> Telegram (native Telegram sticker):
   - static images / 1-frame WXGF     -> 512 px RGBA .webp
@@ -21,7 +18,6 @@ import gzip
 import hashlib
 import io
 import logging
-import math
 import os
 import re
 import shutil
@@ -35,34 +31,25 @@ from PIL import Image, ImageChops, ImageSequence, ImageStat
 
 log = logging.getLogger("stickers")
 
-SIZE = 384          # legacy MP4 output size
-MIN_SECONDS = 3.0   # legacy MP4 repeat target
-MAX_LOOPS = 4
-
 STICKER_CACHE_VERSION = 3
 STICKER_CACHE_MAX_BYTES = 100 * 1024 * 1024
 
-WX_STICKER_LEGACY_SIZE = 240
 WX_STICKER_SIZE = 384
 WX_STICKER_STATIC_SIZE = 512
 WX_STICKER_MAX_BYTES = 1024 * 1024
-# On agent-wechat >= 2.5.0 (long-link / reused short-link), ~550 KB sends in ~20s; legacy 2.4.x stays <= 320 KB.
-WX_STICKER_LEGACY_FAST_BYTES = 320 * 1024
 WX_STICKER_FAST_BYTES = 550 * 1024
 WX_STICKER_MAX_FRAMES = 200
 WX_STICKER_MAX_SECONDS = 9.5
 
 
-def default_fast_bytes(max_edge: int) -> int:
-    """Return the early-stop byte budget matched to the target sticker resolution."""
-    return WX_STICKER_FAST_BYTES if max_edge > WX_STICKER_LEGACY_SIZE else WX_STICKER_LEGACY_FAST_BYTES
+def default_fast_bytes(max_edge: int = WX_STICKER_SIZE) -> int:
+    """Return the early-stop byte budget for WeChat sticker GIF encoding."""
+    del max_edge
+    return WX_STICKER_FAST_BYTES
 
 
 def _static_attempts(max_edge: int) -> tuple[tuple[int, int], ...]:
-    if max_edge > WX_STICKER_LEGACY_SIZE:
-        fallbacks = ((384, 255), (288, 191), (192, 95))
-    else:
-        fallbacks = ((192, 127), (144, 63))
+    fallbacks = ((384, 255), (288, 191), (192, 95))
     return ((max_edge, 255), *(step for step in fallbacks if step[0] < max_edge))
 
 
@@ -88,17 +75,11 @@ def _gif_attempts(duration: float, max_edge: int = WX_STICKER_SIZE,
             head = head[2:]
         elif duration > 4.5:
             head = head[1:]
-    if max_edge > WX_STICKER_LEGACY_SIZE:
-        fallbacks = (
-            (320, 10.0, 192, "diff", "bayer:bayer_scale=4"),
-            (240, 10.0, 128, "diff", "bayer:bayer_scale=3"),
-            (176, 1000.0 / 120.0, 96, "diff", "bayer:bayer_scale=3"),
-        )
-    else:
-        fallbacks = (
-            (208, 10.0, 128, "diff", "bayer:bayer_scale=3"),
-            (176, 1000.0 / 120.0, 96, "diff", "bayer:bayer_scale=3"),
-        )
+    fallbacks = (
+        (320, 10.0, 192, "diff", "bayer:bayer_scale=4"),
+        (240, 10.0, 128, "diff", "bayer:bayer_scale=3"),
+        (176, 1000.0 / 120.0, 96, "diff", "bayer:bayer_scale=3"),
+    )
     return head + tuple(step for step in fallbacks if step[0] < max_edge)
 
 TG_STICKER_SIZE = 512
@@ -129,14 +110,6 @@ def on_white(im: Image.Image) -> Image.Image:
     return bg
 
 
-def static_to_jpeg(data: bytes) -> bytes:
-    im = Image.open(io.BytesIO(data))
-    im.load()
-    out = io.BytesIO()
-    on_white(im).save(out, "JPEG", quality=92)
-    return out.getvalue()
-
-
 def _tgs_size(anim, max_edge: int) -> tuple[int, int]:
     try:
         orig_w, orig_h = anim.lottie_animation_get_size()
@@ -157,15 +130,6 @@ def _resize_rgba(im: Image.Image, width: int, height: int) -> Image.Image:
         return rgba
     # Premultiply before LANCZOS so transparent (0,0,0,0) pixels do not bleed dark fringes into edges.
     return rgba.convert("RGBa").resize((width, height), Image.LANCZOS).convert("RGBA")
-
-
-def tgs_first_frame_jpeg(data: bytes) -> bytes:
-    from rlottie_python import LottieAnimation
-    anim = LottieAnimation.from_data(gzip.decompress(data).decode("utf-8"))
-    w, h = _tgs_size(anim, SIZE)
-    out = io.BytesIO()
-    on_white(_render_tgs_rgba(anim, 0, w, h)).save(out, "JPEG", quality=92)
-    return out.getvalue()
 
 
 def _wxgf_partition(data: bytes) -> bytes:
@@ -1207,72 +1171,6 @@ def from_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes, dict] | Non
     except Exception as e:
         log.info("Could not convert WeChat sticker (%s) to Telegram sticker: %s", mime, e)
     return None
-
-
-def _encode_cmd(ffmpeg: str, source: list[str], out: str, fps: float) -> list[str]:
-    """Legacy MP4 encoder: Input 0 is a white background, input 1 the sticker (with alpha), centred and padded."""
-    graph = (f"[1:v]scale={SIZE}:{SIZE}:force_original_aspect_ratio=decrease,"
-             f"pad={SIZE}:{SIZE}:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba[fg];"
-             "[0:v][fg]overlay=shortest=1,format=yuv420p")
-    return [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", f"color=c=white:s={SIZE}x{SIZE}:r={fps:g}",
-            *source, "-filter_complex", graph, "-r", f"{fps:g}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-movflags", "+faststart", "-an", out]
-
-
-def webm_to_mp4(data: bytes, ffmpeg: str) -> bytes:
-    with tempfile.TemporaryDirectory() as tmp:
-        src, out = os.path.join(tmp, "in.webm"), os.path.join(tmp, "out.mp4")
-        with open(src, "wb") as f:
-            f.write(data)
-        # libvpx-vp9 (not ffmpeg's native vp9 decoder) keeps the alpha channel
-        source = ["-stream_loop", str(MAX_LOOPS - 2), "-c:v", "libvpx-vp9", "-i", src]
-        subprocess.run(_encode_cmd(ffmpeg, source, out, 30), check=True, capture_output=True, timeout=120)
-        with open(out, "rb") as f:
-            return f.read()
-
-
-def tgs_to_mp4(data: bytes, ffmpeg: str) -> bytes:
-    from rlottie_python import LottieAnimation
-    anim = LottieAnimation.from_data(gzip.decompress(data).decode("utf-8"))
-    total = max(1, anim.lottie_animation_get_totalframe())
-    fps = anim.lottie_animation_get_framerate() or 30
-    loops = min(MAX_LOOPS, max(1, math.ceil(MIN_SECONDS * fps / total)))
-    w, h = _tgs_size(anim, SIZE)
-    with tempfile.TemporaryDirectory() as tmp:
-        out = os.path.join(tmp, "out.mp4")
-        source = ["-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}", "-r", f"{fps:g}", "-i", "pipe:0"]
-        frames = [_render_tgs_rgba(anim, i, w, h).tobytes() for i in range(total)]
-        raw = b"".join(frames) * loops
-        res = subprocess.run(_encode_cmd(ffmpeg, source, out, fps), input=raw,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.decode(errors="replace").strip() or f"ffmpeg exited {res.returncode}")
-        with open(out, "rb") as f:
-            return f.read()
-
-
-async def convert(data: bytes, mime: str) -> tuple[str, bytes] | str:
-    """Legacy fallback for agent-wechat < 2.4.0: ("image" | "video", bytes), or error reason."""
-    try:
-        if mime == "image/webp":
-            return "image", await asyncio.to_thread(static_to_jpeg, data)
-        ffmpeg = find_ffmpeg()
-        if mime == "video/webm":
-            if not ffmpeg:
-                return "需要 ffmpeg 才能转换视频贴纸"
-            return "video", await asyncio.to_thread(webm_to_mp4, data, ffmpeg)
-        if mime == "application/x-tgsticker":
-            if ffmpeg:
-                try:
-                    return "video", await asyncio.to_thread(tgs_to_mp4, data, ffmpeg)
-                except Exception as e:
-                    log.warning("Could not render animated sticker as video (%s); sending its first frame", e)
-            return "image", await asyncio.to_thread(tgs_first_frame_jpeg, data)
-    except Exception as e:
-        log.warning("Sticker conversion failed (%s): %s", mime, e)
-        return f"贴纸转换失败：{type(e).__name__}"
-    return f"不支持的贴纸格式 {mime}"
 
 
 _FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")

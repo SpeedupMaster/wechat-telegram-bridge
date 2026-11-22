@@ -67,8 +67,8 @@ def _is_wx_restoring(info: dict) -> bool:
 def _format_login_failure(state: str, res: dict, *, silent: bool = False) -> tuple[str, str]:
     """Return (friendly_summary, diagnostic_details) for a terminal login operation.
 
-    agent-wechat >= 2.9.0 includes `service` (rejected sign-in step) and `serviceCode`
-    (WeChat numeric rejection code) in failed login results when WeChat refused the step.
+    Failed login results include `service` (rejected sign-in step) and `serviceCode`
+    (WeChat numeric rejection code) when WeChat refused the step.
     """
     code = res.get("code")
     reason = code or res.get("reason") or state

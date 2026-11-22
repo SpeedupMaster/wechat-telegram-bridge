@@ -1623,11 +1623,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
     # --- names ------------------------------------------------------------
     async def _contact_names(self, wx_id: str, *, fresh: bool = False) -> tuple[str, str]:
-        """(remark, nickname) from the contact record itself, "" when unknown; cached for a while.
-
-        Threads and group members are meant to report the remark as `displayName` already, but
-        profiles saved before agent-wechat 2.6 can miss it there, so the remark is read directly.
-        """
+        """(remark, nickname) from the contact record itself, "" when unknown; cached for a while."""
         if not wx_id or is_group_id(wx_id):
             return "", ""
         now = time.monotonic()
@@ -3008,7 +3004,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             return ""
         if not self.call_web.can_dial(conf):
             what = "群语音通话" if conf else "语音通话"
-            return f"当前 agent-wechat 不支持发起微信{what}，请升级到 2.7 或更新版本。"
+            return f"当前 agent-wechat 不支持发起微信{what}，请检查 daemon 版本或通话能力。"
         return ""
 
     def _render_dial(self, req: dict) -> tuple[str, list | None]:
@@ -3660,9 +3656,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             result = None
             if msg.media and not isinstance(msg.media, (types.MessageMediaWebPage, types.MessageMediaDice,
                                                         types.MessageMediaEmpty)):
-                want_sticker = bool(msg.sticker or (msg.gif and self.cfg.bridge.gif_as_sticker))
-                native_stickers = await self.wx.supports_stickers() if want_sticker else False
-                kind, media = await self._tg_media(msg, native_stickers=native_stickers)
+                kind, media = await self._tg_media(msg)
                 if kind is None:
                     await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{media}")
                 else:
@@ -3743,15 +3737,6 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             await self.bot.send_message(chat_id, f"获取群成员失败：{e.code}", reply_to=reply_to)
             return
         terms = query.lower().split() if query else []
-        if terms:
-            # Keep client-side AND filtering across fields for older daemons that ignore `?search=`
-            members = [m for m in members if all(
-                any(
-                    term in str(m.get(k) or "").lower()
-                    for k in ("mentionName", "roomDisplayName", "displayName", "nickname", "alias", "username", "id")
-                )
-                for term in terms
-            )]
         if not members:
             await self.bot.send_message(chat_id, "没有匹配的群成员" if query else "没有拿到群成员", reply_to=reply_to)
             return
@@ -3833,7 +3818,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             log.info("Could not fetch the preview of wxgf sticker %s: %s", msg["id"], still)
         return still
 
-    async def _tg_media(self, msg, *, native_stickers: bool = True) -> tuple[str | None, Media | str]:
+    async def _tg_media(self, msg) -> tuple[str | None, Media | str]:
         f = msg.file
         size = f.size if f else 0
         if size and size > self.max_media:
@@ -3847,39 +3832,20 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if msg.photo:
             return "image", Media(data, "image/jpeg", "photo.jpg")
         cache = getattr(self, "sticker_cache", None)
-        wx = getattr(self, "wx", None)
-        if native_stickers and (msg.sticker or (msg.gif and self.cfg.bridge.gif_as_sticker)):
-            max_edge, static_max_edge = await wx.sticker_edge_limits() if wx else (
-                stickers.WX_STICKER_SIZE, stickers.WX_STICKER_STATIC_SIZE,
-            )
-        else:
-            max_edge, static_max_edge = stickers.WX_STICKER_SIZE, stickers.WX_STICKER_STATIC_SIZE
         if msg.sticker:
             if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/", "application/x-tgsticker")):
                 mime = {".webp": "image/webp", ".tgs": "application/x-tgsticker", ".webm": "video/webm"}.get(ext, mime)
-            if native_stickers:
-                converted = await stickers.to_wechat_sticker(
-                    data, mime, cache=cache, max_edge=max_edge, static_max_edge=static_max_edge,
-                )
-                if isinstance(converted, str):
-                    return None, converted
-                _, out = converted
-                return "sticker", Media(out, "image/gif", "sticker.gif")
-            converted = await stickers.convert(data, mime)
+            converted = await stickers.to_wechat_sticker(data, mime, cache=cache)
             if isinstance(converted, str):
                 return None, converted
-            kind, out = converted
-            if kind == "video":
-                return "video", Media(out, "video/mp4", "sticker.mp4")
-            return "image", Media(out, "image/jpeg", "sticker.jpg")
+            _, out = converted
+            return "sticker", Media(out, "image/gif", "sticker.gif")
         if msg.voice:
             return "voice", Media(data, "audio/ogg", "voice.ogg")
-        if msg.gif and native_stickers and self.cfg.bridge.gif_as_sticker:
+        if msg.gif and self.cfg.bridge.gif_as_sticker:
             if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/")):
                 mime = {".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm"}.get(ext, mime)
-            converted = await stickers.gif_to_wechat_sticker(
-                data, mime, cache=cache, max_edge=max_edge, static_max_edge=static_max_edge,
-            )
+            converted = await stickers.gif_to_wechat_sticker(data, mime, cache=cache)
             if not isinstance(converted, str):
                 _, out = converted
                 return "sticker", Media(out, "image/gif", "sticker.gif")
@@ -4047,8 +4013,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             except WeChatError:
                 pass
         try:
-            # agent-wechat >= 2.7 lists only friends by default; also show people you share a group with
-            # (or who removed you), friends first.
+            # Show friends first, followed by people you share a group with (or who removed you).
             found = await self.wx.search_contacts(q, limit=limit, relation="all")
             for c in sorted(found, key=lambda c: c.get("relation") not in (None, "friend")):
                 add(c, "direct")
@@ -4439,7 +4404,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         if pending := int(page.get("pendingIncomingCount") or 0):
                             mode += f"\n好友请求：{pending} 条待处理（发 /requests 查看）"
                     except (WeChatError, ValueError, TypeError):
-                        pass  # older daemon or not readable right now
+                        pass  # not readable right now
                 await event.reply(f"运行 {up // 3600}h{up % 3600 // 60}m，已转发 {self.forwarded} 条，"
                                   f"已连接 {len(self._link_rows())} 个会话。\n"
                                   f"微信：{state}，账号 <code>{_esc(self.wx.account or '-')}</code>{mode}",

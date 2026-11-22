@@ -21,8 +21,6 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .stickers import WX_STICKER_LEGACY_SIZE, WX_STICKER_SIZE, WX_STICKER_STATIC_SIZE
-
 log = logging.getLogger("wechat")
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -259,21 +257,12 @@ def _id(value: str) -> str:
     return quote(value, safe="")
 
 
-def _parse_semver(raw: Any) -> tuple[int, int, int] | None:
-    if not isinstance(raw, str):
-        return None
-    m = re.match(r"^\s*v?(\d+)\.(\d+)\.(\d+)", raw)
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
-
-
 class WeChatClient:
     def __init__(self, base_url: str, token: str, account: str = "",
                  *, read_retry_delays: tuple[float, ...] = (1.0, 2.0)):
         self.base = base_url.rstrip("/") + "/v1/"
         self._token = token
         self.account = account
-        self._supports_stickers: bool | None = None
-        self._daemon_version: tuple[int, int, int] | None = None
         self._sticker_preps: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._read_retry_delays = read_retry_delays
         # trust_env=False: never route the local daemon (and its token) through a system HTTP proxy
@@ -436,21 +425,14 @@ class WeChatClient:
         return await self._req("GET", self._a(f"contacts/{_id(username)}"))
 
     async def search_contacts(self, text: str, limit: int = 20, *, relation: str | None = None) -> list[dict]:
-        """Search cached contacts. agent-wechat >= 2.7 lists only friends unless `relation` says otherwise
-        (`all`, `friend`, `non_contact`, `unknown`); older daemons reject the filter, so it is dropped then."""
+        """Search cached contacts (`relation`: `all`, `friend`, `non_contact`, `unknown`)."""
         params: dict[str, Any] = {"search": text, "limit": limit}
         if relation:
             params["relation"] = relation
-        try:
-            data = await self._req("GET", self._a("contacts"), params=params)
-        except WeChatError as e:
-            if not relation or e.status not in (400, 422):
-                raise
-            params.pop("relation")
-            data = await self._req("GET", self._a("contacts"), params=params)
+        data = await self._req("GET", self._a("contacts"), params=params)
         return data.get("items", [])
 
-    # --- friend requests and contact settings (agent-wechat >= 2.7) -----------
+    # --- friend requests and contact settings -------------------------------
     async def contact_requests(self, *, direction: str | None = None, actionable: bool | None = None,
                                limit: int = 20, cursor: str | None = None) -> dict:
         """One page of request conversations: {"items", "pendingIncomingCount", "nextCursor", ...}.
@@ -498,11 +480,6 @@ class WeChatClient:
                              headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
         return await self._wait_operation(op)
 
-    async def contact_privacy(self, username: str) -> dict:
-        """{"privacy": {"chatsOnly", "hideMyPosts", "hideTheirPosts"}, "version"}. agent-wechat < 2.8 only:
-        2.8 removed this route and returns `privacy` / `privacyVersion` with the contact itself."""
-        return await self._req("GET", self._a(f"contacts/{_id(username)}/privacy"))
-
     async def refresh_contact(self, username: str, *, timeout: float = 30) -> dict:
         """Ask WeChat for a contact's latest details (remark and privacy included) and wait for the operation."""
         op = await self._req("POST", self._a(f"contacts/{_id(username)}/refresh"), timeout=_SEND_TIMEOUT)
@@ -515,8 +492,8 @@ class WeChatClient:
         return await self._wait_operation(op)
 
     async def set_contact_remark(self, username: str, remark: str | None, version: str, key: str) -> dict:
-        """Set (or, with None, clear) my remark for a contact (agent-wechat >= 2.8). `version` is the
-        contact's `privacyVersion`; the new name shows a few seconds after WeChat accepts it."""
+        """Set (or, with None, clear) my remark for a contact. `version` is the contact's
+        `privacyVersion`; the new name shows a few seconds after WeChat accepts it."""
         op = await self._req("PATCH", self._a(f"contacts/{_id(username)}"),
                              json={"expectedVersion": version, "remark": remark},
                              headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
@@ -674,24 +651,9 @@ class WeChatClient:
 
     # --- events -------------------------------------------------------------
     async def latest_cursor(self) -> str:
-        """Read the newest event cursor without replaying history (first start / cursor recovery).
-
-        agent-wechat >= 2.9.0 accepts `newest=true`, returning the tail in one request even after
-        cursor 0 has expired (> 10,000 events). Older daemons reject the unknown query field with
-        400, so fall back to walking from cursor 0 then."""
-        try:
-            page = await self._req("GET", self._a("events"), params={"newest": "true", "limit": 1})
-            return str(page.get("nextCursor") or "0")
-        except WeChatError as e:
-            if e.status not in (400, 422):
-                raise
-        cursor = "0"
-        while True:
-            page = await self._req("GET", self._a("events"), params={"after": cursor, "limit": 200})
-            nxt = str(page.get("nextCursor") or cursor)
-            if not page.get("items") or nxt == cursor:
-                return nxt
-            cursor = nxt
+        """Read the newest event cursor without replaying history (first start / cursor recovery)."""
+        page = await self._req("GET", self._a("events"), params={"newest": "true", "limit": 1})
+        return str(page.get("nextCursor") or "0")
 
     async def ack(self, consumer: str, cursor: str) -> None:
         await self._req("POST", self._a(f"consumers/{_id(consumer)}/ack"), json={"cursor": cursor})
@@ -742,36 +704,6 @@ class WeChatClient:
         intent = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
                                  timeout=_SEND_TIMEOUT)
         return await self._wait(intent, lambda i: f"sends/{_id(i['id'])}", SEND_DONE, 120)
-
-    async def supports_stickers(self) -> bool:
-        if self._supports_stickers is not None:
-            return self._supports_stickers
-        try:
-            caps = await self._req("GET", self._a("capabilities"))
-            self._supports_stickers = bool(isinstance(caps, dict) and caps.get("stickers"))
-        except (WeChatError, httpx.HTTPError):
-            return False
-        return self._supports_stickers
-
-    async def daemon_version(self) -> tuple[int, int, int] | None:
-        if self._daemon_version is not None:
-            return self._daemon_version
-        try:
-            st = await self._req("GET", "status")
-        except (WeChatError, httpx.HTTPError):
-            return None
-        vinfo = st.get("version") if isinstance(st, dict) else None
-        ver = _parse_semver(vinfo.get("version") if isinstance(vinfo, dict) else None)
-        if ver is not None:
-            self._daemon_version = ver
-        return ver
-
-    async def sticker_edge_limits(self) -> tuple[int, int]:
-        """Return (animated_edge, static_edge): 384/512 on agent-wechat >= 2.5.0, else 240/240."""
-        ver = await self.daemon_version()
-        if ver is not None and ver >= (2, 5, 0):
-            return WX_STICKER_SIZE, WX_STICKER_STATIC_SIZE
-        return WX_STICKER_LEGACY_SIZE, WX_STICKER_LEGACY_SIZE
 
     async def prepare_sticker(self, media: Media, key: str, *, fit: bool = True) -> dict:
         files = {"file": (media.filename, media.data, media.mime)}
@@ -850,16 +782,8 @@ class WeChatClient:
             body["imageQuality"] = "original"
         if kind == "video":
             body["videoQuality"] = "original"  # 720p playback copy plus the untouched original
-        try:
-            job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
-                                  timeout=_SEND_TIMEOUT)
-        except WeChatError as e:
-            if kind == "image" and e.status in (400, 422) and "imageQuality" in body:
-                body.pop("imageQuality", None)
-                job = await self._req("POST", self._a("sends"), json=body,
-                                      headers={"Idempotency-Key": f"{key}-std"}, timeout=_SEND_TIMEOUT)
-            else:
-                raise
+        job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
+                              timeout=_SEND_TIMEOUT)
         return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
 
     async def recall_message(self, message_id: str, server_id: str, key: str) -> dict:

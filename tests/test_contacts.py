@@ -1,4 +1,4 @@
-"""Friend requests, /add, /contact and relation-aware search (agent-wechat >= 2.7)."""
+"""Friend requests, /add, /contact and relation-aware search."""
 from __future__ import annotations
 
 import tempfile
@@ -215,10 +215,12 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_contact_card_privacy_and_removal(self):
         self.daemon.add_thread("wxid_bob", "Bob Remark")
-        self.daemon.add_contact("wxid_bob", "Bob Remark", alias="bob123", nickname="Bobby", remark="Bob Remark",
-                                relation="friend")
-        self.daemon.privacy["wxid_bob"] = {"privacy": {"chatsOnly": False, "hideMyPosts": False,
-                                                       "hideTheirPosts": True}, "version": "p1"}
+        self.daemon.add_contact(
+            "wxid_bob", "Bob Remark", alias="bob123", nickname="Bobby", remark="Bob Remark",
+            relation="friend",
+            privacy={"chatsOnly": False, "hideMyPosts": False, "hideTheirPosts": True},
+            privacyVersion="p1",
+        )
         self.b.store.link("wxid_bob", -600, "Bob Remark")
         await self.b.on_tg_message(tg_event(-600, 10, "/contact"))
         card = self.b.bot.sent[-1]
@@ -263,7 +265,6 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("这是微信群聊", self.b.bot.sent[-1].text)
 
     async def test_contact_card_reads_privacy_from_contact_and_refreshes_remark(self):
-        # agent-wechat 2.8: privacy comes with the contact; the old /privacy route is gone
         self.daemon.add_thread("wxid_amy", "Amy Nick")
         self.daemon.add_contact("wxid_amy", "Amy Nick", nickname="Amy Nick", remark=None, relation="friend",
                                 privacy={"chatsOnly": True, "hideMyPosts": False, "hideTheirPosts": False},
@@ -327,10 +328,10 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已清除备注", self.b.bot.sent[-1].text)
         self.assertEqual(self.b._link_title("wxid_cat"), "Cat Nick")
 
-        # An old daemon (no privacyVersion) and a WeChat group can't take a remark
+        # Missing privacyVersion and WeChat groups can't take a remark
         self.daemon.contacts["wxid_cat"].pop("privacyVersion")
         await self.b.on_tg_message(tg_event(-620, 14, "/remark 喵"))
-        self.assertIn("需要 agent-wechat 2.8", self.b.bot.sent[-1].text)
+        self.assertIn("读不到资料版本", self.b.bot.sent[-1].text)
         self.daemon.add_thread("8@chatroom", "Team", kind="group")
         self.b.store.link("8@chatroom", -621, "👥 Team")
         await self.b.on_tg_message(tg_event(-621, 15, "/remark 喵"))
@@ -382,11 +383,6 @@ class ContactsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.daemon.contact_searches[-1]["relation"], "all")
         self.assertIn("Zed Stranger</b>（非好友）", text)
         self.assertLess(text.index("Zed Friend"), text.index("Zed Stranger"))
-
-        self.daemon.relations_supported = False  # agent-wechat < 2.7
-        text, _ = await self.cmd("/find Zed")
-        self.assertNotIn("relation", self.daemon.contact_searches[-1])
-        self.assertIn("Zed Friend", text)
 
     async def test_follows_wechat_renames(self):
         self.daemon.add_thread("wxid_bob", "Bob")
