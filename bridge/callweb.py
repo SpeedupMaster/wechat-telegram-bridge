@@ -46,6 +46,8 @@ DIAL_REQUEST_TTL = 600.0
 MAX_INVITEES = 100
 INIT_DATA_MAX_AGE = 24 * 3600
 MAX_PCM_CHUNK = 65536
+# How long after the media socket attaches to check that audio is flowing both ways (logged, not enforced).
+AUDIO_CHECK_SECONDS = 8
 # Mini App start parameters that open the article reader instead of a call: "r_" + Store.article_id().
 READER_PREFIX = "r_"
 _ARTICLE_ID_RE = re.compile(r"[A-Za-z0-9]{8,32}")
@@ -140,6 +142,11 @@ class CallSession:
         self.task: asyncio.Task | None = None
         self.grace_task: asyncio.Task | None = None
         self.closed = False
+        # audio flow, for the "no sound" diagnosis: chunks WeChat sent / reached a page, mic chunks a page sent
+        self.rx_chunks = 0
+        self.rx_to_page = 0
+        self.tx_chunks = 0
+        self.watch_task: asyncio.Task | None = None
 
     @property
     def attached(self) -> bool:
@@ -183,6 +190,9 @@ class CallSession:
                 return
             await self._start_send()
             await self.web.push_state(self.entry)
+            log.info("Call %s media attached: %d Hz, frame %d, send track %s", self.call_id, self.rate, self.frame,
+                     self.send_track)
+            self.watch_task = asyncio.create_task(self._watch_audio())
             async for ev in sock.events():
                 etype = ev.get("type")
                 if etype == "audio.chunk":
@@ -208,6 +218,21 @@ class CallSession:
         finally:
             await self.close()
 
+    async def _watch_audio(self) -> None:
+        """Log once if, shortly after the media socket attached, audio is not flowing in some direction."""
+        await asyncio.sleep(AUDIO_CHECK_SECONDS)
+        if self.closed or self.entry["terminal"]:
+            return
+        if not self.rx_chunks:
+            log.warning("Call %s: no audio from WeChat %ds after the media socket attached", self.call_id,
+                        AUDIO_CHECK_SECONDS)
+        elif not self.rx_to_page:
+            log.warning("Call %s: WeChat audio is arriving but no call page is attached to play it", self.call_id)
+        if not self.tx_chunks:
+            log.warning("Call %s: no microphone audio from the call page %ds after the media socket attached "
+                        "(page attached: %s, muted: %s)", self.call_id, AUDIO_CHECK_SECONDS,
+                        self.active_ws is not None, self.muted)
+
     async def _start_send(self) -> None:
         if self.media is not None and self.send_track is not None and self.send_gen is not None:
             await self.media.send_json({"type": "audio.start", "trackId": self.send_track, "generation": self.send_gen})
@@ -222,6 +247,7 @@ class CallSession:
             log.info("Could not restart send track for %s: %s", self.call_id, e)
 
     async def _to_page(self, ev: dict) -> None:
+        self.rx_chunks += 1
         ws = self.active_ws
         if ws is None or ws.closed:
             return
@@ -233,6 +259,7 @@ class CallSession:
             return
         try:
             await ws.send_bytes(struct.pack("<I", int(ev.get("trackId") or 0)) + pcm)
+            self.rx_to_page += 1
         except (ConnectionError, RuntimeError):
             pass
 
@@ -251,6 +278,7 @@ class CallSession:
             data = data[:-1]
         if not data or len(data) > MAX_PCM_CHUNK:
             return
+        self.tx_chunks += 1
         try:
             await self.media.send_json({
                 "type": "audio.chunk",
@@ -285,6 +313,11 @@ class CallSession:
             return
         self.closed = True
         self.changed.set()
+        if self.watch_task and not self.watch_task.done():
+            self.watch_task.cancel()
+        if self.media is not None:
+            log.info("Call %s audio: %d chunks from WeChat (%d relayed to the page), %d mic chunks from the page",
+                     self.call_id, self.rx_chunks, self.rx_to_page, self.tx_chunks)
         if self.grace_task and not self.grace_task.done() and self.grace_task is not asyncio.current_task():
             self.grace_task.cancel()
         if self.media is not None:
@@ -1323,9 +1356,12 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     if (audioStarting) return audioStarting;
     if (!window.isSecureContext) return Promise.reject(new Error('页面必须通过 HTTPS 打开才能使用麦克风'));
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('当前环境不支持麦克风'));
+    // iOS: a two-way call needs the play-and-record session, or Web Audio follows the silent switch / gets
+    // interrupted once the microphone starts.
+    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
     const AC = window.AudioContext || window.webkitAudioContext;
     const ctx = new AC({latencyHint: 'interactive'});
-    const resumed = ctx.resume().catch(() => {});
+    ctx.resume().catch(() => {});
     if (!ctx.audioWorklet) { ctx.close(); return Promise.reject(new Error('当前浏览器不支持 AudioWorklet')); }
     const gum = navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
       autoGainControl: true, channelCount: 1}, video: false});
@@ -1342,11 +1378,19 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         node.port.onmessage = (e) => {
           if (st && st.mine && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 64000) ws.send(e.data);
         };
-        await resumed;
-        if (ctx.state !== 'running') await ctx.resume();
+        // Never wait for resume(): on iOS the microphone starting can leave the context "interrupted" and the
+        // promise pending indefinitely, which used to leave the call connected with no sound either way.
         audio = {ctx: ctx, stream: stream, node: node, rate: rate};
         micGranted = true;
-        try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+        ctx.onstatechange = checkAudio;
+        checkAudio();
+        try {
+          if (navigator.wakeLock) {
+            navigator.wakeLock.request('screen').then((l) => {
+              if (audio && audio.ctx === ctx) wakeLock = l; else l.release();
+            }).catch(() => {});
+          }
+        } catch (e) {}
         return audio;
       } catch (e) {
         gum.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
@@ -1359,8 +1403,37 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     return audioStarting;
   }
 
-  function stopAudio() {
+  // Keeps the AudioContext running: the system can suspend or interrupt it (iOS when the mic starts, another
+  // app takes audio, the page is backgrounded). Resume quietly, and ask for a tap if that is not allowed.
+  const SOUND_HINT = '声音被系统暂停了，轻点屏幕任意位置恢复';
+  let soundHint = false, soundTimer = null;
+  function checkAudio() {
     if (!audio) return;
+    const s = audio.ctx.state;
+    if (s === 'running') {
+      if (soundHint) { soundHint = false; hint(''); }
+      return;
+    }
+    if (s === 'closed') return;
+    audio.ctx.resume().catch(() => {});
+    clearTimeout(soundTimer);
+    soundTimer = setTimeout(() => {
+      if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') {
+        soundHint = true;
+        hint(SOUND_HINT, true);
+      }
+    }, 800);
+  }
+  ['touchend', 'click'].forEach((t) => document.addEventListener(t, () => {
+    if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') audio.ctx.resume().then(checkAudio, () => {});
+  }, true));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAudio(); });
+
+  function stopAudio() {
+    clearTimeout(soundTimer);
+    if (soundHint) { soundHint = false; hint(''); }
+    if (!audio) return;
+    try { audio.ctx.onstatechange = null; } catch (e) {}
     try { audio.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
     try { audio.ctx.close(); } catch (e) {}
     audio = null;
@@ -1527,6 +1600,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       if (p === 'ended') ended = true;
       stopAudio();
     }
+    if (soundHint) hint(SOUND_HINT, true);  // a phase change clears the hint; this one still applies
   }
 
   function connect() {

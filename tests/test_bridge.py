@@ -6360,6 +6360,8 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
             if m.type == aiohttp.WSMsgType.BINARY:
                 got = m.data
         self.assertEqual(got, struct.pack("<I", 2) + b"\x01\x00\x02\x00")
+        sess = self.b.call_web.sessions["call-1"]  # flow counters behind the "no sound" log lines
+        self.assertEqual((sess.rx_chunks, sess.rx_to_page, sess.tx_chunks), (1, 1, 1))
 
         # mute -> call.mute; the daemon then moves the send track to a new generation
         await ws.send_json({"type": "mute", "muted": True})
