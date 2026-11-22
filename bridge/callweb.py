@@ -1666,7 +1666,7 @@ font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","M
 body{background:radial-gradient(130% 70% at 50% -10%,#1f3a2b 0%,rgba(20,22,27,0) 60%),var(--bg)}
 .stage{position:fixed;inset:0;z-index:1;background:#0c0e12;display:grid;grid-template-columns:1fr;gap:4px;padding:0}
 .stage[hidden]{display:none}
-.stage.grid-2,.stage.grid-many{gap:8px;padding:calc(max(12px,env(safe-area-inset-top)) + 106px) 8px calc(128px + env(safe-area-inset-bottom))}
+.stage.grid-2,.stage.grid-many{gap:8px;padding:calc(max(12px,env(safe-area-inset-top)) + 116px) 8px calc(128px + env(safe-area-inset-bottom))}
 .stage.grid-2{grid-template-columns:1fr;grid-template-rows:1fr 1fr}
 .stage.grid-many{grid-template-columns:1fr 1fr;grid-auto-rows:1fr}
 @media (min-width:680px){
@@ -1703,7 +1703,10 @@ main.video-live .title{font-size:12px;color:rgba(244,245,247,.72)}
 main.video-live .name{font-size:20px;text-shadow:0 1px 6px rgba(0,0,0,.55)}
 main.video-live .timer{font-size:14px;min-height:18px;color:rgba(244,245,247,.9);text-shadow:0 1px 4px rgba(0,0,0,.55)}
 main.video-live .status{padding:3px 10px;min-height:24px;font-size:12px;background:rgba(14,16,21,.56)}
-main.video-live .hint{pointer-events:auto;padding:2px 10px;border-radius:10px;background:rgba(14,16,21,.55)}
+main.video-live .hint{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(134px + env(safe-area-inset-bottom));
+z-index:4;pointer-events:auto;width:max-content;max-width:calc(100vw - 32px);padding:6px 14px;border-radius:14px;
+background:rgba(14,16,21,.82);border:1px solid rgba(255,255,255,.1);-webkit-backdrop-filter:blur(10px);
+backdrop-filter:blur(10px);box-shadow:0 6px 18px rgba(0,0,0,.35)}
 main.video-live .hint:empty{display:none}
 .avatar{position:relative;width:112px;height:112px;border-radius:50%;display:flex;align-items:center;
 justify-content:center;font-size:46px;font-weight:600;color:#fff;margin-bottom:14px;
@@ -1857,7 +1860,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   const pageUrl = location.origin + CFG.base + '/call/' + token;
   const workletUrl = URL.createObjectURL(new Blob([WORKLET], {type: 'application/javascript'}));
 
-  let ws = null, st = null, audio = null, audioStarting = null, ended = false, fatal = false, retry = 0, reattach = false;
+  let ws = null, wsOpen = false, st = null, audio = null, audioStarting = null, ended = false, fatal = false, retry = 0, reattach = false;
   let timerBase = null, timerId = null, wakeLock = null, pending = null, lastPhase = null, micGranted = false;
   let closingConfirm = null;
 
@@ -2335,7 +2338,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
 
   function act(action, extra) {
     if (!begin(action, extra)) return;
-    if (!send(Object.assign({type: action}, extra || {}))) { pending = null; hint('连接已断开，正在重连…', true); render(); }
+    if (!send(Object.assign({type: action}, extra || {}))) { wsOpen = false; pending = null; render(); }
   }
 
   async function withMedia(action, wantVideo) {
@@ -2376,7 +2379,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       const payload = {type: action, videoCaps: caps};
       if (wantVideo || st.videoEnabled || st.videoCall) payload.cameraEnabled = camOk;
       if (action === 'dial' && wantVideo) payload.callType = 'video';
-      if (!send(payload)) { pending = null; hint('连接已断开，正在重连…', true); render(); }
+      if (!send(payload)) { wsOpen = false; pending = null; render(); }
     }
   }
 
@@ -2409,7 +2412,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const b = document.createElement('button');
     const busy = pending && pending.action === action;
     b.className = 'btn ' + cls + (busy ? ' busy' : '');
-    b.disabled = !!pending;
+    b.disabled = !!pending || (!wsOpen && action !== 'close');
     b.innerHTML = '<span class="c">' + icon + '</span>';
     b.appendChild(document.createTextNode(label));
     b.onclick = onClick;
@@ -2507,6 +2510,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       text = pending.action === 'hangup' && p === 'calling' ? '正在取消…' : PENDING_TEXT[pending.action];
       tone = 'wait';
     }
+    if (!wsOpen && !ended && !fatal) { text = '连接中断，正在重连…'; tone = 'wait'; }
     setStatus(text, tone);
 
     if (st.elapsed != null && p !== 'ended') {
@@ -2588,6 +2592,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     ws = new WebSocket(proto + '//' + location.host + CFG.base + '/ws');
     ws.binaryType = 'arraybuffer';
     ws.onopen = async () => {
+      wsOpen = true;
       retry = 0;
       const caps = await videoCapsReady;
       if (ws && ws.readyState === 1) {
@@ -2629,10 +2634,12 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       }
     };
     ws.onclose = () => {
+      wsOpen = false;
       if (fatal || ended) return;
       if (audio) reattach = true;
       pending = null;
-      setStatus('连接中断，正在重连…', 'wait');
+      if (st) render();
+      else setStatus('连接中断，正在重连…', 'wait');
       setTimeout(connect, Math.min(5000, 300 * Math.pow(2, retry++)));
     };
   }

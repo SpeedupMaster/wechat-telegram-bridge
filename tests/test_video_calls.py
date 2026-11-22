@@ -652,8 +652,12 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
             '翻转镜头',
             '对方已关闭摄像头',
             "$('pip').onclick = flipCamera",
+            'wsOpen',
+            'main.video-live .hint{position:fixed',
         ):
             self.assertIn(marker, body)
+        # Disconnected WS must not duplicate status+hint text
+        self.assertNotIn("hint('连接已断开，正在重连…'", body)
         # iOS Safari requires startAudio() (AudioContext creation) synchronously before awaiting videoCapsReady
         wm = body[body.index("async function withMedia"):body.index("async function toggleCamera")]
         self.assertLess(wm.index("startAudio("), wm.index("await videoCapsReady"))
