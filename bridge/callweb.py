@@ -326,14 +326,12 @@ class CallWeb:
         return f"{self.base_url}/call/{token}"
 
     def reader_kind(self, url: str | None) -> str | None:
-        """How the Mini App shows a link: "fetch" (note / embedded video, resolved ahead of time), "article",
-        "link" (any other web page, opened in place), or None (not through the Mini App)."""
+        """How the Mini App shows a link: "fetch" (note / embedded video, resolved ahead of time), "link" (any
+        other web page, Official Account articles included, opened in place), or None (not through the Mini App)."""
         cfg = self.bridge.cfg.bridge
         if (cfg.xhs_reader and xhs.is_note_url(url) or cfg.douyin_reader and douyin.is_video_url(url)
                 or cfg.bilibili_reader and bilibili.is_video_url(url)):
             return "fetch"
-        if cfg.article_reader and articles.is_article_url(url):
-            return "article"
         if cfg.links_in_app and _is_plain_link(url):
             return "link"
         return None

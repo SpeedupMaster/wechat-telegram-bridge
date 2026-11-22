@@ -146,7 +146,7 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.web.reader_kind(SHARE), "link")
         self.b.cfg.bridge.links_in_app = False
         self.assertIsNone(self.web.article_link(SHARE))
-        self.assertIsNotNone(self.web.article_link("https://mp.weixin.qq.com/s/abcDEF123"))
+        self.assertIsNone(self.web.article_link("https://mp.weixin.qq.com/s/abcDEF123"))  # articles are plain links now
 
 
 if __name__ == "__main__":

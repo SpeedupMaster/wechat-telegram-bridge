@@ -66,9 +66,6 @@ call_notifications = true
 # call_web_app = ""
 # 将微信链接分享（小红书、公众号、抖音/抖音极速版口令、网页等）渲染为微信风格卡片图并附带直达按钮
 link_card_images = true
-# 公众号文章卡片的按钮改为在内置阅读页（Mini App）中打开：不再弹「打开此链接？」确认，页面里可再点「打开原文」
-# 需要同时配置 call_web_url 与 call_web_app；关闭后按钮仍直接打开原文链接
-article_reader = true
 # 小红书笔记卡片同样走内置阅读页：视频直接内嵌播放、图文按原图展示；收到卡片时即预抓取（分享链接的 xsec_token 会过期）
 # 服务器被小红书拦截（登录墙、链接过期）时，Mini App 会在应用内原地打开原笔记
 xhs_reader = true
@@ -77,11 +74,11 @@ xhs_reader = true
 douyin_reader = true
 # B 站视频卡片（含 b23.tv 短链）同样用官方嵌入播放器（player.bilibili.com）播放，默认关闭弹幕
 bilibili_reader = true
-# 其余链接卡片也通过 Mini App 原地打开原网页，免去「打开此链接？」确认（服务端不抓取网页）
+# 其余链接卡片（含公众号文章）也通过 Mini App 原地打开原网页，免去「打开此链接？」确认（服务端不抓取网页）
 # 卡片会多一个「🔗 原链接」按钮，用于需要完整浏览器的页面；t.me 等 Telegram 链接保持原样
 links_in_app = true
-# 可选：仅用于抓取公众号文章 / 小红书笔记 / 解析抖音与 B 站短链的独立代理（环境变量 ARTICLE_PROXY），与 [telegram].proxy 相互独立
-# 支持 http://、https://、socks5://、socks5h://；留空则直连（遇微信「环境异常」时 Mini App 会自动在应用内跳转原文）
+# 可选：仅用于抓取小红书笔记 / 解析抖音与 B 站短链的独立代理（环境变量 ARTICLE_PROXY），与 [telegram].proxy 相互独立
+# 支持 http://、https://、socks5://、socks5h://；留空则直连
 # article_proxy = ""
 # 把收到的微信好友请求推送到与机器人的私聊，可一键通过（需 agent-wechat >= 2.7.0）
 friend_requests = true

@@ -1,4 +1,7 @@
-"""Official Account article reader: parsing / sanitizing, fetching, and the CallWeb reader page."""
+"""Shared Mini App reader: fetch session, caches, reader / handoff pages, and the CallWeb reader routes.
+
+WeChat Official Account articles are not fetched any more: their card buttons open the original page in place.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,157 +12,40 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import httpx
-
 from bridge import article as A
 from bridge.config import BridgeConfig, Config, TelegramConfig, WeChatConfig
 from bridge.core import Bridge
 from bridge.store import Store
 
 ART_URL = "https://mp.weixin.qq.com/s/abcDEF123"
-
-PAGE = """<!doctype html><html><head>
-<meta property="og:title" content="测试 &amp; 标题" />
-<meta property="og:image" content="http://mmbiz.qpic.cn/cover/0?wx_fmt=jpeg" />
-<meta property="og:description" content="摘要" />
-<meta property="og:article:author" content="作者甲" />
-<script>var nickname = htmlDecode("某公众号"); var ct = "1700000000";</script>
-</head><body>
-<h1 id="activity-name">测试标题</h1>
-<div class="rich_media_content" id="js_content" style="visibility: hidden; opacity: 0;">
-  <section style="color: red; position: fixed; width: expression(alert(1))"><p onclick="evil()">第一段<strong>加粗</strong>
-  <p>没闭合的段落
-  <img class="rich_pages" data-src="http://mmbiz.qpic.cn/a/640?wx_fmt=png" data-w="600" data-ratio="0.5" src="data:x" />
-  <a href="javascript:alert(1)">坏链接</a><a href="https://example.com/x?a=1&amp;b=2">好链接</a>
-  <script>alert('x')</script><style>body{display:none}</style>
-  <svg viewBox="0 0 1 1"><text>svg 文字</text></svg>
-  <iframe class="video_iframe" data-src="https://v.qq.com/x"></iframe>
-  <mp-custom>保留的子内容</mp-custom>
-  <section style="background-image: url(http://mmbiz.qpic.cn/bg/0)">背景</section>
-  <section style="background-image: url(javascript:alert(1)); color: blue">坏背景</section>
-  </section>
-</div>
-<div id="js_tags">不属于正文</div>
-<script>var tail = "</div>";</script>
-</body></html>"""
+# A Xiaohongshu note: still rendered by the reader, so it exercises the shared fetch / cache / page plumbing.
+NOTE_URL = "https://www.xiaohongshu.com/explore/0123456789abcdef01234567"
 
 
 def _btn_url(btn):
     return btn.type.url if hasattr(btn, "type") and hasattr(btn.type, "url") else btn.url
 
 
-class ParseTests(unittest.TestCase):
-    def test_is_article_url_and_normalize(self):
-        self.assertTrue(A.is_article_url("http://mp.weixin.qq.com/s?__biz=MzA&mid=1&idx=1&sn=x#rd"))
-        self.assertTrue(A.is_article_url(ART_URL))
-        self.assertFalse(A.is_article_url("https://mp.weixin.qq.com/cgi-bin/home"))
-        self.assertFalse(A.is_article_url("https://evil.com/s/abc"))
-        self.assertFalse(A.is_article_url("https://mp.weixin.qq.com.evil.com/s/abc"))
-        self.assertFalse(A.is_article_url(None))
-        self.assertEqual(A.normalize_url("http://mp.weixin.qq.com/s?__biz=MzA&amp;mid=1#rd"),
-                         "https://mp.weixin.qq.com/s?__biz=MzA&mid=1")
-
-    def test_parse_and_sanitize(self):
-        art = A.parse_article(PAGE, ART_URL)
-        self.assertEqual(art.title, "测试 & 标题")
-        self.assertEqual(art.account, "某公众号")
-        self.assertEqual(art.author, "作者甲")
-        self.assertEqual(art.published, 1700000000)
-        self.assertEqual(art.cover, "https://mmbiz.qpic.cn/cover/0?wx_fmt=jpeg")
-        c = art.content
-        self.assertIn("第一段<strong>加粗</strong>", c)
-        self.assertIn("没闭合的段落", c)
-        self.assertIn('src="https://mmbiz.qpic.cn/a/640?wx_fmt=png"', c)
-        self.assertIn('width="600" height="300"', c)
-        self.assertIn('referrerpolicy="no-referrer"', c)
-        self.assertIn('href="https://example.com/x?a=1&amp;b=2"', c)
-        self.assertIn("保留的子内容", c)
-        self.assertIn("［视频，请打开原文查看］", c)
-        self.assertIn("url(&quot;https://mmbiz.qpic.cn/bg/0&quot;)", c)
-        self.assertIn("color: blue", c)
-        self.assertIn("color: red", c)
-        for bad in ("onclick", "javascript", "alert", "<script", "<style", "display:none", "svg", "expression",
-                    "position", "data:x", "不属于正文", "mp-custom", "<iframe"):
-            self.assertNotIn(bad, c)
-        # Every emitted element is closed again.
-        for tag in ("section", "p", "a", "strong"):
-            self.assertEqual(c.count(f"<{tag}>") + c.count(f"<{tag} "), c.count(f"</{tag}>"), tag)
-
-    def test_blocked_and_empty_pages(self):
-        with self.assertRaisesRegex(A.ArticleError, "已被发布者删除") as cm_del:
-            A.parse_article("<html><body>该内容已被发布者删除</body></html>", ART_URL)
-        self.assertFalse(cm_del.exception.fallback_original)
-        with self.assertRaisesRegex(A.ArticleError, "验证") as cm_cap:
-            A.parse_article("<html><body>当前环境异常，完成验证后即可继续访问</body></html>", ART_URL)
-        self.assertTrue(cm_cap.exception.fallback_original)
-        self.assertEqual(cm_cap.exception.code, "captcha")
-        # Picture-style posts without a #js_content body still get title + summary + cover.
-        art = A.parse_article('<meta property="og:title" content="图片消息" />'
-                              '<meta property="og:description" content="说明" />', ART_URL)
-        self.assertEqual((art.title, art.description, art.content), ("图片消息", "说明", ""))
-        page = A.render_page(art, nonce="n1")
-        self.assertIn("暂不支持阅读模式", page)
-        self.assertIn('<script nonce="n1">', page)
-
-    def test_parse_picture_post_xiaolvshu(self):
-        pic_page = """<!doctype html><html><head>
-        <meta property="og:title" content="春日随拍" />
-        <meta property="og:description" content="备用摘要" />
-        <script>
-        var nickname = "摄影日记";
-        var ct = "1710000000";
-        var content_noencode = JsDecode('今天天气真好\\x0a第二行 <b>转义</b>');
-        window.picture_page_info_list = [
-          {
-            width: '1080',
-            height: '1440',
-            cdn_url: 'http://mmecoa.qpic.cn/mmecoa_jpg/pic1/0?wx_fmt=jpeg\\x26amp;from=appmsg',
-            watermark_info: {
-              cdn_url: 'http://mmecoa.qpic.cn/mmecoa_jpg/watermark_ignore/0',
-            },
-          },
-          {
-            "width": 1200,
-            "height": 800,
-            "cdn_url": "https://mmbiz.qpic.cn/sz_mmbiz_png/pic2/0?wx_fmt=png",
-          },
-        ].slice(0, 20);
-        </script>
-        </head><body></body></html>"""
-        art = A.parse_article(pic_page, ART_URL)
-        self.assertEqual(art.title, "春日随拍")
-        self.assertEqual(art.account, "摄影日记")
-        self.assertEqual(art.published, 1710000000)
-        self.assertIn("今天天气真好", art.content)
-        self.assertIn("第二行 &lt;b&gt;转义&lt;/b&gt;", art.content)
-        self.assertIn('src="https://mmecoa.qpic.cn/mmecoa_jpg/pic1/0?wx_fmt=jpeg&amp;from=appmsg"', art.content)
-        self.assertIn('width="1080" height="1440"', art.content)
-        self.assertIn('src="https://mmbiz.qpic.cn/sz_mmbiz_png/pic2/0?wx_fmt=png"', art.content)
-        self.assertNotIn("watermark_ignore", art.content)
-        self.assertNotIn("暂不支持阅读模式", A.render_page(art, nonce="n1"))
-
-    def test_parse_croporisrc_and_code_blocks(self):
-        code_page = """<html><head><meta property="og:title" content="代码文" /></head><body>
-        <div id="js_content">
-          <img data-croporisrc="http://mmbiz.qpic.cn/crop/0?wx_fmt=jpeg" />
-          <pre><code>x = 1 &lt; 2</code></pre>
-        </div></body></html>"""
-        art = A.parse_article(code_page, ART_URL)
-        self.assertIn('src="https://mmbiz.qpic.cn/crop/0?wx_fmt=jpeg"', art.content)
-        self.assertIn("<pre><code>x = 1 &lt; 2</code></pre>", art.content)
+class ReaderPageTests(unittest.TestCase):
+    def test_normalize(self):
+        self.assertEqual(A.normalize_url("http://WWW.Xiaohongshu.com/explore/1?a=1&amp;b=2#frag"),
+                         "https://www.xiaohongshu.com/explore/1?a=1&b=2")
 
     def test_render_escapes(self):
-        art = A.Article(url=ART_URL, title="<b>x</b>", account="号", content="<p>正文</p>")
+        art = A.Article(url=NOTE_URL, title="<b>x</b>", account="号", content="<p>正文</p>")
         page = A.render_page(art, nonce="abc")
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", page)
         self.assertIn("<p>正文</p>", page)
         # 打开原文 stays inside the Mini App (no web_app_open_link hand-off to an external browser)
-        self.assertIn(f'<a class="open" id="open" data-inapp="1" href="{ART_URL}">打开原文</a>', page)
+        self.assertIn(f'<a class="open" id="open" data-inapp="1" href="{NOTE_URL}">打开原文</a>', page)
         self.assertNotIn('target="_blank"', page)
         self.assertIn('<meta name="referrer" content="no-referrer">', page)
-        dated = A.render_page(A.Article(url=ART_URL, title="t", account="号", published=1607438787), nonce="")
+        dated = A.render_page(A.Article(url=NOTE_URL, title="t", account="号", published=1607438787), nonce="")
         self.assertIn("号 · 2020-12-08 22:46", dated)  # Beijing time, whatever the server's timezone
-        err = A.render_page(None, error="<坏>", source_url=ART_URL)
+        bare = A.render_page(A.Article(url=NOTE_URL, title="t", description="摘要"), nonce="n1")
+        self.assertIn("暂不支持阅读模式", bare)
+        self.assertIn('<script nonce="n1">', bare)
+        err = A.render_page(None, error="<坏>", source_url=NOTE_URL)
         self.assertIn("&lt;坏&gt;", err)
         self.assertIn("打开原文", err)
 
@@ -177,102 +63,45 @@ class ParseTests(unittest.TestCase):
 
 
 class FetchTests(unittest.IsolatedAsyncioTestCase):
-    async def test_fetch_follows_same_host_redirects_only(self):
-        seen = []
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            seen.append(str(req.url))
-            if req.url.path == "/s/abcDEF123":
-                return httpx.Response(302, headers={"location": "/s?__biz=X&mid=1#wechat_redirect"})
-            if req.url.path == "/s/away":
-                return httpx.Response(302, headers={"location": "https://evil.example/s/1"})
-            if req.url.path == "/s/gone":
-                return httpx.Response(404)
-            return httpx.Response(200, content=PAGE.encode(), headers={"content-type": "text/html; charset=utf-8"})
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            art = await A.fetch_article(ART_URL, client)
-            self.assertEqual(art.title, "测试 & 标题")
-            self.assertEqual(art.url, "https://mp.weixin.qq.com/s?__biz=X&mid=1")
-            self.assertEqual(seen, [ART_URL, "https://mp.weixin.qq.com/s?__biz=X&mid=1"])
-            with self.assertRaisesRegex(A.ArticleError, "其他网站"):
-                await A.fetch_article("https://mp.weixin.qq.com/s/away", client)
-            with self.assertRaisesRegex(A.ArticleError, "404") as cm_404:
-                await A.fetch_article("https://mp.weixin.qq.com/s/gone", client)
-            self.assertFalse(cm_404.exception.fallback_original)
-            with self.assertRaisesRegex(A.ArticleError, "不是"):
-                await A.fetch_article("https://example.com/s/1", client)
-            with mock.patch.object(A, "MAX_PAGE_BYTES", 100):
-                with self.assertRaisesRegex(A.ArticleError, "过大"):
-                    await A.fetch_article("https://mp.weixin.qq.com/s/big", client)
-
-    async def test_fetch_captcha_redirect_and_rate_limit_mark_fallback(self):
-        def handler(req: httpx.Request) -> httpx.Response:
-            if req.url.path == "/s/cap":
-                return httpx.Response(302, headers={"location": "/mp/wappoc_appmsgcaptcha?poc_token=abc"})
-            if req.url.path == "/s/r403":
-                return httpx.Response(403)
-            if req.url.path == "/s/r429":
-                return httpx.Response(429)
-            return httpx.Response(200, content=PAGE.encode())
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            with self.assertRaises(A.ArticleError) as cm_cap:
-                await A.fetch_article("https://mp.weixin.qq.com/s/cap", client)
-            self.assertTrue(cm_cap.exception.fallback_original)
-            self.assertEqual(cm_cap.exception.code, "captcha")
-            for path in ("/s/r403", "/s/r429"):
-                with self.assertRaises(A.ArticleError) as cm:
-                    await A.fetch_article("https://mp.weixin.qq.com" + path, client)
-                self.assertTrue(cm.exception.fallback_original)
-                self.assertEqual(cm.exception.code, "rate_limit")
+    async def test_official_account_articles_are_not_fetched(self):
+        session = mock.Mock()
+        for url in (ART_URL, "https://example.com/s/1"):
+            with self.assertRaises(A.ArticleError) as cm:
+                await A.fetch_article(url, session)
+            self.assertEqual(cm.exception.code, "invalid_url")
+        session.stream.assert_not_called()
 
     async def test_fetcher_concurrency_and_curl_cffi_session(self):
         active = 0
         peak = 0
         created_kwargs = {}
-
-        class FakeResp:
-            is_redirect = False
-            status_code = 200
-            headers = {"content-type": "text/html; charset=utf-8"}
-            encoding = "utf-8"
-
-            async def aiter_content(self):
-                yield PAGE.encode()
-
-        class FakeStream:
-            async def __aenter__(self):
-                nonlocal active, peak
-                active += 1
-                peak = max(peak, active)
-                await asyncio.sleep(0.03)
-                return FakeResp()
-
-            async def __aexit__(self, *exc):
-                nonlocal active
-                active -= 1
+        seen_sessions = []
 
         class FakeCurlSession:
             def __init__(self, **kw):
                 created_kwargs.update(kw)
                 self.closed = False
 
-            def stream(self, method, url, **kw):
-                return FakeStream()
-
             async def close(self):
                 self.closed = True
 
-        with mock.patch.object(A, "_CurlAsyncSession", FakeCurlSession):
+        async def fake_fetch(url, session, *, uses_curl):
+            nonlocal active, peak
+            seen_sessions.append((session, uses_curl))
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.03)
+            active -= 1
+            return A.Article(url=url, title="笔记")
+
+        with mock.patch.object(A, "_CurlAsyncSession", FakeCurlSession),                 mock.patch.object(A, "_fetch_with_session", side_effect=fake_fetch):
             fetcher = A.ArticleFetcher(proxy="socks5://127.0.0.1:7890", max_concurrency=1)
             with A.use_fetcher(fetcher):
-                a1, a2 = await asyncio.gather(
-                    A.fetch_article(ART_URL),
-                    A.fetch_article(ART_URL + "2"),
-                )
-            self.assertEqual((a1.title, a2.title), ("测试 & 标题", "测试 & 标题"))
+                a1, a2 = await asyncio.gather(A.fetch_article(NOTE_URL), A.fetch_article(NOTE_URL + "2"))
+            self.assertEqual((a1.title, a2.title), ("笔记", "笔记"))
             self.assertEqual(peak, 1)
+            self.assertIs(seen_sessions[0][0], seen_sessions[1][0])  # one reusable session
+            self.assertTrue(seen_sessions[0][1])
             self.assertEqual(created_kwargs.get("impersonate"), A.IMPERSONATE_BROWSER)
             self.assertEqual(created_kwargs.get("proxy"), "socks5://127.0.0.1:7890")
             self.assertFalse(created_kwargs.get("allow_redirects"))
@@ -305,31 +134,31 @@ class StoreTests(unittest.TestCase):
     def test_persistent_article_cache_and_eviction(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             store = Store(Path(tmp) / "s.db")
-            aid1 = store.article_id("https://mp.weixin.qq.com/s/a1")
-            store.save_cached_article("https://mp.weixin.qq.com/s/a1", {
-                "url": "https://mp.weixin.qq.com/s/a1", "title": "第一篇", "account": "号1",
+            aid1 = store.article_id("https://www.xiaohongshu.com/explore/a1")
+            store.save_cached_article("https://www.xiaohongshu.com/explore/a1", {
+                "url": "https://www.xiaohongshu.com/explore/a1", "title": "第一篇", "account": "号1",
                 "author": "甲", "published": 1700000001, "cover": "", "description": "摘1", "content": "<p>正文1</p>",
             }, max_entries=2)
-            store.save_cached_article("https://mp.weixin.qq.com/s/a2", {
-                "url": "https://mp.weixin.qq.com/s/a2", "title": "第二篇", "account": "号2",
+            store.save_cached_article("https://www.xiaohongshu.com/explore/a2", {
+                "url": "https://www.xiaohongshu.com/explore/a2", "title": "第二篇", "account": "号2",
                 "author": "", "published": 1700000002, "cover": "", "description": "", "content": "<p>正文2</p>",
             }, max_entries=2)
             # Touch a1 so a2 becomes oldest, then insert a3 -> a2 evicted, a1 & a3 kept.
-            hit1 = store.get_cached_article("https://mp.weixin.qq.com/s/a1")
+            hit1 = store.get_cached_article("https://www.xiaohongshu.com/explore/a1")
             self.assertIsNotNone(hit1)
             self.assertEqual(hit1["title"], "第一篇")
             self.assertEqual(hit1["content"], "<p>正文1</p>")
-            store.save_cached_article("https://mp.weixin.qq.com/s/a3", {
-                "url": "https://mp.weixin.qq.com/s/a3", "title": "第三篇", "account": "号3",
+            store.save_cached_article("https://www.xiaohongshu.com/explore/a3", {
+                "url": "https://www.xiaohongshu.com/explore/a3", "title": "第三篇", "account": "号3",
                 "author": "", "published": 1700000003, "cover": "", "description": "", "content": "<p>正文3</p>",
             }, max_entries=2)
-            self.assertIsNotNone(store.get_cached_article("https://mp.weixin.qq.com/s/a1"))
-            self.assertIsNone(store.get_cached_article("https://mp.weixin.qq.com/s/a2"))
-            self.assertIsNotNone(store.get_cached_article("https://mp.weixin.qq.com/s/a3"))
+            self.assertIsNotNone(store.get_cached_article("https://www.xiaohongshu.com/explore/a1"))
+            self.assertIsNone(store.get_cached_article("https://www.xiaohongshu.com/explore/a2"))
+            self.assertIsNotNone(store.get_cached_article("https://www.xiaohongshu.com/explore/a3"))
             # Short ID mapping remains intact even after cache deletion.
-            store.delete_cached_article("https://mp.weixin.qq.com/s/a1")
-            self.assertIsNone(store.get_cached_article("https://mp.weixin.qq.com/s/a1"))
-            self.assertEqual(store.article_url(aid1), "https://mp.weixin.qq.com/s/a1")
+            store.delete_cached_article("https://www.xiaohongshu.com/explore/a1")
+            self.assertIsNone(store.get_cached_article("https://www.xiaohongshu.com/explore/a1"))
+            self.assertEqual(store.article_url(aid1), "https://www.xiaohongshu.com/explore/a1")
             store.db.close()
 
 
@@ -356,42 +185,56 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     def test_article_link(self):
-        link = self.web.article_link("http://mp.weixin.qq.com/s/abcDEF123#rd")
+        # Official Account articles open the original in place, like any other page: the exact URL is kept and
+        # the raw link rides along as a second button.
+        wx = "http://mp.weixin.qq.com/s/abcDEF123#rd"
+        self.assertEqual(self.web.reader_kind(wx), "link")
+        row = self.b._card_buttons({"url": wx}, 5)[0]
+        m = re.fullmatch(r"https://t\.me/mybot/app\?startapp=r_([A-Za-z0-9]{16})", _btn_url(row[0]))
+        self.assertIsNotNone(m, _btn_url(row[0]))
+        self.assertEqual(self.b.store.article_url(m.group(1)), wx)  # exact URL: scheme and fragment kept
+        self.assertEqual((row[1].text, _btn_url(row[1])), ("🔗 原链接", wx))
+        self.b.cfg.bridge.article_reader = False  # deprecated: no effect any more
+        self.assertEqual(self.web.reader_kind(wx), "link")
+        # Notes still go through the reader: canonical URL, one button (the reader page has its own 打开原文).
+        with mock.patch.object(self.web, "_prefetch"):
+            link = self.web.article_link(NOTE_URL + "#frag")
+            row = self.b._card_buttons({"url": NOTE_URL}, 5)[0]
         m = re.fullmatch(r"https://t\.me/mybot/app\?startapp=r_([A-Za-z0-9]{16})", link or "")
         self.assertIsNotNone(m, link)
-        self.assertEqual(self.b.store.article_url(m.group(1)), ART_URL)
-        # The card button uses it, alone: the reader page has its own 打开原文.
-        row = self.b._card_buttons({"url": ART_URL}, 5)[0]
+        self.assertEqual(self.b.store.article_url(m.group(1)), NOTE_URL)
         self.assertEqual([_btn_url(b) for b in row], [link])
-        # Other pages open in place in the Mini App, with the raw URL as a second button.
-        other = "http://www.xiaohongshu.com/x#frag"
-        self.assertEqual(self.web.reader_kind(other), "link")
-        row = self.b._card_buttons({"url": other}, 5)[0]
-        aid = re.fullmatch(r"https://t\.me/mybot/app\?startapp=r_([A-Za-z0-9]{16})", _btn_url(row[0])).group(1)
-        self.assertEqual(self.b.store.article_url(aid), other)  # exact URL: scheme and fragment kept
-        self.assertEqual((row[1].text, _btn_url(row[1])), ("🔗 原链接", other))
         self.assertIsNone(self.web.article_link("https://t.me/somechannel/12"))  # Telegram opens these natively
-        self.b.cfg.bridge.article_reader = False  # articles then simply open in place
-        self.assertEqual(self.web.reader_kind(ART_URL), "link")
         self.b.cfg.bridge.links_in_app = False
         self.assertIsNone(self.web.article_link(ART_URL))
-        self.assertEqual(_btn_url(self.b._card_buttons({"url": other}, 5)[0][0]), other)
-        self.b.cfg.bridge.article_reader = self.b.cfg.bridge.links_in_app = True
+        self.assertEqual(_btn_url(self.b._card_buttons({"url": ART_URL}, 5)[0][0]), ART_URL)
+        self.b.cfg.bridge.links_in_app = True
         self.web.app_name = ""
         self.assertIsNone(self.web.article_link(ART_URL))
+
+    async def test_old_article_reader_links_open_the_original(self):
+        # Cards sent before the change carry r_<id> links to an mp.weixin URL: hand them over, never fetch.
+        aid = self.b.store.article_id(ART_URL)
+        with mock.patch.object(A, "fetch_article", side_effect=AssertionError("must not fetch")):
+            async with self.http.get(f"{self.base}/read/{aid}") as r:
+                self.assertEqual(r.status, 200)
+                text = await r.text()
+        self.assertIn("location.replace", text)
+        self.assertIn(ART_URL, text)
+        self.assertNotIn("retry=1", text)
 
     def test_call_tokens_never_look_like_reader_links(self):
         with mock.patch("bridge.callweb.secrets.token_urlsafe", side_effect=["r_abc", "r_def", "callTok"]):
             self.assertEqual(self.web._new_token("call", "c1"), "callTok")
 
     async def test_reader_page(self):
-        aid = self.b.store.article_id(ART_URL)
+        aid = self.b.store.article_id(NOTE_URL)
         calls = []
 
         async def fake_fetch(url):
             calls.append(url)
             await asyncio.sleep(0.05)
-            return A.parse_article(PAGE, url)
+            return A.Article(url=url, title="测试 & 标题", account="某博主", content="<p>第一段</p>")
 
         with mock.patch.object(A, "fetch_article", side_effect=fake_fetch):
             async def get(path):
@@ -399,7 +242,7 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
                     return r.status, r.headers, await r.text()
             (s1, h1, t1), (s2, _, _) = await asyncio.gather(get(f"/read/{aid}"), get(f"/read/{aid}"))
             self.assertEqual((s1, s2), (200, 200))
-            self.assertEqual(calls, [ART_URL])  # concurrent taps share one download
+            self.assertEqual(calls, [NOTE_URL])  # concurrent taps share one download
             self.assertIn("测试 &amp; 标题", t1)
             self.assertIn("第一段", t1)
             self.assertEqual(h1["Referrer-Policy"], "no-referrer")
@@ -425,20 +268,20 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(s5, 404)
 
     async def test_reader_page_fetch_failure(self):
-        aid = self.b.store.article_id(ART_URL)
-        with mock.patch.object(A, "fetch_article", side_effect=A.ArticleError("该内容已被发布者删除")):
+        aid = self.b.store.article_id(NOTE_URL)
+        with mock.patch.object(A, "fetch_article", side_effect=A.ArticleError("笔记已被删除")):
             async with self.http.get(f"{self.base}/read/{aid}") as r:
                 self.assertEqual(r.status, 502)
                 text = await r.text()
-        self.assertIn("该内容已被发布者删除", text)
-        self.assertIn(f'href="{ART_URL}"', text)
+        self.assertIn("笔记已被删除", text)
+        self.assertIn(f'href="{NOTE_URL}"', text)
         self.assertIn(f'href="/wxcall/read/{aid}?retry=1"', text)
         self.assertNotIn("location.replace", text)
-        self.assertIsNone(self.b.store.get_cached_article(ART_URL))
+        self.assertIsNone(self.b.store.get_cached_article(NOTE_URL))
 
-    async def test_reader_page_auto_redirects_in_mini_app_on_captcha(self):
-        aid = self.b.store.article_id(ART_URL)
-        err = A.ArticleError("微信要求验证访问环境，正在打开原文…", code="captcha", fallback_original=True)
+    async def test_reader_page_auto_redirects_in_mini_app_when_blocked(self):
+        aid = self.b.store.article_id(NOTE_URL)
+        err = A.ArticleError("小红书要求登录，正在打开原笔记…", code="login_wall", fallback_original=True)
         with mock.patch.object(A, "fetch_article", side_effect=err):
             async with self.http.get(f"{self.base}/read/{aid}") as r:
                 self.assertEqual(r.status, 200)
@@ -447,14 +290,14 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
                 text = await r.text()
         self.assertIn(f'<script nonce="{nonce}">', text)
         self.assertIn("location.replace", text)
-        self.assertIn(ART_URL, text)
+        self.assertIn(NOTE_URL, text)
         self.assertIn("web_app_expand", text)
         self.assertIn("web_app_ready", text)
         self.assertIn(f'href="/wxcall/read/{aid}?retry=1"', text)
-        self.assertIsNone(self.b.store.get_cached_article(ART_URL))
+        self.assertIsNone(self.b.store.get_cached_article(NOTE_URL))
 
     def test_reader_html_supports_dark_mode_and_lightbox(self):
-        page = A.render_page(A.Article(url=ART_URL, title="t", content='<p><img src="https://mmbiz.qpic.cn/a/0"></p>'),
+        page = A.render_page(A.Article(url=NOTE_URL, title="t", content='<p><img src="https://sns-img.xhscdn.com/a"></p>'),
                              nonce="n2", retry_url="/read/abc?retry=1")
         self.assertIn("prefers-color-scheme: dark", page)
         self.assertIn("tgWebAppThemeParams", page)
@@ -462,7 +305,7 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("data-inapp", page)
 
     async def test_reader_persists_cache_across_memory_clear_and_supports_retry(self):
-        aid = self.b.store.article_id(ART_URL)
+        aid = self.b.store.article_id(NOTE_URL)
         calls = 0
 
         async def fake_fetch(url):

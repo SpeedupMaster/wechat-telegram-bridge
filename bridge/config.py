@@ -62,9 +62,11 @@ class BridgeConfig:
     call_web_listen: str = "127.0.0.1:8780"
     call_web_app: str = ""  # optional BotFather Mini App short name: buttons open t.me/<bot>/<app> instead
     link_card_images: bool = True
-    # With call_web_app set, Official Account article cards open in a built-in reader Mini App (no link prompt).
+    # Deprecated, ignored: Official Account articles are no longer fetched; their cards open the original page in
+    # place like any other link (links_in_app). Still accepted so existing config files keep loading.
     article_reader: bool = True
-    # Same reader for Xiaohongshu notes (video plays inline); falls back to the original page when blocked.
+    # With call_web_app set, Xiaohongshu notes open in a built-in reader Mini App (no link prompt; video plays
+    # inline); falls back to the original page when blocked.
     xhs_reader: bool = True
     # Douyin video cards open Douyin's official embed player in the same Mini App (图文/profiles open the link).
     douyin_reader: bool = True
@@ -72,7 +74,8 @@ class BridgeConfig:
     # Every other link card opens its page in place inside the Mini App (no "Open this link?" prompt);
     # a second "原链接" button keeps the plain URL for pages that need a real browser.
     links_in_app: bool = True
-    # Optional proxy used only when fetching mp.weixin.qq.com articles (independent of telegram.proxy).
+    # Optional proxy used only for reader fetches (Xiaohongshu notes, Douyin / Bilibili short links); independent of
+    # telegram.proxy.
     article_proxy: str = ""
     friend_requests: bool = True  # push incoming WeChat friend requests to the bot chat
     auto_rename: bool = True  # follow WeChat remark/group-name changes in Telegram titles
