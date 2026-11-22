@@ -120,7 +120,8 @@ HELP = (
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
-    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音/视频电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
+    "• <code>/vcall</code> [成员] — 直接发起微信视频通话或群视频通话\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理：免打扰、邀请/移出成员、清空公告、退群\n"
     "• <code>/invite</code> [关键词] / <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
@@ -145,7 +146,8 @@ GROUP_HELP = (
     "• <code>/wx</code> — 查看当前群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
-    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音/视频电话；在微信群里勾选成员发起群通话\n"
+    "• <code>/vcall</code> [成员] — 直接发起微信视频通话或群视频通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理（免打扰、邀请/移出成员、清空公告、退群）\n"
     "• <code>/invite</code> · <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
@@ -183,7 +185,8 @@ TOPIC_HELP = (
     "• <code>/wx</code> — 查看当前话题/群对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
-    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音/视频电话；在微信群里勾选成员发起群通话（需配置通话页面）\n"
+    "• <code>/vcall</code> [成员] — 直接发起微信视频通话或群视频通话\n"
     "• <code>/members</code> [关键词] — 列出微信群成员，点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理：免打扰、邀请/移出成员、清空公告、退群\n"
     "• <code>/invite</code> [关键词] / <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
@@ -207,7 +210,8 @@ TOPIC_GROUP_HELP = (
     "• <code>/wx</code> — 查看当前话题对应的微信会话\n"
     "• <code>/contact</code> — 查看好友资料、设置朋友圈权限（别名 <code>/info</code>）\n"
     "• <code>/remark</code> 新备注 — 修改微信好友备注（<code>/remark -</code> 清除）\n"
-    "• <code>/call</code> [成员] — 给好友打微信语音电话；在微信群里勾选成员发起群通话\n"
+    "• <code>/call</code> [成员] — 给好友打微信语音/视频电话；在微信群里勾选成员发起群通话\n"
+    "• <code>/vcall</code> [成员] — 直接发起微信视频通话或群视频通话\n"
     "• <code>/members</code> [关键词] — 查看群成员并点按复制 <code>@名字</code>（别名 <code>/at</code>）\n"
     "• <code>/group</code> — 微信群资料与管理（免打扰、邀请/移出成员、清空公告、退群）\n"
     "• <code>/invite</code> · <code>/kick</code> [关键词] — 邀请好友进群 / 移出群成员\n"
@@ -252,7 +256,8 @@ GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
     ("contact", "查看好友资料与朋友圈权限"),
     ("remark", "修改微信好友备注"),
-    ("call", "给好友打微信电话或发起群语音通话"),
+    ("call", "给好友打微信电话或发起群通话"),
+    ("vcall", "给好友打微信视频电话或发起群视频通话"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("group", "微信群资料与管理"),
     ("invite", "邀请好友进微信群"),
@@ -289,7 +294,8 @@ TOPIC_GROUP_BOT_COMMANDS = [
     ("wx", "查看对应的微信会话"),
     ("contact", "查看好友资料与朋友圈权限"),
     ("remark", "修改微信好友备注"),
-    ("call", "给好友打微信电话或发起群语音通话"),
+    ("call", "给好友打微信电话或发起群通话"),
+    ("vcall", "给好友打微信视频电话或发起群视频通话"),
     ("members", "查看群成员（点按复制 @名字）"),
     ("group", "微信群资料与管理"),
     ("invite", "邀请好友进微信群"),
@@ -933,7 +939,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self._group_picks: dict[str, dict] = {}  # pick id -> /invite, /kick or /newgroup member picker
         self._calls_retry_sleep: float = 300.0
         self._calls_client_id: str = ""
+        self._calls_protocol_version: int = 2
         self._calls_caps: dict = {}
+        self._calls_video_caps: dict = {}
         self._orphan_call_states: dict[str, dict] = {}
         b = cfg.bridge
         self.call_web: CallWeb | None = (
@@ -2334,7 +2342,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if fmt := event.get("audioFormat"):
                 self._calls_audio_format = fmt
             self._calls_client_id = event.get("clientId") or ""
+            self._calls_protocol_version = int(event.get("protocolVersion") or 2)
             self._calls_caps = event.get("capabilities") or {}
+            self._calls_video_caps = event.get("videoCapabilities") or {}
             live_ids = {
                 x.get("callId")
                 for x in (event.get("currentOffer"), event.get("currentPendingOffer"), event.get("currentCall"))
@@ -2380,9 +2390,13 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             await self._on_conf_invitations(event.get("invitations") or [])
         elif etype == "call.invitation_result":
             await self._on_invitation_result(event)
-        elif etype == "track.updated":
+        elif etype in ("track.added", "track.updated", "track.removed"):
             if self.call_web is not None:
-                await self.call_web.on_track_updated(event)
+                await self.call_web.on_track_event(event)
+        elif etype == "call.control":
+            await self._on_call_control(event)
+        elif etype == "participant.updated":
+            await self._on_participant_updated(event)
         elif etype == "call.error":
             log.warning("WeChat call error event: %s", event.get("code"))
 
@@ -2448,13 +2462,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
     def _render_call(self, entry: dict) -> tuple[str, list | None]:
         outgoing = entry.get("direction") == "outgoing"
+        video = entry.get("call_type") == "video"
         if entry["kind"] == "conference" and outgoing:
-            title, who = "📞 <b>微信群语音通话</b>", "群"
+            title, who = ("📹 <b>微信群视频通话</b>" if video else "📞 <b>微信群语音通话</b>"), "群"
         elif entry["kind"] == "conference":
-            title, who = "📞 <b>微信群语音通话</b>", "发起人"
+            title, who = ("📹 <b>微信群视频通话</b>" if video else "📞 <b>微信群语音通话</b>"), "发起人"
         elif outgoing:
-            title, who = "📞 <b>微信语音通话</b>", "呼叫"
-        elif entry["call_type"] == "video":
+            title, who = ("📹 <b>微信视频通话</b>" if video else "📞 <b>微信语音通话</b>"), "呼叫"
+        elif video:
             title, who = "📹 <b>微信视频来电</b>", "来电人"
         else:
             title, who = "📞 <b>微信语音来电</b>", "来电人"
@@ -2469,10 +2484,10 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             # One button per row: full-width buttons are much easier to hit on a phone.
             if entry["stage"] in ("pending", "offered"):
                 if web is not None and web.can_answer(entry):
-                    rows.append([Button.url("📞 接听", web.link(web.token_for_call(entry)))])
+                    rows.append([Button.url("📹 接听" if video else "📞 接听", web.link(web.token_for_call(entry)))])
                 rows.append([Button.inline("📵 拒接", f"callrej:{entry['token']}".encode())])
             elif web is not None and entry.get("answered_by_tg") and web.has_session(entry["call_id"]):
-                rows.append([Button.url("🎧 通话界面", web.link(web.token_for_call(entry)))])
+                rows.append([Button.url("📹 通话界面" if video else "🎧 通话界面", web.link(web.token_for_call(entry)))])
                 if web.can_invite(entry):
                     rows.append([Button.inline("➕ 邀请更多人", f"callinv:{entry['token']}".encode())])
                 label = "📴 取消呼叫" if outgoing and entry["stage"] in ("dialing", "ringing") else "📴 挂断"
@@ -2498,6 +2513,44 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             out.append("邀请异常：" + "、".join(f"{_esc(n)}（{why}）" for n, why in failed.values()))
         # A long list folds away: Telegram shows the first lines and a tap expands the rest.
         return "\n<blockquote expandable>" + "\n".join(out) + "</blockquote>"
+
+    @staticmethod
+    def _apply_call_control(entry: dict, ctrl: dict) -> None:
+        if not isinstance(ctrl, dict):
+            return
+        kind = ctrl.get("kind")
+        if kind == "camera" and "enabled" in ctrl:
+            entry["remote_camera"] = bool(ctrl["enabled"])
+        elif kind == "microphone" and "muted" in ctrl:
+            entry["remote_muted"] = bool(ctrl["muted"])
+
+    async def _on_call_control(self, event: dict) -> None:
+        entry = self._active_calls.get(event.get("callId") or "")
+        if entry is None:
+            return
+        self._apply_call_control(entry, event.get("control") or {})
+        if self.call_web is not None:
+            await self.call_web.push_state(entry)
+
+    async def _on_participant_updated(self, event: dict) -> None:
+        entry = self._active_calls.get(event.get("callId") or "")
+        part = event.get("participant")
+        if entry is None or not isinstance(part, dict):
+            return
+        if event.get("revision") is not None:
+            entry["revision"] = event["revision"]
+        parts = list(entry.get("participants") or [])
+        pid, cid = part.get("participantId"), part.get("contactId")
+        replaced = False
+        for i, old in enumerate(parts):
+            if (pid and old.get("participantId") == pid) or (cid and old.get("contactId") == cid):
+                parts[i] = {**old, **part}
+                replaced = True
+                break
+        if not replaced:
+            parts.append(part)
+        entry["participants"] = parts
+        await self._sync_call_msg(entry)
 
     async def _on_invitation_result(self, event: dict) -> None:
         call_id = event.get("callId") or ""
@@ -2684,8 +2737,13 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         conf = entry["kind"] == "conference"
         outgoing = entry.get("direction") == "outgoing"
         group_out = conf and outgoing
-        if group_out and isinstance(call.get("participants"), list):
+        if call.get("callType") in ("voice", "video"):
+            entry["call_type"] = call["callType"]
+        if conf and isinstance(call.get("participants"), list):
             entry["participants"] = call["participants"]
+        for item in call.get("controls") or []:
+            if isinstance(item, dict):
+                self._apply_call_control(entry, item.get("control") or {})
         if state == "offered":
             entry["stage"] = "offered"
             entry["status_text"] = "🔔 响铃中…"
@@ -2931,8 +2989,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if entry.get("chat_id"):
             await self._report(entry["chat_id"], entry.get("msg_id"), text)
 
-    # ---------------------------------------------------------------- outgoing calls (/call)
-    def _dial_unavailable(self, thread_id: str) -> str:
+    # ---------------------------------------------------------------- outgoing calls (/call, /vcall)
+    def _dial_unavailable(self, thread_id: str, *, video: bool = False) -> str:
         conf = is_group_id(thread_id)
         if thread_id == "filehelper" or thread_id.startswith("gh_"):
             return "文件传输助手和公众号不能接听微信电话。"
@@ -2943,6 +3001,11 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             return "🔐 微信尚未登录，登录后再打电话。"
         if self._calls_sock is None or self._calls_sock.closed:
             return "通话信令未连接（agent-wechat 通话功能不可用或正在重连），请稍后重试。"
+        if video:
+            if not self.call_web.can_dial(conf, video=True):
+                what = "群视频通话" if conf else "视频通话"
+                return f"当前 agent-wechat 不支持发起微信{what}，请升级到 3.0 或更新版本。"
+            return ""
         if not self.call_web.can_dial(conf):
             what = "群语音通话" if conf else "语音通话"
             return f"当前 agent-wechat 不支持发起微信{what}，请升级到 2.7 或更新版本。"
@@ -2951,19 +3014,36 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     def _render_dial(self, req: dict) -> tuple[str, list | None]:
         if req.get("kind") == "conference":
             return self._render_group_dial(req)
-        text = _card("📞 <b>微信语音通话</b>",
+        video = req.get("call_type") == "video"
+        title = "📹 <b>微信视频通话</b>" if video else "📞 <b>微信语音通话</b>"
+        text = _card(title,
                      [f"呼叫：<b>{_esc(req['name'])}</b>", f"状态：{req['status_text']}"])
         web = self.call_web
         if not req["live"] or web is None:
             return text, None
-        return text, [[Button.url("📞 开始呼叫", web.link(web.token_for_dial(req)))],
-                      [Button.inline("✖️ 取消", f"dialx:{req['dial_id']}".encode())]]
+        if video:
+            rows = [[Button.url("📹 开始视频呼叫", web.link(web.token_for_dial(req, video=True)))]]
+        elif web.can_dial(False, video=True):
+            rows = [
+                [Button.url("📞 语音呼叫", web.link(web.token_for_dial(req, video=False)))],
+                [Button.url("📹 视频呼叫", web.link(web.token_for_dial(req, video=True)))],
+            ]
+        else:
+            rows = [[Button.url("📞 开始呼叫", web.link(web.token_for_dial(req)))]]
+        rows.append([Button.inline("✖️ 取消", f"dialx:{req['dial_id']}".encode())])
+        return text, rows
 
     def _render_group_dial(self, req: dict) -> tuple[str, list | None]:
         selected = req["selected"]
         names = req["names"]
         inviting = bool(req.get("invite_call"))
-        title = "➕ <b>邀请加入群语音通话</b>" if inviting else "📞 <b>微信群语音通话</b>"
+        video = req.get("call_type") == "video"
+        if inviting:
+            title = "➕ <b>邀请加入群视频通话</b>" if video else "➕ <b>邀请加入群语音通话</b>"
+        elif video:
+            title = "📹 <b>微信群视频通话</b>"
+        else:
+            title = "📞 <b>微信群语音通话</b>"
         lines = [f"群：<b>{_esc(req['name'])}</b>"]
         if selected:
             shown = "、".join(_esc(names.get(cid) or cid) for cid in selected[:DIAL_PICK_SHOWN])
@@ -2999,7 +3079,16 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             # The call page already has the microphone: inviting is a plain command, no page needed.
             rows.append([Button.inline(f"➕ 发送邀请（{len(selected)} 人）", f"dialp:{did}:go".encode())])
         elif selected:
-            rows.append([Button.url(f"📞 开始呼叫（{len(selected)} 人）", web.link(web.token_for_dial(req)))])
+            if video:
+                rows.append([Button.url(f"📹 开始视频呼叫（{len(selected)} 人）",
+                                        web.link(web.token_for_dial(req, video=True)))])
+            elif web.can_dial(True, video=True):
+                rows.append([Button.url(f"📞 语音呼叫（{len(selected)} 人）",
+                                        web.link(web.token_for_dial(req, video=False)))])
+                rows.append([Button.url(f"📹 视频呼叫（{len(selected)} 人）",
+                                        web.link(web.token_for_dial(req, video=True)))])
+            else:
+                rows.append([Button.url(f"📞 开始呼叫（{len(selected)} 人）", web.link(web.token_for_dial(req)))])
         rows.append([Button.inline("✖️ 取消", f"dialx:{did}".encode())])
         return text, rows
 
@@ -3016,8 +3105,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                                             "alias", "username", "id")).lower()})
         return out
 
-    async def _start_dial(self, chat_id: int, reply_to: int | None, thread_id: str, query: str = "") -> None:
-        if why := self._dial_unavailable(thread_id):
+    async def _start_dial(self, chat_id: int, reply_to: int | None, thread_id: str, query: str = "",
+                          *, video: bool = False) -> None:
+        if why := self._dial_unavailable(thread_id, video=video):
             await self.bot.send_message(chat_id, why, parse_mode="html", reply_to=reply_to)
             return
         conf = is_group_id(thread_id)
@@ -3029,12 +3119,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         req = {
             "dial_id": secrets.token_hex(6),
             "kind": "conference" if conf else "direct",
+            "call_type": "video" if video else "voice",
             "contact_id": thread_id,
             "thread_id": thread_id,
             "name": name,
             "chat_id": chat_id,
             "msg_id": None,
-            "status_text": "点击「开始呼叫」，在通话页面授权麦克风后拨出",
+            "status_text": ("点击「开始视频呼叫」，在通话页面授权摄像头与麦克风后拨出" if video
+                            else "点击下方按钮，在通话页面授权设备后拨出"),
             "live": True,
             "dialing": False,
             "call_id": None,
@@ -3048,7 +3140,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                                             reply_to=reply_to)
                 return
             if not members:
-                await self.bot.send_message(chat_id, "没有拿到群成员，无法发起群语音通话", reply_to=reply_to)
+                await self.bot.send_message(chat_id, "没有拿到群成员，无法发起群通话", reply_to=reply_to)
                 return
             terms = query.lower().split()
             picked = [m for m in members if any(t in m["search"] for t in terms)] if terms else []
@@ -3063,7 +3155,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 names={m["id"]: m["label"] for m in members},
                 selected=[m["id"] for m in picked],
                 page=0,
-                status_text="勾选要邀请的成员，再点「开始呼叫」，在通话页面授权麦克风后发起",
+                status_text=("勾选要邀请的成员，再点「开始视频呼叫」，在通话页面授权设备后发起" if video
+                             else "勾选要邀请的成员，再点下方呼叫按钮发起"),
             )
         for old in list(self._dial_requests.values()):
             if (old["live"] and old["thread_id"] == thread_id and not old.get("dialing")
@@ -3232,6 +3325,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         req = {
             "dial_id": secrets.token_hex(6),
             "kind": "conference",
+            "call_type": entry.get("call_type", "voice"),
             "invite_call": call_id,
             "contact_id": entry["thread_id"],
             "thread_id": entry["thread_id"],
@@ -3329,7 +3423,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         elif cmd_name == "/help":
             await self._send_group_notice(event.chat_id, msg.id, TOPIC_GROUP_HELP)
         elif cmd_name in ("/wx", "/unlink", "/members", "/at", "/recall", "/rename", "/title", "/avatar",
-                          "/contact", "/info", "/call", "/remark", *GROUP_COMMANDS):
+                          "/contact", "/info", "/call", "/vcall", "/remark", *GROUP_COMMANDS):
             await self._send_group_notice(event.chat_id, msg.id,
                                           "这个话题还没有绑定微信会话，发送 <code>/link</code> 绑定。")
 
@@ -3467,8 +3561,11 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 await self.bot.send_message(chat_id, card, parse_mode="html", buttons=buttons, link_preview=False,
                                             reply_to=await self._bot_reply_id(chat_id, msg.id))
                 return
-            if cmd_name == "/call":
-                await self._start_dial(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg.strip())
+            if cmd_name in ("/call", "/vcall"):
+                await self._start_dial(
+                    chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg.strip(),
+                    video=cmd_name == "/vcall",
+                )
                 return
             if cmd_name == "/remark":
                 await self.cmd_remark(chat_id, await self._bot_reply_id(chat_id, msg.id), thread_id, arg)
