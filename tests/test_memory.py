@@ -26,12 +26,24 @@ from bridge.wechat import Media, WeChatClient
 
 
 class LazyImportTests(unittest.TestCase):
-    def test_importing_core_skips_callweb_aiohttp_web_article_curl_cffi_and_rlottie(self):
+    def test_importing_core_skips_callweb_aiohttp_web_article_curl_cffi_pil_draw_font_segno_and_rlottie(self):
         code = (
-            "import sys, bridge.core; "
-            "bad = [m for m in ('bridge.callweb', 'aiohttp.web', 'bridge.article', 'curl_cffi', 'rlottie_python') "
-            "if m in sys.modules]; "
+            "import sys, bridge.core, bridge.cards, bridge.stickers; "
+            "bridge.cards.extract_text_link('hello https://example.com'); "
+            "bad = [m for m in ("
+            "'bridge.callweb', 'aiohttp.web', 'bridge.article', 'curl_cffi', 'rlottie_python', "
+            "'PIL.ImageFont', 'PIL.ImageDraw', 'PIL.ImageChops', 'segno'"
+            ") if m in sys.modules]; "
             "assert not bad, f'eagerly imported: {bad}'"
+        )
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_importing_cards_and_stickers_skips_pillow_until_render(self):
+        code = (
+            "import sys, bridge.cards, bridge.stickers; "
+            "bridge.cards.extract_text_link('hi https://mp.weixin.qq.com/s/abc'); "
+            "assert 'PIL' not in sys.modules, 'PIL should stay unloaded for text link extraction'"
         )
         res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -59,6 +71,8 @@ class ClientAndStoreMemoryTests(unittest.TestCase):
                 self.assertIsNone(b_topics.user)
                 self.assertFalse((Path(tmp) / "data" / "user.session").exists())
                 self.assertEqual(b_topics.bot._entity_cache_limit, core.TG_ENTITY_CACHE_LIMIT)
+                self.assertEqual(b_topics.bot.session._conn.execute("PRAGMA cache_size").fetchone()[0], -512)
+                self.assertEqual(b_topics.bot.session._conn.execute("PRAGMA temp_store").fetchone()[0], 1)
                 self.assertIsNone(b_topics.call_web)
             finally:
                 b_topics.store.db.close()
@@ -75,6 +89,7 @@ class ClientAndStoreMemoryTests(unittest.TestCase):
                 self.assertIsNotNone(b_groups.user)
                 self.assertEqual(b_groups.user._entity_cache_limit, core.TG_ENTITY_CACHE_LIMIT)
                 self.assertEqual(b_groups.bot._entity_cache_limit, core.TG_ENTITY_CACHE_LIMIT)
+                self.assertEqual(b_groups.user.session._conn.execute("PRAGMA cache_size").fetchone()[0], -512)
             finally:
                 b_groups.store.db.close()
                 b_groups.user.session.close()
@@ -86,19 +101,26 @@ class ClientAndStoreMemoryTests(unittest.TestCase):
             try:
                 cache_size = store.db.execute("PRAGMA cache_size").fetchone()[0]
                 journal_limit = store.db.execute("PRAGMA journal_size_limit").fetchone()[0]
+                temp_store = store.db.execute("PRAGMA temp_store").fetchone()[0]
                 self.assertEqual(cache_size, -1024)
                 self.assertEqual(journal_limit, 4194304)
+                self.assertEqual(temp_store, 1)
             finally:
                 store.db.close()
 
-    def test_docker_and_compose_configure_glibc_malloc_limits(self):
+    def test_docker_and_compose_configure_glibc_malloc_and_precompiled_bytecode(self):
+        from bridge import wechat
+
         root = Path(__file__).resolve().parent.parent
         dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
         compose = (root / "compose.yaml").read_text(encoding="utf-8")
         self.assertIn("MALLOC_ARENA_MAX=2", dockerfile)
         self.assertIn("MALLOC_TRIM_THRESHOLD_=65536", dockerfile)
+        self.assertIn("compileall -b -q -f /opt/dist-packages/telethon/tl", dockerfile)
+        self.assertIn("compileall -q", dockerfile)
         self.assertIn("MALLOC_ARENA_MAX", compose)
         self.assertIn("MALLOC_TRIM_THRESHOLD_", compose)
+        self.assertEqual(wechat.MEDIA_SPILL_BYTES, 1 * 1024 * 1024)
 
 
 class IdleCleanupAndBoundsTests(unittest.IsolatedAsyncioTestCase):
@@ -292,16 +314,92 @@ class StickerAndMemTests(unittest.TestCase):
     def test_streaming_pam_reader_handles_rgba_and_rgb_frames(self):
         p1 = bytes([255, 0, 0, 128] * 4)
         p2 = bytes([0, 255, 0] * 4)
-        stream = io.BytesIO(
+        raw_pam = (
             b"P7\nWIDTH 2\nHEIGHT 2\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" + p1
             + b"P7\nWIDTH 2\nHEIGHT 2\nDEPTH 3\nMAXVAL 255\nTUPLTYPE RGB\nENDHDR\n" + p2
         )
-        frames, w, h = stickers._read_pam_rgba_frames(stream)
+        frames, w, h = stickers._read_pam_rgba_frames(io.BytesIO(raw_pam))
         self.assertEqual((len(frames), w, h), (2, 2, 2))
         self.assertEqual(frames[0].mode, "RGBA")
         self.assertEqual(frames[1].mode, "RGBA")
         self.assertEqual(frames[0].getpixel((0, 0)), (255, 0, 0, 128))
         self.assertEqual(frames[1].getpixel((0, 0)), (0, 255, 0, 255))
+
+        # clean_alpha=True zeroes faint sub-128 alpha pixels on arrival without extra cache copies.
+        p_faint = bytes([200, 100, 50, 40] * 4)
+        pam_faint = b"P7\nWIDTH 2\nHEIGHT 2\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n" + p_faint
+        cleaned, _, _ = stickers._read_pam_rgba_frames(io.BytesIO(pam_faint), clean_alpha=True)
+        self.assertEqual(cleaned[0].getpixel((0, 0)), (0, 0, 0, 0))
+
+    def test_precleaned_frames_skip_duplicate_pil_cache_on_target_size(self):
+        frames = [
+            Image.new("RGBA", (32, 32), (255, 0, 0, 255)),
+            Image.new("RGBA", (32, 32), (0, 255, 0, 255)),
+        ]
+        with mock.patch.object(stickers, "_clean_rgba_alpha", wraps=stickers._clean_rgba_alpha) as clean_spy:
+            out = stickers._encode_rgba_attempts_to_gif(
+                ((32, 10.0, 256, "diff", "none"),),
+                0.2,
+                10.0,
+                lambda edge: (edge, edge),
+                lambda n: [i % len(frames) for i in range(n)],
+                lambda idx, _w, _h: frames[idx],
+                None,
+                None,
+                precleaned_size=(32, 32),
+            )
+        self.assertTrue(out.startswith((b"GIF87a", b"GIF89a")))
+        self.assertEqual(clean_spy.call_count, 0)
+
+    def test_pairing_queues_remove_empty_chat_entries_and_closed_dial_drops_members(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = Config(
+                WeChatConfig(token="tok"),
+                TelegramConfig(api_id=1, api_hash="h", bot_token="1:a"),
+                BridgeConfig(mode="groups"),
+                Path(tmp) / "config.toml",
+            )
+            b = core.Bridge(cfg)
+            try:
+                fp = ("text", "hello")
+                b._pair(-500, fp, bot=("wx_t1", "m1", "s1"))
+                self.assertIn(-500, b.unpaired_bot)
+                b._pair(-500, fp, user=42)
+                self.assertNotIn(-500, b.unpaired_bot)
+                self.assertNotIn(-500, b.unpaired_user)
+
+                b._pair_tg_user_msg(-500, fp, user_id=10)
+                self.assertIn(-500, b._unpaired_tg_user)
+                b._pair_tg_user_msg(-500, fp, bot_id=11)
+                self.assertNotIn(-500, b._unpaired_tg_user)
+                self.assertNotIn(-500, b._unpaired_tg_bot)
+
+                req = {
+                    "dial_id": "d1",
+                    "kind": "conference",
+                    "call_type": "voice",
+                    "thread_id": "room@chatroom",
+                    "name": "Test Group",
+                    "chat_id": -1001,
+                    "msg_id": 99,
+                    "live": True,
+                    "dialing": False,
+                    "call_id": None,
+                    "expire_task": None,
+                    "members": [{"id": f"u{i}", "label": f"User {i}", "search": f"u{i}"} for i in range(50)],
+                    "names": {f"u{i}": f"User {i}" for i in range(50)},
+                    "selected": ["u1", "u2"],
+                    "page": 0,
+                    "status_text": "ready",
+                }
+                b.bot.edit_message = mock.AsyncMock()
+                asyncio.run(b._close_dial_request(req, "expired"))
+                self.assertNotIn("members", req)
+                self.assertEqual(set(req["names"]), {"u1", "u2"})
+            finally:
+                b.store.db.close()
+                b.user.session.close()
+                b.bot.session.close()
 
     def test_rgba_frames_have_alpha_supports_pil_and_bytes(self):
         opaque = Image.new("RGBA", (4, 4), (10, 20, 30, 255))

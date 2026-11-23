@@ -139,8 +139,10 @@ RUN apt-get update \
     && echo 'faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9  /stage/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf' \
         | sha256sum -c -
 
-# Install Python deps without .pyc bytecode, strip unstripped DWARF debug info from wheel .so
-# binaries (notably curl_cffi/_wrapper.abi3.so, aiohttp, Pillow), and deduplicate rlottie copies.
+# Precompile bytecode so CPython never builds a ~175 MiB AST for telethon/tl/types/__init__.py at
+# startup (which otherwise fragments glibc's heap and adds ~38 MiB permanent RSS). Auto-generated
+# telethon/tl + telethon/errors classes are compiled with -OO -b into sourceless .pyc (stripping
+# thousands of docstrings while keeping runtime asserts active), and wheel .so DWARF info is stripped.
 WORKDIR /build
 COPY requirements.txt .
 RUN pip install --no-cache-dir --no-compile --disable-pip-version-check \
@@ -148,6 +150,9 @@ RUN pip install --no-cache-dir --no-compile --disable-pip-version-check \
     && find /opt/dist-packages -type f \( -name '*.so' -o -name '*.so.*' \) -exec strip --strip-unneeded {} + \
     && rm -rf /opt/dist-packages/bin \
     && find /opt/dist-packages -type d -name '__pycache__' -exec rm -rf {} + \
+    && python3 -OO -m compileall -b -q -f /opt/dist-packages/telethon/tl /opt/dist-packages/telethon/errors \
+    && find /opt/dist-packages/telethon/tl /opt/dist-packages/telethon/errors -type f -name '*.py' -delete \
+    && python3 -m compileall -q -j"$(nproc)" /opt/dist-packages \
     && rl=/opt/dist-packages/rlottie_python \
     && real=$(find "$rl" -maxdepth 1 -type f -name 'librlottie.so.*.*' | head -n 1) \
     && if [ -n "$real" ]; then \
@@ -158,6 +163,9 @@ RUN pip install --no-cache-dir --no-compile --disable-pip-version-check \
             fi; \
         done; \
     fi
+
+COPY bridge /stage/app/bridge
+RUN python3 -m compileall -q -j"$(nproc)" /stage/app/bridge
 
 FROM gcr.io/distroless/python3-debian13:nonroot
 
@@ -174,7 +182,7 @@ COPY --from=builder /stage/usr/share/fonts/ /usr/share/fonts/
 COPY --from=builder /opt/dist-packages /usr/local/lib/python3.13/dist-packages
 
 WORKDIR /app
-COPY bridge ./bridge
+COPY --from=builder /stage/app/bridge ./bridge
 
 # Runtime state (bridge.db, Telegram sessions) lives in /app/data, mounted as a volume (UID 10002).
 # /app/config may hold an optional config.toml with advanced settings.

@@ -178,7 +178,7 @@ class Media:
 
 
 # Downloads up to this size stay in memory; larger ones are streamed to a temp file.
-MEDIA_SPILL_BYTES = 8 * 1024 * 1024
+MEDIA_SPILL_BYTES = 1 * 1024 * 1024
 
 
 class _MediaTooLarge(Exception):

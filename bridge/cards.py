@@ -6,11 +6,23 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
-
 from . import stickers
+
+if TYPE_CHECKING:  # pragma: no cover
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+else:
+    Image = ImageDraw = ImageFont = ImageOps = None
+
+
+def _ensure_pil() -> None:
+    """Lazily import Pillow (and its C image/font libraries) on first card render."""
+    global Image, ImageDraw, ImageFont, ImageOps
+    if Image is None:
+        from PIL import Image as _Image, ImageDraw as _ImageDraw, ImageFont as _ImageFont, ImageOps as _ImageOps
+        Image, ImageDraw, ImageFont, ImageOps = _Image, _ImageDraw, _ImageFont, _ImageOps
 
 CARD_WIDTH = 800
 PAD_X = 34
@@ -454,6 +466,7 @@ def identify_link_source(link: dict | None, app_type: int | None = None) -> Link
 def _ttc_sc_index(path: str) -> int:
     if not path.lower().endswith(".ttc"):
         return 0
+    _ensure_pil()
     for idx in range(6):
         try:
             f = ImageFont.truetype(path, 24, index=idx)
@@ -480,6 +493,7 @@ def _font_paths() -> tuple[str | None, str | None, str | None, bool]:
 
 @lru_cache(maxsize=12)
 def _load_font(path: str | None, size: int, *, index: int | None = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    _ensure_pil()
     if path:
         idx = _ttc_sc_index(path) if index is None else index
         try:
@@ -497,6 +511,7 @@ def _emoji_font() -> ImageFont.FreeTypeFont | None:
     _, _, emoji_path, _ = _font_paths()
     if not emoji_path:
         return None
+    _ensure_pil()
     for strike in (109, 128, 72, 64):
         try:
             return ImageFont.truetype(emoji_path, strike)
@@ -553,6 +568,7 @@ def _render_emoji_glyph(cluster: str, size: int) -> Image.Image | None:
     efont = _emoji_font()
     if efont is None:
         return None
+    _ensure_pil()
     canvas = Image.new("RGBA", (180, 180), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     try:
@@ -680,6 +696,7 @@ def _draw_faux_bold_text(canvas: Image.Image, pos: tuple[int, int], chunk: str,
 def _draw_mixed_text(canvas: Image.Image, draw: ImageDraw.ImageDraw, pos: tuple[int, int],
                      text: str, font, size: int, fill: tuple[int, int, int], *,
                      faux_bold_path: str | None = None) -> None:
+    _ensure_pil()
     x, y = float(pos[0]), float(pos[1])
     buf: list[str] = []
     use_faux = bool(faux_bold_path and isinstance(font, ImageFont.FreeTypeFont))
@@ -712,6 +729,7 @@ def _draw_mixed_text(canvas: Image.Image, draw: ImageDraw.ImageDraw, pos: tuple[
 
 
 def _decode_thumb(data: bytes) -> Image.Image | None:
+    _ensure_pil()
     try:
         if data.startswith(b"wxgf"):
             ffmpeg = stickers.find_ffmpeg()
@@ -728,6 +746,7 @@ def _decode_thumb(data: bytes) -> Image.Image | None:
 
 
 def _draw_rounded_thumb(canvas: Image.Image, thumb: Image.Image, box: tuple[int, int, int, int], radius: int) -> None:
+    _ensure_pil()
     x, y, size = box[0], box[1], box[2] - box[0]
     scale = 4
     fitted = ImageOps.fit(thumb, (size, size), Image.LANCZOS)
@@ -751,6 +770,7 @@ def _draw_rounded_thumb(canvas: Image.Image, thumb: Image.Image, box: tuple[int,
 
 def _draw_brand_badge(canvas: Image.Image, x: int, y: int, size: int, source: LinkSource,
                       bold_path: str | None, has_cjk: bool, *, faux_bold: bool = False) -> None:
+    _ensure_pil()
     scale = 4
     s = size * scale
     badge = Image.new("RGBA", (s, s), (0, 0, 0, 0))

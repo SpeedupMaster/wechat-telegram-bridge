@@ -12,7 +12,6 @@ import time
 import uuid
 
 import httpx
-import segno
 from telethon import Button, errors, utils
 
 from .wechat import NoAccountYet, WeChatError
@@ -24,6 +23,8 @@ MAX_PAIRING_FAILURES = 10
 
 
 def qr_png(data: str) -> io.BytesIO:
+    import segno
+
     buf = io.BytesIO()
     segno.make(data, error="m").save(buf, kind="png", scale=8, border=3)
     buf.seek(0)

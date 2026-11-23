@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from .article import USER_AGENT, Article, ArticleError, MAX_PAGE_BYTES, MAX_REDIRECTS
+from .mem import maybe_trim_memory
 
 import httpx
 
@@ -110,10 +111,14 @@ def extract_state(page: str) -> dict | None:
         return None
     end = page.find("</script>", m.end())
     raw = page[m.end():end if end > 0 else None].strip().rstrip(";")
+    if "undefined" in raw:
+        raw = _UNDEFINED_RE.sub(r"\1null", raw)
     try:
-        state = json.loads(_UNDEFINED_RE.sub(r"\1null", raw))
+        state = json.loads(raw)
     except ValueError:
         return None
+    finally:
+        raw = ""
     return state if isinstance(state, dict) else None
 
 
@@ -278,7 +283,9 @@ async def fetch_note(url: str, session: Any, *, uses_curl: bool, net_errors: tup
                     buf += chunk
                     if len(buf) > MAX_PAGE_BYTES:
                         raise ArticleError("笔记页面过大", code="too_large", fallback_original=True)
+                raw_len = len(buf)
                 page = buf.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
+                buf.clear()
                 try:
                     return parse_note(page, current)
                 except ArticleError as e:
@@ -286,6 +293,10 @@ async def fetch_note(url: str, session: Any, *, uses_curl: bool, net_errors: tup
                     log.info("Xiaohongshu page not usable [%s] (%d bytes, title %r)", e.code, len(page),
                              html.unescape(m.group(1)).strip() if m else "")
                     raise
+                finally:
+                    page = ""
+                    if raw_len >= 1024 * 1024:
+                        maybe_trim_memory()
         raise ArticleError(_FALLBACK, code="too_many_redirects", fallback_original=True)
     except (httpx.HTTPError, *net_errors) as e:
         raise ArticleError(f"无法连接小红书（{type(e).__name__}），正在打开原笔记…", code="network",

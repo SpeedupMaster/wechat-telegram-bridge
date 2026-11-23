@@ -907,6 +907,17 @@ def _tg_text_to_wx(text: str, mention_spans: list[tuple[int, int]]) -> str:
     return "".join(out)
 
 
+def _tune_tg_session(client: TelegramClient | None) -> None:
+    """Bound Telethon's SQLiteSession page cache and keep temp B-trees off the heap."""
+    conn = getattr(getattr(client, "session", None), "_conn", None)
+    if conn is not None:
+        try:
+            conn.execute("PRAGMA cache_size=-512")
+            conn.execute("PRAGMA temp_store=FILE")
+        except Exception:
+            pass
+
+
 class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -927,6 +938,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             str(data / "bot"), tg.api_id, tg.api_hash, proxy=proxy,
             flood_sleep_threshold=60, entity_cache_limit=TG_ENTITY_CACHE_LIMIT,
         )
+        _tune_tg_session(self.user)
+        _tune_tg_session(self.bot)
         self.max_media = cfg.bridge.max_media_mb * 1024 * 1024
         self.pending_sends: dict[str, int] = defaultdict(int)  # wx thread -> in-flight sends from Telegram
         self.create_lock = asyncio.Lock()
@@ -1988,14 +2001,21 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
     def _pair(self, chat: int, fp: tuple, bot: tuple | None = None, user: int | None = None) -> None:
         now = time.monotonic()
         mine, other = (self.unpaired_bot, self.unpaired_user) if bot else (self.unpaired_user, self.unpaired_bot)
-        for q in (mine[chat], other[chat]):
-            q[:] = [e for e in q if now - e[2] < 300][-50:]
-        for i, (ofp, payload, _) in enumerate(other[chat]):
-            if ofp == fp:
-                del other[chat][i]
-                user_id, wx = (payload, bot) if bot else (user, payload)
-                self.store.map_message(chat, "user", user_id, *wx)
-                return
+        for d in (mine, other):
+            if q := d.get(chat):
+                q[:] = [e for e in q if now - e[2] < 300][-50:]
+                if not q:
+                    d.pop(chat, None)
+        oq = other.get(chat)
+        if oq:
+            for i, (ofp, payload, _) in enumerate(oq):
+                if ofp == fp:
+                    del oq[i]
+                    if not oq:
+                        other.pop(chat, None)
+                    user_id, wx = (payload, bot) if bot else (user, payload)
+                    self.store.map_message(chat, "user", user_id, *wx)
+                    return
         mine[chat].append((fp, bot or user, now))
 
     async def on_bot_sees_user_message(self, event) -> None:
@@ -2022,14 +2042,21 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         now = time.monotonic()
         mine, other = (self._unpaired_tg_user, self._unpaired_tg_bot) if user_id is not None else (
             self._unpaired_tg_bot, self._unpaired_tg_user)
-        for q in (mine[chat_id], other[chat_id]):
-            q[:] = [e for e in q if now - e[2] < 300][-50:]
-        for i, (ofp, payload, _) in enumerate(other[chat_id]):
-            if ofp == fp:
-                del other[chat_id][i]
-                uid, bid = (user_id, payload) if user_id is not None else (payload, bot_id)
-                self._record_user_bot_pair(chat_id, uid, bid)
-                return
+        for d in (mine, other):
+            if q := d.get(chat_id):
+                q[:] = [e for e in q if now - e[2] < 300][-50:]
+                if not q:
+                    d.pop(chat_id, None)
+        oq = other.get(chat_id)
+        if oq:
+            for i, (ofp, payload, _) in enumerate(oq):
+                if ofp == fp:
+                    del oq[i]
+                    if not oq:
+                        other.pop(chat_id, None)
+                    uid, bid = (user_id, payload) if user_id is not None else (payload, bot_id)
+                    self._record_user_bot_pair(chat_id, uid, bid)
+                    return
         mine[chat_id].append((fp, user_id if user_id is not None else bot_id, now))
 
     async def _bot_reply_id(self, chat_id: int, user_msg_id: int | None, *, wait: bool = True) -> int | None:
@@ -3304,11 +3331,16 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         req["live"] = False
         req["status_text"] = status
         task = req.get("expire_task")
+        req["expire_task"] = None
         if task is not None and not task.done() and task is not asyncio.current_task():
             task.cancel()
         if self.call_web is not None:
             await self.call_web.on_dial_changed(req)
         text, _ = self._render_dial(req)
+        req.pop("members", None)
+        if names := req.get("names"):
+            shown_ids = (req.get("selected") or ())[:DIAL_PICK_SHOWN]
+            req["names"] = {cid: names[cid] for cid in shown_ids if cid in names}
         try:
             await self.bot.edit_message(req["chat_id"], req["msg_id"], text, parse_mode="html", buttons=None,
                                         link_preview=False)

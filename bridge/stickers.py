@@ -27,10 +27,27 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
-
-from PIL import Image, ImageChops, ImageSequence, ImageStat
+from typing import TYPE_CHECKING
 
 from .mem import maybe_trim_memory
+
+if TYPE_CHECKING:  # pragma: no cover
+    from PIL import Image, ImageChops, ImageSequence, ImageStat
+else:
+    Image = ImageChops = ImageSequence = ImageStat = None
+
+
+def _ensure_pil() -> None:
+    """Lazily import Pillow on first sticker, avatar, or video-thumbnail operation."""
+    global Image, ImageChops, ImageSequence, ImageStat
+    if Image is None:
+        from PIL import (
+            Image as _Image,
+            ImageChops as _ImageChops,
+            ImageSequence as _ImageSequence,
+            ImageStat as _ImageStat,
+        )
+        Image, ImageChops, ImageSequence, ImageStat = _Image, _ImageChops, _ImageSequence, _ImageStat
 
 log = logging.getLogger("stickers")
 
@@ -107,6 +124,7 @@ def find_gifsicle() -> str | None:
 
 
 def on_white(im: Image.Image) -> Image.Image:
+    _ensure_pil()
     im = im.convert("RGBA")
     bg = Image.new("RGB", im.size, "white")
     bg.paste(im, mask=im.getchannel("A"))
@@ -122,12 +140,14 @@ def _tgs_size(anim, max_edge: int) -> tuple[int, int]:
 
 
 def _render_tgs_rgba(anim, frame_num: int, width: int, height: int) -> Image.Image:
+    _ensure_pil()
     # rlottie renders premultiplied BGRA bytes; unpremultiplying avoids dark halos on translucent pixels.
     buf = anim.lottie_animation_render(frame_num=frame_num, width=width, height=height)
     return Image.frombuffer("RGBa", (width, height), buf, "raw", "BGRa").convert("RGBA")
 
 
 def _resize_rgba(im: Image.Image, width: int, height: int) -> Image.Image:
+    _ensure_pil()
     rgba = im.convert("RGBA")
     if rgba.size == (width, height):
         return rgba
@@ -330,6 +350,7 @@ def wxgf_to_tg_sticker(data: bytes, ffmpeg: str) -> tuple[str, bytes, dict]:
                                   *inputs(with_mask), "-filter_complex", f"{merge(with_mask)}{crop}format=rgba[v]",
                                   "-map", "[v]", "-frames:v", "1", png], capture_output=True, timeout=30)
             if res.returncode == 0 and os.path.exists(png):
+                _ensure_pil()
                 with Image.open(png) as im:
                     im.load()
                     webp, w, h = wechat_image_to_tg_webp(im)
@@ -344,6 +365,7 @@ def wxgf_to_tg_sticker(data: bytes, ffmpeg: str) -> tuple[str, bytes, dict]:
 
 def wxgf_to_image(data: bytes, ffmpeg: str) -> Image.Image:
     """First frame of a WeChat wxgf image (used for avatars and stickers that come in this format)."""
+    _ensure_pil()
     with tempfile.TemporaryDirectory() as tmp:
         src, out = os.path.join(tmp, "in.hevc"), os.path.join(tmp, "out.png")
         with open(src, "wb") as f:
@@ -371,6 +393,7 @@ def _fit_size(w: int, h: int, max_edge: int, *, even: bool = False, upscale: boo
 
 
 def _rgba_frame_to_pal(im: Image.Image, max_colors: int = 255) -> tuple[Image.Image, bool]:
+    _ensure_pil()
     im = im.convert("RGBA")
     alpha = im.getchannel("A")
     has_alpha = alpha.getextrema()[0] < 128
@@ -389,6 +412,7 @@ def _rgba_frame_to_pal(im: Image.Image, max_colors: int = 255) -> tuple[Image.Im
 
 def _rgba_to_transparent_gif_pillow(frames: list[tuple[Image.Image, int]], max_edge: int = WX_STICKER_SIZE,
                                     max_colors: int = 255) -> bytes:
+    _ensure_pil()
     pals: list[Image.Image] = []
     durations: list[int] = []
     any_alpha = False
@@ -419,6 +443,7 @@ _GIFSICLE_FAST_SKIP_BYTES = 96 * 1024
 
 def _clean_rgba_alpha(im: Image.Image) -> Image.Image:
     """Zero RGB on sub-128 alpha pixels so faint edge halos and invisible jitter vanish cleanly."""
+    _ensure_pil()
     rgba = im.convert("RGBA")
     lo, _ = rgba.getchannel("A").getextrema()
     if lo >= 128:
@@ -429,6 +454,7 @@ def _clean_rgba_alpha(im: Image.Image) -> Image.Image:
 
 
 def _rgba_frames_have_alpha(frames: Sequence[Image.Image | bytes]) -> bool:
+    _ensure_pil()
     for frame in frames:
         if isinstance(frame, Image.Image):
             rgba = frame if frame.mode == "RGBA" else frame.convert("RGBA")
@@ -451,6 +477,7 @@ def _dedup_sampled_frames(
     rms_thresh: float,
 ) -> tuple[list[int], list[Image.Image], list[int]]:
     """Collapse consecutive identical or visually still sampled frames and accumulate their durations."""
+    _ensure_pil()
     n_out = len(indices)
     kept_indices: list[int] = []
     kept_pils: list[Image.Image] = []
@@ -543,6 +570,7 @@ def _gif_palette_vf(max_colors: int, stats_mode: str, dither: str, *, transparen
 def _ffmpeg_rgba_to_gif(frames: Sequence[Image.Image | bytes], width: int, height: int, fps: float, ffmpeg: str,
                         *, max_colors: int = 256, stats_mode: str = "full",
                         dither: str = "none") -> bytes:
+    _ensure_pil()
     transparent = _rgba_frames_have_alpha(frames)
     vf = _gif_palette_vf(max_colors, stats_mode, dither, transparent=transparent)
     with tempfile.TemporaryDirectory() as tmp:
@@ -648,6 +676,7 @@ def _encode_rgba_attempts_to_gif(
     static_max_edge: int | None = None,
     max_diff_thresh: int = 4,
     rms_thresh: float = 0.6,
+    precleaned_size: tuple[int, int] | None = None,
 ) -> bytes:
     """Encode an RGBA animation using target-edge-first quality preservation, still-frame merging, and fast convergence."""
     pil_cache: dict[tuple[int, int, int], Image.Image] = {}
@@ -660,6 +689,8 @@ def _encode_rgba_attempts_to_gif(
     eff_fast_bytes = default_fast_bytes(target_edge) if fast_bytes is None else fast_bytes
 
     def get_pil(idx: int, w: int, h: int) -> Image.Image:
+        if precleaned_size is not None and (w, h) == precleaned_size:
+            return load_frame(idx, w, h)
         key = (w, h, idx)
         if key not in pil_cache:
             pil_cache[key] = _clean_rgba_alpha(load_frame(idx, w, h))
@@ -723,29 +754,42 @@ def webp_to_wechat_gif(
     static_max_edge: int = WX_STICKER_STATIC_SIZE,
     fast_bytes: int | None = None,
 ) -> bytes:
-    im = Image.open(io.BytesIO(data))
-    im.load()
+    _ensure_pil()
     gifsicle = find_gifsicle()
-    n_frames = getattr(im, "n_frames", 1)
-    if n_frames <= 1:
-        eff_fast = default_fast_bytes(static_max_edge) if fast_bytes is None else fast_bytes
-        return _encode_static_rgba_to_gif(im, static_max_edge, eff_fast, gifsicle)
+    with Image.open(io.BytesIO(data)) as im:
+        n_frames = getattr(im, "n_frames", 1)
+        if n_frames <= 1:
+            im.load()
+            eff_fast = default_fast_bytes(static_max_edge) if fast_bytes is None else fast_bytes
+            return _encode_static_rgba_to_gif(im, static_max_edge, eff_fast, gifsicle)
 
-    src_frames: list[Image.Image] = []
-    ends_ms: list[int] = []
-    acc = 0
-    max_ms = int(WX_STICKER_MAX_SECONDS * 1000)
-    for frame in ImageSequence.Iterator(im):
-        d = max(20, int(frame.info.get("duration") or 50))
-        if acc + d > max_ms and src_frames:
-            break
-        src_frames.append(frame.convert("RGBA"))
-        acc += d
-        ends_ms.append(acc)
+        orig_w, orig_h = im.size
+        base_w, base_h = _fit_size(orig_w, orig_h, max_edge)
+        src_frames: list[Image.Image] = []
+        ends_ms: list[int] = []
+        acc = 0
+        max_ms = int(WX_STICKER_MAX_SECONDS * 1000)
+        for frame in ImageSequence.Iterator(im):
+            frame.load()
+            d = max(20, int(frame.info.get("duration") or 50))
+            if acc + d > max_ms and src_frames:
+                break
+            src_frames.append(_clean_rgba_alpha(_resize_rgba(frame, base_w, base_h)))
+            acc += d
+            ends_ms.append(acc)
+
+    def load_scaled(idx: int, w: int, h: int) -> Image.Image:
+        if (w, h) == (base_w, base_h):
+            return src_frames[idx]
+        if w > base_w or h > base_h:
+            with Image.open(io.BytesIO(data)) as raw_im:
+                if idx:
+                    raw_im.seek(idx)
+                return _resize_rgba(raw_im, w, h)
+        return _resize_rgba(src_frames[idx], w, h)
 
     duration = max(0.05, acc / 1000.0)
     src_fps = len(src_frames) / duration
-    orig_w, orig_h = im.size
     return _encode_rgba_attempts_to_gif(
         _gif_attempts(duration, max_edge),
         duration,
@@ -755,11 +799,12 @@ def webp_to_wechat_gif(
             min(len(src_frames) - 1, bisect.bisect_right(ends_ms, (i + 0.5) * acc / n_out))
             for i in range(n_out)
         ],
-        lambda idx, w, h: _resize_rgba(src_frames[idx], w, h),
+        load_scaled,
         ffmpeg,
         gifsicle,
         fast_bytes=fast_bytes,
         static_max_edge=static_max_edge,
+        precleaned_size=(base_w, base_h),
     )
 
 
@@ -819,7 +864,9 @@ def _read_exact(stream, size: int) -> bytes:
     return bytes(buf)
 
 
-def _read_pam_rgba_frames(stream, *, allow_empty: bool = False) -> tuple[list[Image.Image], int, int]:
+def _read_pam_rgba_frames(stream, *, allow_empty: bool = False,
+                          clean_alpha: bool = False) -> tuple[list[Image.Image], int, int]:
+    _ensure_pil()
     frames: list[Image.Image] = []
     width, height = 0, 0
     while True:
@@ -849,6 +896,8 @@ def _read_pam_rgba_frames(stream, *, allow_empty: bool = False) -> tuple[list[Im
         im = Image.frombytes(mode, (w, h), px)
         if mode != "RGBA":
             im = im.convert("RGBA")
+        elif clean_alpha:
+            im = _clean_rgba_alpha(im)
         width, height = w, h
         frames.append(im)
     if not frames and not allow_empty:
@@ -902,7 +951,9 @@ def _decode_video_rgba_frames(
             try:
                 assert proc.stdout is not None
                 try:
-                    frames, width, height = _read_pam_rgba_frames(proc.stdout, allow_empty=True)
+                    frames, width, height = _read_pam_rgba_frames(
+                        proc.stdout, allow_empty=True, clean_alpha=preserve_alpha
+                    )
                 finally:
                     proc.stdout.close()
                 returncode = proc.wait()
@@ -951,12 +1002,13 @@ def _transcode_video_to_wechat_gif(
         base_fps,
         lambda edge: _fit_size(orig_w, orig_h, edge),
         lambda n_out: [min(len(src_frames) - 1, int(i * len(src_frames) / n_out)) for i in range(n_out)],
-        lambda idx, w, h: _resize_rgba(src_frames[idx], w, h),
+        lambda idx, w, h: src_frames[idx] if (w, h) == (orig_w, orig_h) else _resize_rgba(src_frames[idx], w, h),
         ffmpeg,
         gifsicle,
         fast_bytes=fast_bytes,
         max_diff_thresh=8,
         rms_thresh=1.2,
+        precleaned_size=(orig_w, orig_h),
     )
 
 
@@ -985,6 +1037,7 @@ def gif_media_to_wechat_gif(
     """Convert a Telegram GIF (MP4, WebM, or GIF) into a <=max_edge <=1MB WeChat sticker GIF."""
     eff_fast = default_fast_bytes(max_edge) if fast_bytes is None else fast_bytes
     if mime == "image/gif" or data[:6] in (b"GIF87a", b"GIF89a"):
+        _ensure_pil()
         im = Image.open(io.BytesIO(data))
         n_frames = getattr(im, "n_frames", 1)
         if n_frames <= 1:
@@ -1114,6 +1167,7 @@ async def _run_wechat_sticker_convert(
         if cache is not None:
             cache.put(key, out)
         try:
+            _ensure_pil()
             with Image.open(io.BytesIO(out)) as gim:
                 log.info("Converted %s %s (%d B) -> %dx%d GIF (%d frames, %d B) in %.2fs",
                          mime, label, len(data), gim.size[0], gim.size[1], getattr(gim, "n_frames", 1),
@@ -1206,6 +1260,7 @@ def wechat_image_to_tg_webp(im: Image.Image) -> tuple[bytes, int, int]:
 
 
 def wechat_gif_to_tg_webm(data: bytes, ffmpeg: str) -> tuple[bytes, int, int, float] | None:
+    _ensure_pil()
     im = Image.open(io.BytesIO(data))
     n_frames = getattr(im, "n_frames", 1)
     if n_frames <= 1:
@@ -1262,6 +1317,7 @@ def from_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes, dict] | Non
             webp, w, h = wechat_image_to_tg_webp(wxgf_to_image(data, ffmpeg))
             return "static", webp, {"w": w, "h": h}
         if mime == "image/gif":
+            _ensure_pil()
             im = Image.open(io.BytesIO(data))
             if getattr(im, "n_frames", 1) > 1:
                 if not ffmpeg:
@@ -1275,6 +1331,7 @@ def from_wechat_sticker(data: bytes, mime: str) -> tuple[str, bytes, dict] | Non
             webp, w, h = wechat_image_to_tg_webp(im)
             return "static", webp, {"w": w, "h": h}
         if mime in ("image/png", "image/jpeg", "image/webp"):
+            _ensure_pil()
             im = Image.open(io.BytesIO(data))
             im.load()
             webp, w, h = wechat_image_to_tg_webp(im)
@@ -1314,6 +1371,7 @@ def extract_video_meta_and_thumb(data: bytes, filename: str = "video.mp4", *,
             )
             if res.returncode != 0 or not os.path.exists(frame):
                 return None
+            _ensure_pil()
             with Image.open(frame) as im:
                 im.load()
                 w, h = im.size
