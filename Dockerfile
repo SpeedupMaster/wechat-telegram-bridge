@@ -28,7 +28,7 @@ RUN set -eux; \
         dpkg --add-architecture "$target_arch"; \
         apt-get update; \
         apt-get install -y --no-install-recommends \
-            "binutils-${gnu_host}" ca-certificates curl "gcc-${gnu_host}" make pkgconf xz-utils $asm_pkg \
+            "binutils-${gnu_host}" ca-certificates curl gcc "gcc-${gnu_host}" libc6-dev make pkgconf xz-utils $asm_pkg \
             "libc6-dev:${target_arch}" "libdav1d-dev:${target_arch}" \
             "libopus-dev:${target_arch}" "libvpx-dev:${target_arch}" "zlib1g-dev:${target_arch}"; \
         cross_args="--enable-cross-compile --arch=${ff_arch} --target-os=linux --cross-prefix=${gnu_host}-"; \
@@ -130,7 +130,7 @@ RUN apt-get update \
         /stage/usr/share/fonts/truetype/noto \
         /stage/app/data /stage/app/config \
     && cp /usr/bin/gifsicle /usr/bin/tini /stage/usr/bin/ \
-    && python3 -m fontTools.subset /usr/share/fonts/truetype/noto/NotoColorEmoji.ttf \
+    && /usr/bin/python3 -m fontTools.subset /usr/share/fonts/truetype/noto/NotoColorEmoji.ttf \
         "--unicodes=*" "--layout-features=" \
         --output-file=/stage/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf \
     && curl -fsSL --retry 3 --retry-delay 2 \
