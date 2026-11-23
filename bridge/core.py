@@ -5,35 +5,51 @@ import asyncio
 import html
 import io
 import logging
+import os
 import re
 import secrets
+import shutil
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx
 from telethon import Button, TelegramClient, errors, events, functions, types, utils
 
 from .config import Config
-from . import cards, stickers
-from . import callweb, tghtml
-from .callweb import CallActionError, CallWeb
+from . import cards, stickers, tghtml, wechat
 from .contacts import ContactsMixin, friendly as contact_error
 from .emojis import WX_EMOJIS, replace_wx_emojis, unicode_to_wx_emojis
 from .groups import GROUP_COMMANDS, GroupsMixin
 from .login import LoginMixin
+from .mem import maybe_trim_memory
 from .store import Store
 from .wechat import (APP, APP_BIG_XML, APP_CHANNELS, APP_FILE, APP_FORWARDED, APP_QUOTE, APP_UPLOAD_NOTICE, IMAGE,
                      LOCATION, SEND_OK, STICKER, SYSTEM, TEXT, VIDEO, VOICE, CursorExpired, Media, WeChatClient,
                      WeChatError, is_group_id, is_wecom_group_id)
 
+if TYPE_CHECKING:  # pragma: no cover
+    from .callweb import CallWeb
+
 log = logging.getLogger("bridge")
 
 TG_TEXT_LIMIT = 4000
 TG_CAPTION_LIMIT = 1000
+TG_ENTITY_CACHE_LIMIT = 500
+NAMES_CACHE_MAX = 4000
+CARD_CACHE_IDLE_SECONDS = 600.0
+TRIM_MEDIA_BYTES = 1 * 1024 * 1024
 DEAD_CHAT_ERRORS = (errors.ChatWriteForbiddenError, errors.ChatIdInvalidError, errors.PeerIdInvalidError,
                     errors.ChannelPrivateError, errors.ChatAdminRequiredError)
+
+
+def _callweb():
+    """Lazily import bridge.callweb (and aiohttp) only when the Mini App / call page is used."""
+    from . import callweb
+    return callweb
 
 
 def _dead_chat(e: Exception) -> bool:
@@ -659,7 +675,7 @@ _IMAGE_EXT_MIME = {
 }
 
 
-def _image_from_file(data: bytes, mime: str, name: str, ext: str) -> Media | None:
+def _image_from_file(data: bytes, mime: str, name: str, ext: str, *, path: str | None = None) -> Media | None:
     """Validate/prepare an image sent as a Telegram file so WeChat receives it as an original image."""
     from PIL import Image, ImageOps
     norm_mime = mime.split(";")[0].strip().lower()
@@ -672,34 +688,33 @@ def _image_from_file(data: bytes, mime: str, name: str, ext: str) -> Media | Non
     if not is_img:
         return None
     try:
-        im = Image.open(io.BytesIO(data))
-        w, h = im.size
-        fmt = (im.format or "").upper()
+        byte_len = os.path.getsize(path) if path is not None else len(data)
+        src = path if path is not None else io.BytesIO(data)
+        with Image.open(src) as im:
+            w, h = im.size
+            fmt = (im.format or "").upper()
+            if fmt == "GIF" and getattr(im, "n_frames", 1) > 1:
+                return None  # keep animated GIF as a file so WeChat doesn't flatten it to a static image
+            if fmt == "JPEG":
+                if byte_len <= WX_IMAGE_MAX_BYTES and max(w, h) <= WX_JPEG_MAX_EDGE and w * h <= WX_JPEG_MAX_PIXELS:
+                    out_name = name if file_ext in (".jpg", ".jpeg") else (
+                        (name.rsplit(".", 1)[0] if "." in name else name) + ".jpg")
+                    return Media(data, "image/jpeg", out_name, path=path)
+                return None
+            direct_mime = {"PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}.get(fmt)
+            if direct_mime and byte_len <= WX_IMAGE_MAX_BYTES and max(w, h) <= WX_OTHER_IMAGE_MAX_EDGE and w * h <= WX_OTHER_IMAGE_MAX_PIXELS:
+                return Media(data, direct_mime, name, path=path)
+            if max(w, h) <= WX_JPEG_MAX_EDGE and w * h <= WX_JPEG_MAX_PIXELS:
+                im.load()
+                im = ImageOps.exif_transpose(im)
+                out = io.BytesIO()
+                stickers.on_white(im).save(out, "JPEG", quality=95)
+                jpg = out.getvalue()
+                if len(jpg) <= WX_IMAGE_MAX_BYTES:
+                    stem = name.rsplit(".", 1)[0] if "." in name else name
+                    return Media(jpg, "image/jpeg", f"{stem}.jpg")
     except Exception:
         return None
-    if fmt == "GIF" and getattr(im, "n_frames", 1) > 1:
-        return None  # keep animated GIF as a file so WeChat doesn't flatten it to a static image
-    if fmt == "JPEG":
-        if len(data) <= WX_IMAGE_MAX_BYTES and max(w, h) <= WX_JPEG_MAX_EDGE and w * h <= WX_JPEG_MAX_PIXELS:
-            out_name = name if file_ext in (".jpg", ".jpeg") else (
-                (name.rsplit(".", 1)[0] if "." in name else name) + ".jpg")
-            return Media(data, "image/jpeg", out_name)
-        return None
-    direct_mime = {"PNG": "image/png", "WEBP": "image/webp", "GIF": "image/gif"}.get(fmt)
-    if direct_mime and len(data) <= WX_IMAGE_MAX_BYTES and max(w, h) <= WX_OTHER_IMAGE_MAX_EDGE and w * h <= WX_OTHER_IMAGE_MAX_PIXELS:
-        return Media(data, direct_mime, name)
-    if max(w, h) <= WX_JPEG_MAX_EDGE and w * h <= WX_JPEG_MAX_PIXELS:
-        try:
-            im.load()
-            im = ImageOps.exif_transpose(im)
-            out = io.BytesIO()
-            stickers.on_white(im).save(out, "JPEG", quality=95)
-            jpg = out.getvalue()
-            if len(jpg) <= WX_IMAGE_MAX_BYTES:
-                stem = name.rsplit(".", 1)[0] if "." in name else name
-                return Media(jpg, "image/jpeg", f"{stem}.jpg")
-        except Exception:
-            return None
     return None
 
 
@@ -900,12 +915,18 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self.store = Store(data / "bridge.db")
         self.sticker_cache = stickers.StickerDiskCache(data / "sticker_cache")
         self.wx = WeChatClient(cfg.wechat.base_url, cfg.wechat.read_token(), cfg.wechat.account)
+        # Topics mode: everything happens in one forum supergroup and only the bot is used.
+        self.topics = cfg.bridge.mode == "topics"
         tg = cfg.telegram
         proxy = _proxy(tg.proxy)
-        self.user = TelegramClient(str(data / "user"), tg.api_id, tg.api_hash, proxy=proxy,
-                                   flood_sleep_threshold=120)
-        self.bot = TelegramClient(str(data / "bot"), tg.api_id, tg.api_hash, proxy=proxy,
-                                  flood_sleep_threshold=60)
+        self.user = None if self.topics else TelegramClient(
+            str(data / "user"), tg.api_id, tg.api_hash, proxy=proxy,
+            flood_sleep_threshold=120, entity_cache_limit=TG_ENTITY_CACHE_LIMIT,
+        )
+        self.bot = TelegramClient(
+            str(data / "bot"), tg.api_id, tg.api_hash, proxy=proxy,
+            flood_sleep_threshold=60, entity_cache_limit=TG_ENTITY_CACHE_LIMIT,
+        )
         self.max_media = cfg.bridge.max_media_mb * 1024 * 1024
         self.pending_sends: dict[str, int] = defaultdict(int)  # wx thread -> in-flight sends from Telegram
         self.create_lock = asyncio.Lock()
@@ -945,14 +966,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         self._orphan_call_states: dict[str, dict] = {}
         b = cfg.bridge
         self.call_web: CallWeb | None = (
-            CallWeb(self, b.call_web_url, b.call_web_listen, b.call_web_app)
+            _callweb().CallWeb(self, b.call_web_url, b.call_web_listen, b.call_web_app)
             if b.call_web_url and b.call_notifications else None)
         self._ui_tokens: dict[str, dict] = {}
         self._link_wait: dict | None = None
         self._recall_notice_ttl: float = 5.0
         self._notice_tasks: set[asyncio.Task] = set()
-        # Topics mode: everything happens in one forum supergroup and only the bot is used.
-        self.topics = cfg.bridge.mode == "topics"
+        self._card_cache_handle: asyncio.TimerHandle | None = None
+        self._card_cache_idle_seconds: float = CARD_CACHE_IDLE_SECONDS
         self.forum_chat: int | None = (
             cfg.bridge.forum_chat or int(self.store.get("forum_chat") or 0) or None) if self.topics else None
         # Optional dedicated forum supergroup for official/service accounts (works in both modes).
@@ -1139,6 +1160,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
     async def close(self) -> None:
         self._cancel_auto_relogin()
+        if self._card_cache_handle is not None:
+            self._card_cache_handle.cancel()
+            self._card_cache_handle = None
         tasks = list(self._notice_tasks)
         for task in tasks:
             task.cancel()
@@ -1695,6 +1719,8 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         if name == sid:
             name = nick or sid
         self.names[key] = name
+        while len(self.names) > NAMES_CACHE_MAX:
+            self.names.pop(next(iter(self.names)))
         return name
 
     def _body(self, msg: dict) -> str:
@@ -1909,10 +1935,14 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 app_type=link_app_type,
                 thumbnail_bytes=thumb_bytes,
             )
+            self._schedule_card_cache_clear()
             if card_png:
                 media = Media(card_png, "image/png", "link-card.png")
 
         silent = outgoing and self.cfg.bridge.outgoing_silent
+        should_trim = isinstance(media, Media) and (
+            media.path is not None or media.size >= TRIM_MEDIA_BYTES or t == STICKER
+        )
         try:
             sent = await self._send_tg(
                 chat, thread, header, prefix, msg, media, reply_to, silent,
@@ -1921,6 +1951,9 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         finally:
             if isinstance(media, Media):
                 media.close()  # large downloads were streamed to a temp file
+            media = None
+            if should_trim:
+                maybe_trim_memory()
         for m in sent:
             self.store.map_message(chat, "bot", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
             if chat < -1000000000000:
@@ -1928,6 +1961,24 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if not self.topics:
                 self._pair(chat, _fingerprint(m), bot=(msg["threadId"], msg["id"], msg.get("serverId")))
         self.forwarded += 1
+
+    def _schedule_card_cache_clear(self) -> None:
+        if self._card_cache_handle is not None:
+            self._card_cache_handle.cancel()
+            self._card_cache_handle = None
+        if self._card_cache_idle_seconds <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        def _clear() -> None:
+            self._card_cache_handle = None
+            cards.clear_caches()
+            maybe_trim_memory(min_interval=0.0)
+
+        self._card_cache_handle = loop.call_later(self._card_cache_idle_seconds, _clear)
 
     # --- pairing the two views of a bridged message ----------------------
     async def on_user_sees_bot_message(self, event) -> None:
@@ -2876,7 +2927,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         await event.answer("正在挂断…")
         try:
             await self.call_web.hangup(entry)
-        except CallActionError as e:
+        except _callweb().CallActionError as e:
             await self._report_call_reject_failure(entry, str(e))
 
     async def _reject_call(self, entry: dict) -> None:
@@ -3144,7 +3195,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 await self.bot.send_message(chat_id, f"没有匹配「{_esc(query)}」的群成员", parse_mode="html",
                                             reply_to=reply_to)
                 return
-            picked = picked[:callweb.MAX_INVITEES]
+            picked = picked[:_callweb().MAX_INVITEES]
             ids = {m["id"] for m in picked}
             req.update(
                 members=picked + [m for m in members if m["id"] not in ids],  # matches first
@@ -3212,7 +3263,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 return
         selected: list[str] = req["selected"]
         members: list[dict] = req["members"]
-        limit = callweb.MAX_INVITEES
+        limit = _callweb().MAX_INVITEES
         note = None
         if op.startswith("t") and op[1:].isdigit() and int(op[1:]) < len(members):
             cid = members[int(op[1:])]["id"]
@@ -3242,7 +3293,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         await self._sync_dial_msg(req)
 
     async def _expire_dial(self, req: dict) -> None:
-        await asyncio.sleep(callweb.DIAL_REQUEST_TTL)
+        await asyncio.sleep(_callweb().DIAL_REQUEST_TTL)
         while req.get("dialing"):
             await asyncio.sleep(1.0)
         if req["live"] and not req.get("call_id"):
@@ -3349,7 +3400,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         await event.answer("正在发送邀请…")
         try:
             await self.call_web.invite(entry, selected, req["names"])
-        except CallActionError as e:
+        except _callweb().CallActionError as e:
             req["dialing"] = False
             await self._report(req["chat_id"], req["msg_id"], f"邀请失败：{e}")
             return
@@ -3660,10 +3711,20 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 if kind is None:
                     await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{media}")
                 else:
-                    if kind == "sticker":
-                        result = await self.wx.send_sticker(thread_id, media, key)
-                    else:
-                        result = await self.wx.send_media(thread_id, kind, media, key)
+                    should_trim = isinstance(media, Media) and (
+                        media.path is not None or media.size >= TRIM_MEDIA_BYTES or kind == "sticker"
+                    )
+                    try:
+                        if kind == "sticker":
+                            result = await self.wx.send_sticker(thread_id, media, key)
+                        else:
+                            result = await self.wx.send_media(thread_id, kind, media, key)
+                    finally:
+                        if isinstance(media, Media):
+                            media.close()
+                        media = None
+                        if should_trim:
+                            maybe_trim_memory()
                     self._record_send(chat_id, msg.id, thread_id, result, media=True)
                     if wx_text:  # caption goes as a separate text message
                         result = await self.wx.send_text(thread_id, wx_text, key + "-caption", mentions=mentions)
@@ -3823,14 +3884,40 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         size = f.size if f else 0
         if size and size > self.max_media:
             return None, f"文件太大（{size // 1048576} MB），超过 max_media_mb 限制"
-        data = await msg.download_media(file=bytes)
-        if not data:
-            return None, "无法下载这条 Telegram 媒体"
         mime = (f.mime_type if f and f.mime_type else "application/octet-stream").lower()
         ext = (getattr(f, "ext", None) or "").lower()
         name = (f.name if f and f.name else None) or f"telegram{ext}"
+        needs_bytes = bool(msg.sticker or (msg.gif and self.cfg.bridge.gif_as_sticker))
+        spill_to_disk = bool(size and size > wechat.MEDIA_SPILL_BYTES and not needs_bytes)
+        media_path: str | None = None
+        if spill_to_disk:
+            tmp_dir = tempfile.mkdtemp(prefix="tg-media-")
+            dst = os.path.join(tmp_dir, wechat._safe_filename(name))
+            try:
+                saved = await msg.download_media(file=dst)
+            except BaseException:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise
+            if not saved:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return None, "无法下载这条 Telegram 媒体"
+            if isinstance(saved, (bytes, bytearray)):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                data = bytes(saved)
+            else:
+                saved_path = os.fspath(saved)
+                if not os.path.isfile(saved_path):
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    return None, "无法下载这条 Telegram 媒体"
+                data = b""
+                media_path = saved_path
+        else:
+            raw = await msg.download_media(file=bytes)
+            if not raw:
+                return None, "无法下载这条 Telegram 媒体"
+            data = bytes(raw)
         if msg.photo:
-            return "image", Media(data, "image/jpeg", "photo.jpg")
+            return "image", Media(data, "image/jpeg", "photo.jpg", path=media_path)
         cache = getattr(self, "sticker_cache", None)
         if msg.sticker:
             if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/", "application/x-tgsticker")):
@@ -3841,7 +3928,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             _, out = converted
             return "sticker", Media(out, "image/gif", "sticker.gif")
         if msg.voice:
-            return "voice", Media(data, "audio/ogg", "voice.ogg")
+            return "voice", Media(data, "audio/ogg", "voice.ogg", path=media_path)
         if msg.gif and self.cfg.bridge.gif_as_sticker:
             if mime in ("application/octet-stream", "") or not mime.startswith(("image/", "video/")):
                 mime = {".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm"}.get(ext, mime)
@@ -3854,10 +3941,17 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if mime == "image/gif":
                 return "file", Media(data, mime, name if name.endswith(".gif") else "animation.gif")
         if msg.video or msg.video_note or msg.gif:
-            return "video", Media(data, "video/mp4", name if name.endswith(".mp4") else "video.mp4")
-        if img := await asyncio.to_thread(_image_from_file, data, mime, name, ext):
-            return "image", img
-        return "file", Media(data, mime, name)
+            return "video", Media(data, "video/mp4", name if name.endswith(".mp4") else "video.mp4", path=media_path)
+        try:
+            if img := await asyncio.to_thread(_image_from_file, data, mime, name, ext, path=media_path):
+                if media_path is not None and img.path != media_path:
+                    shutil.rmtree(os.path.dirname(media_path), ignore_errors=True)
+                return "image", img
+        except BaseException:
+            if media_path is not None:
+                shutil.rmtree(os.path.dirname(media_path), ignore_errors=True)
+            raise
+        return "file", Media(data, mime, name, path=media_path)
 
     @staticmethod
     def _recall_expired_msg(key_prefix: str) -> str:

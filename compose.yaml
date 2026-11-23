@@ -112,6 +112,8 @@ services:
       AUTO_RELOGIN: ${AUTO_RELOGIN:-}
       WECHAT_URL: http://127.0.0.1:6174
       WECHAT_TOKEN_FILE: /token/bridge-token
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
+      MALLOC_TRIM_THRESHOLD_: ${MALLOC_TRIM_THRESHOLD_:-65536}
     volumes:
       - ./data/bridge-data:/app/data
       - ./data/wechat-token:/token:ro

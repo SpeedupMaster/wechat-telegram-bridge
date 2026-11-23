@@ -478,7 +478,7 @@ def _font_paths() -> tuple[str | None, str | None, str | None, bool]:
     return reg, bold, emoji, has_cjk
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=8)
 def _load_font(path: str | None, size: int, *, index: int | None = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     if path:
         idx = _ttc_sc_index(path) if index is None else index
@@ -548,7 +548,7 @@ def _iter_clusters(text: str) -> list[tuple[str, bool]]:
     return out
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=128)
 def _render_emoji_glyph(cluster: str, size: int) -> Image.Image | None:
     efont = _emoji_font()
     if efont is None:
@@ -568,6 +568,13 @@ def _render_emoji_glyph(cluster: str, size: int) -> Image.Image | None:
     scale = target / max(cw, ch)
     nw, nh = max(1, round(cw * scale)), max(1, round(ch * scale))
     return cropped.convert("RGBa").resize((nw, nh), Image.LANCZOS).convert("RGBA")
+
+
+def clear_caches() -> None:
+    """Release cached FreeType font faces (including NotoColorEmoji) and rendered emoji glyphs."""
+    _load_font.cache_clear()
+    _emoji_font.cache_clear()
+    _render_emoji_glyph.cache_clear()
 
 
 def _cluster_advance(cluster: str, is_emoji: bool, font, size: int) -> float:

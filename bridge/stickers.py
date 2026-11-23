@@ -23,11 +23,14 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageSequence, ImageStat
+
+from .mem import maybe_trim_memory
 
 log = logging.getLogger("stickers")
 
@@ -425,9 +428,14 @@ def _clean_rgba_alpha(im: Image.Image) -> Image.Image:
     return clean
 
 
-def _rgba_frames_have_alpha(frames: list[bytes]) -> bool:
+def _rgba_frames_have_alpha(frames: Sequence[Image.Image | bytes]) -> bool:
     for frame in frames:
-        if len(frame) >= 4 and frame[3::4].translate(None, _OPAQUE_ALPHA_TABLE):
+        if isinstance(frame, Image.Image):
+            rgba = frame if frame.mode == "RGBA" else frame.convert("RGBA")
+            lo, _ = rgba.getchannel("A").getextrema()
+            if lo < 128:
+                return True
+        elif len(frame) >= 4 and frame[3::4].translate(None, _OPAQUE_ALPHA_TABLE):
             return True
     return False
 
@@ -438,16 +446,14 @@ def _dedup_sampled_frames(
     width: int,
     height: int,
     get_pil: Callable[[int, int, int], Image.Image],
-    get_raw: Callable[[int, int, int], bytes],
     *,
     max_diff_thresh: int,
     rms_thresh: float,
-) -> tuple[list[int], list[Image.Image], list[bytes], list[int]]:
+) -> tuple[list[int], list[Image.Image], list[int]]:
     """Collapse consecutive identical or visually still sampled frames and accumulate their durations."""
     n_out = len(indices)
     kept_indices: list[int] = []
     kept_pils: list[Image.Image] = []
-    kept_raws: list[bytes] = []
     kept_cs: list[int] = []
 
     for i, idx in enumerate(indices):
@@ -456,22 +462,21 @@ def _dedup_sampled_frames(
             kept_cs[-1] = min(65535, kept_cs[-1] + dur_cs)
             continue
         im = get_pil(idx, width, height)
-        raw = get_raw(idx, width, height)
-        if kept_raws:
-            same = raw == kept_raws[-1]
-            if not same and max_diff_thresh > 0:
-                diff = ImageChops.difference(im, kept_pils[-1])
-                max_diff = max(hi for _, hi in diff.getextrema())
-                if max_diff <= max_diff_thresh and max(ImageStat.Stat(diff).rms) <= rms_thresh:
-                    same = True
+        if kept_pils:
+            diff = ImageChops.difference(im, kept_pils[-1])
+            max_diff = max(hi for _, hi in diff.getextrema())
+            same = max_diff == 0 or (
+                max_diff_thresh > 0
+                and max_diff <= max_diff_thresh
+                and max(ImageStat.Stat(diff).rms) <= rms_thresh
+            )
             if same and kept_cs[-1] + dur_cs <= 65535:
                 kept_cs[-1] += dur_cs
                 continue
         kept_indices.append(idx)
         kept_pils.append(im)
-        kept_raws.append(raw)
         kept_cs.append(dur_cs)
-    return kept_indices, kept_pils, kept_raws, kept_cs
+    return kept_indices, kept_pils, kept_cs
 
 
 def _skip_gif_subblocks(buf: bytearray, pos: int) -> int:
@@ -535,19 +540,57 @@ def _gif_palette_vf(max_colors: int, stats_mode: str, dither: str, *, transparen
             f"[s1][p]paletteuse={use_opts}")
 
 
-def _ffmpeg_rgba_to_gif(frames: list[bytes], width: int, height: int, fps: float, ffmpeg: str,
+def _ffmpeg_rgba_to_gif(frames: Sequence[Image.Image | bytes], width: int, height: int, fps: float, ffmpeg: str,
                         *, max_colors: int = 256, stats_mode: str = "full",
                         dither: str = "none") -> bytes:
     transparent = _rgba_frames_have_alpha(frames)
     vf = _gif_palette_vf(max_colors, stats_mode, dither, transparent=transparent)
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "out.gif")
+        err_path = os.path.join(tmp, "ffmpeg.err")
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{width}x{height}", "-r", f"{fps:g}", "-i", "pipe:0",
                "-vf", vf, "-loop", "0", out]
-        res = subprocess.run(cmd, input=b"".join(frames), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
-        if res.returncode != 0:
-            raise RuntimeError(res.stderr.decode(errors="replace").strip() or f"ffmpeg exited {res.returncode}")
+        with open(err_path, "wb") as err_f:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_f)
+            timed_out = False
+
+            def _kill_on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+            timer = threading.Timer(120.0, _kill_on_timeout)
+            timer.start()
+            try:
+                assert proc.stdin is not None
+                try:
+                    for frame in frames:
+                        raw = (frame if frame.mode == "RGBA" else frame.convert("RGBA")).tobytes() if isinstance(frame, Image.Image) else frame
+                        proc.stdin.write(raw)
+                except BrokenPipeError:
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
+                returncode = proc.wait()
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+            finally:
+                timer.cancel()
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, 120)
+        if returncode != 0:
+            with open(err_path, "rb") as err_f:
+                stderr = err_f.read().decode(errors="replace").strip()
+            raise RuntimeError(stderr or f"ffmpeg exited {returncode}")
         with open(out, "rb") as f:
             return f.read()
 
@@ -608,7 +651,7 @@ def _encode_rgba_attempts_to_gif(
 ) -> bytes:
     """Encode an RGBA animation using target-edge-first quality preservation, still-frame merging, and fast convergence."""
     pil_cache: dict[tuple[int, int, int], Image.Image] = {}
-    raw_cache: dict[tuple[int, int, int], bytes] = {}
+    cached_size: tuple[int, int] | None = None
     seen: set[tuple] = set()
     best: bytes | None = None
     best_is_hq = False
@@ -622,22 +665,20 @@ def _encode_rgba_attempts_to_gif(
             pil_cache[key] = _clean_rgba_alpha(load_frame(idx, w, h))
         return pil_cache[key]
 
-    def get_raw(idx: int, w: int, h: int) -> bytes:
-        key = (w, h, idx)
-        if key not in raw_cache:
-            raw_cache[key] = get_pil(idx, w, h).tobytes()
-        return raw_cache[key]
-
     for edge, max_fps, colors, stats_mode, dither in attempts:
         is_hq = edge == target_edge and colors == 256
         if best is not None and best_is_hq and not is_hq:
             return best
         w, h = size_for_edge(edge)
+        if cached_size is not None and cached_size != (w, h):
+            # Attempts step monotonically down in edge size; drop larger cached frames immediately.
+            pil_cache.clear()
+        cached_size = (w, h)
         target_fps = min(max_fps, src_fps, 180.0 / max(duration, 0.1))
         n_out = max(1, min(180, round(duration * target_fps)))
         indices = sample_indices(n_out)
-        kept_indices, kept_pils, kept_raws, kept_cs = _dedup_sampled_frames(
-            indices, total_cs, w, h, get_pil, get_raw,
+        kept_indices, kept_pils, kept_cs = _dedup_sampled_frames(
+            indices, total_cs, w, h, get_pil,
             max_diff_thresh=max_diff_thresh, rms_thresh=rms_thresh,
         )
         # Lottie exports of static stickers often use ip=0, op=1 (totalframe=2 in rlottie) or identical frames.
@@ -655,8 +696,8 @@ def _encode_rgba_attempts_to_gif(
             continue
         seen.add(spec)
         if ffmpeg:
-            actual_fps = max(1.0, len(kept_raws) / max(duration, 0.05))
-            out = _ffmpeg_rgba_to_gif(kept_raws, w, h, actual_fps, ffmpeg, max_colors=colors,
+            actual_fps = max(1.0, len(kept_pils) / max(duration, 0.05))
+            out = _ffmpeg_rgba_to_gif(kept_pils, w, h, actual_fps, ffmpeg, max_colors=colors,
                                       stats_mode=stats_mode, dither=dither)
             if len(kept_cs) < len(indices) or len(set(kept_cs)) > 1:
                 out = _set_gif_frame_delays(out, kept_cs)
@@ -732,58 +773,91 @@ def tgs_to_wechat_gif(
 ) -> bytes:
     from rlottie_python import LottieAnimation
     anim = LottieAnimation.from_data(gzip.decompress(data).decode("utf-8"))
-    gifsicle = find_gifsicle()
-    total = max(1, anim.lottie_animation_get_totalframe())
-    src_fps = anim.lottie_animation_get_framerate() or 30
-    if total == 1:
-        w, h = _tgs_size(anim, static_max_edge)
-        frame = _render_tgs_rgba(anim, 0, w, h)
-        eff_fast = default_fast_bytes(static_max_edge) if fast_bytes is None else fast_bytes
-        return _encode_static_rgba_to_gif(frame, static_max_edge, eff_fast, gifsicle)
+    try:
+        try:
+            # Flush and disable rlottie's internal C++ model cache so parsed animations do not linger in RAM.
+            anim.lottie_configure_model_cache_size(0)
+        except Exception:
+            pass
+        gifsicle = find_gifsicle()
+        total = max(1, anim.lottie_animation_get_totalframe())
+        src_fps = anim.lottie_animation_get_framerate() or 30
+        if total == 1:
+            w, h = _tgs_size(anim, static_max_edge)
+            frame = _render_tgs_rgba(anim, 0, w, h)
+            eff_fast = default_fast_bytes(static_max_edge) if fast_bytes is None else fast_bytes
+            return _encode_static_rgba_to_gif(frame, static_max_edge, eff_fast, gifsicle)
 
-    duration = min(WX_STICKER_MAX_SECONDS, total / src_fps)
-    usable_src_frames = max(1, min(total, round(duration * src_fps)))
-    return _encode_rgba_attempts_to_gif(
-        _gif_attempts(duration, max_edge),
-        duration,
-        src_fps,
-        lambda edge: _tgs_size(anim, edge),
-        lambda n_out: [min(usable_src_frames - 1, int(i * usable_src_frames / n_out)) for i in range(n_out)],
-        lambda idx, w, h: _render_tgs_rgba(anim, idx, w, h),
-        ffmpeg,
-        gifsicle,
-        fast_bytes=fast_bytes,
-        static_max_edge=static_max_edge,
-    )
+        duration = min(WX_STICKER_MAX_SECONDS, total / src_fps)
+        usable_src_frames = max(1, min(total, round(duration * src_fps)))
+        return _encode_rgba_attempts_to_gif(
+            _gif_attempts(duration, max_edge),
+            duration,
+            src_fps,
+            lambda edge: _tgs_size(anim, edge),
+            lambda n_out: [min(usable_src_frames - 1, int(i * usable_src_frames / n_out)) for i in range(n_out)],
+            lambda idx, w, h: _render_tgs_rgba(anim, idx, w, h),
+            ffmpeg,
+            gifsicle,
+            fast_bytes=fast_bytes,
+            static_max_edge=static_max_edge,
+        )
+    finally:
+        try:
+            anim.lottie_animation_destroy()
+        except Exception:
+            pass
 
 
-def _decode_pam_rgba_frames(buf: bytes) -> tuple[list[Image.Image], int, int]:
-    frames: list[Image.Image] = []
-    pos, width, height = 0, 0, 0
-    while pos < len(buf):
-        end = buf.find(b"ENDHDR\n", pos)
-        if end == -1:
+def _read_exact(stream, size: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = stream.read(size - len(buf))
+        if not chunk:
             break
-        hdr = buf[pos:end].decode("ascii", errors="replace")
-        meta = dict(line.split(None, 1) for line in hdr.splitlines() if " " in line)
+        buf += chunk
+    return bytes(buf)
+
+
+def _read_pam_rgba_frames(stream, *, allow_empty: bool = False) -> tuple[list[Image.Image], int, int]:
+    frames: list[Image.Image] = []
+    width, height = 0, 0
+    while True:
+        meta: dict[str, str] = {}
+        saw_endhdr = False
+        while True:
+            line = stream.readline()
+            if not line:
+                break
+            text = line.decode("ascii", errors="replace").strip()
+            if text == "ENDHDR":
+                saw_endhdr = True
+                break
+            if " " in text:
+                k, v = text.split(None, 1)
+                meta[k] = v
+        if not saw_endhdr:
+            break
         w = int(meta["WIDTH"])
         h = int(meta["HEIGHT"])
         depth = int(meta["DEPTH"])
-        pos = end + 7
         size = w * h * depth
-        if pos + size > len(buf):
+        px = _read_exact(stream, size)
+        if len(px) < size:
             break
-        px = buf[pos:pos + size]
-        pos += size
         mode = "RGBA" if depth == 4 else "RGB"
         im = Image.frombytes(mode, (w, h), px)
         if mode != "RGBA":
             im = im.convert("RGBA")
         width, height = w, h
         frames.append(im)
-    if not frames:
+    if not frames and not allow_empty:
         raise ValueError("empty_video_stream")
     return frames, width, height
+
+
+def _decode_pam_rgba_frames(buf: bytes) -> tuple[list[Image.Image], int, int]:
+    return _read_pam_rgba_frames(io.BytesIO(buf))
 
 
 def _decode_video_rgba_frames(
@@ -805,13 +879,48 @@ def _decode_video_rgba_frames(
         vf = f"fps={base_fps:g},{scale},format=rgba"
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, f"in{ext}")
+        err_path = os.path.join(tmp, "ffmpeg.err")
         with open(src, "wb") as f:
             f.write(data)
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                *input_args, "-i", src, "-t", f"{WX_STICKER_MAX_SECONDS:g}",
                "-vf", vf, "-c:v", "pam", "-f", "image2pipe", "pipe:1"]
-        res = subprocess.run(cmd, check=True, capture_output=True, timeout=120)
-        return _decode_pam_rgba_frames(res.stdout)
+        with open(err_path, "wb") as err_f:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err_f)
+            timed_out = False
+
+            def _kill_on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+            timer = threading.Timer(120.0, _kill_on_timeout)
+            timer.start()
+            try:
+                assert proc.stdout is not None
+                try:
+                    frames, width, height = _read_pam_rgba_frames(proc.stdout, allow_empty=True)
+                finally:
+                    proc.stdout.close()
+                returncode = proc.wait()
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+            finally:
+                timer.cancel()
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, 120)
+        if returncode != 0:
+            with open(err_path, "rb") as err_f:
+                stderr = err_f.read()
+            raise subprocess.CalledProcessError(returncode, cmd, stderr=stderr)
+        if not frames:
+            raise ValueError("empty_video_stream")
+        return frames, width, height
 
 
 def _transcode_video_to_wechat_gif(
@@ -1005,16 +1114,18 @@ async def _run_wechat_sticker_convert(
         if cache is not None:
             cache.put(key, out)
         try:
-            gim = Image.open(io.BytesIO(out))
-            log.info("Converted %s %s (%d B) -> %dx%d GIF (%d frames, %d B) in %.2fs",
-                     mime, label, len(data), gim.size[0], gim.size[1], getattr(gim, "n_frames", 1),
-                     len(out), time.monotonic() - t0)
+            with Image.open(io.BytesIO(out)) as gim:
+                log.info("Converted %s %s (%d B) -> %dx%d GIF (%d frames, %d B) in %.2fs",
+                         mime, label, len(data), gim.size[0], gim.size[1], getattr(gim, "n_frames", 1),
+                         len(out), time.monotonic() - t0)
         except Exception:
             pass
         return "sticker", out
     except Exception as e:
         log.warning("WeChat %s conversion failed (%s): %s", label, mime, e)
         return f"贴纸转换失败：{type(e).__name__}"
+    finally:
+        maybe_trim_memory()
 
 
 async def to_wechat_sticker(

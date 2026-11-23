@@ -18,18 +18,33 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-try:
-    from curl_cffi.requests import AsyncSession as _CurlAsyncSession
-    from curl_cffi.requests.exceptions import CurlError as _CurlBaseError, RequestException as _CurlReqError
-    _CURL_ERRORS: tuple[type[BaseException], ...] = (_CurlBaseError, _CurlReqError)
-except ImportError:  # pragma: no cover
-    _CurlAsyncSession = None
-    _CURL_ERRORS = ()
+from .mem import maybe_trim_memory
+
+_UNSET = object()
+_CurlAsyncSession: Any = _UNSET
+_CURL_ERRORS: tuple[type[BaseException], ...] = ()
+
+
+def _load_curl_cffi() -> tuple[Any, tuple[type[BaseException], ...]]:
+    """Lazily import curl_cffi (libcurl-impersonate + BoringSSL) on first reader fetch."""
+    global _CurlAsyncSession, _CURL_ERRORS
+    if _CurlAsyncSession is _UNSET:
+        try:
+            from curl_cffi.requests import AsyncSession as _Session
+            from curl_cffi.requests.exceptions import CurlError as _CurlBaseError, RequestException as _CurlReqError
+            _CurlAsyncSession = _Session
+            _CURL_ERRORS = (_CurlBaseError, _CurlReqError)
+        except ImportError:  # pragma: no cover
+            _CurlAsyncSession = None
+            _CURL_ERRORS = ()
+    return _CurlAsyncSession, _CURL_ERRORS
+
 
 MAX_PAGE_BYTES = 12 * 1024 * 1024  # note pages are mostly inline script; several MB is common
 FETCH_TIMEOUT = 20.0
 MAX_REDIRECTS = 5
 MAX_FETCH_CONCURRENCY = 2
+SESSION_IDLE_TIMEOUT = 300.0  # close idle curl_cffi / httpx session after 5 min to free TLS/pool buffers
 IMPERSONATE_BROWSER = "safari_ios"
 USER_AGENT = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
               "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
@@ -68,11 +83,12 @@ _CURRENT_FETCHER: contextvars.ContextVar[ArticleFetcher | None] = contextvars.Co
 
 async def _fetch_with_session(url: str, session: Any, *, uses_curl: bool) -> Article:
     from . import bilibili, douyin, xhs  # they import this module; keep the dependency one-way at import time
+    net_errors = _load_curl_cffi()[1] if uses_curl else _CURL_ERRORS
     if xhs.is_note_url(url):
-        return await xhs.fetch_note(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
+        return await xhs.fetch_note(url, session, uses_curl=uses_curl, net_errors=net_errors)
     for site in (douyin, bilibili):
         if site.is_video_url(url):
-            return await site.fetch_video(url, session, uses_curl=uses_curl, net_errors=_CURL_ERRORS)
+            return await site.fetch_video(url, session, uses_curl=uses_curl, net_errors=net_errors)
     raise ArticleError("此链接不支持阅读模式", code="invalid_url")
 
 
@@ -80,18 +96,51 @@ class ArticleFetcher:
     """Reusable session (curl_cffi TLS impersonation + cookies, or httpx fallback) with concurrency cap."""
 
     def __init__(self, *, proxy: str = "", max_concurrency: int = MAX_FETCH_CONCURRENCY,
-                 impersonate: str = IMPERSONATE_BROWSER):
+                 impersonate: str = IMPERSONATE_BROWSER, idle_timeout: float = SESSION_IDLE_TIMEOUT):
         self.proxy = (proxy or "").strip()
         self.impersonate = impersonate
         self._max_concurrency = max(1, int(max_concurrency))
+        self._idle_timeout = max(0.0, float(idle_timeout))
         self._sem: asyncio.Semaphore | None = None
         self._session: Any = None
         self._uses_curl = False
+        self._active_fetches = 0
+        self._idle_handle: asyncio.TimerHandle | None = None
+        self._idle_close_task: asyncio.Task | None = None
+
+    def _cancel_idle_close(self) -> None:
+        if self._idle_handle is not None:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+
+    def _schedule_idle_close(self) -> None:
+        self._cancel_idle_close()
+        if self._idle_timeout <= 0 or self._session is None or self._active_fetches > 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._idle_handle = loop.call_later(self._idle_timeout, self._on_idle_timeout)
+
+    def _on_idle_timeout(self) -> None:
+        self._idle_handle = None
+        if self._active_fetches > 0 or self._session is None:
+            return
+        self._idle_close_task = asyncio.create_task(self._close_on_idle())
+
+    async def _close_on_idle(self) -> None:
+        try:
+            await self._close_session()
+        finally:
+            self._idle_close_task = None
+            maybe_trim_memory(min_interval=0.0)
 
     def _ensure_session(self) -> tuple[Any, bool]:
         if self._session is None:
-            if _CurlAsyncSession is not None:
-                self._session = _CurlAsyncSession(
+            curl_cls, _ = _load_curl_cffi()
+            if curl_cls is not None:
+                self._session = curl_cls(
                     impersonate=self.impersonate,
                     timeout=FETCH_TIMEOUT,
                     allow_redirects=False,
@@ -109,13 +158,22 @@ class ArticleFetcher:
         return self._session, self._uses_curl
 
     async def fetch(self, url: str) -> Article:
-        if self._sem is None:
-            self._sem = asyncio.Semaphore(self._max_concurrency)
-        async with self._sem:
-            session, uses_curl = self._ensure_session()
-            return await _fetch_with_session(url, session, uses_curl=uses_curl)
+        self._cancel_idle_close()
+        self._active_fetches += 1
+        try:
+            if self._idle_close_task is not None and not self._idle_close_task.done():
+                await self._idle_close_task
+            if self._sem is None:
+                self._sem = asyncio.Semaphore(self._max_concurrency)
+            async with self._sem:
+                session, uses_curl = self._ensure_session()
+                return await _fetch_with_session(url, session, uses_curl=uses_curl)
+        finally:
+            self._active_fetches -= 1
+            if self._active_fetches == 0:
+                self._schedule_idle_close()
 
-    async def close(self) -> None:
+    async def _close_session(self) -> None:
         if self._session is None:
             return
         sess, self._session = self._session, None
@@ -125,6 +183,13 @@ class ArticleFetcher:
             res = sess.close()
             if asyncio.iscoroutine(res):
                 await res
+
+    async def close(self) -> None:
+        self._cancel_idle_close()
+        task = self._idle_close_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            await task
+        await self._close_session()
 
 
 @contextlib.contextmanager
@@ -155,7 +220,7 @@ async def fetch_article(url: str, client: Any = None, *, proxy: str = "") -> Art
 class ArticleCache:
     """Small in-memory cache of parsed articles (and recent failures, briefly)."""
 
-    def __init__(self, size: int = 32, ttl: float = 3600.0, fail_ttl: float = 60.0):
+    def __init__(self, size: int = 16, ttl: float = 1800.0, fail_ttl: float = 60.0):
         self.size, self.ttl, self.fail_ttl = size, ttl, fail_ttl
         self._items: dict[str, tuple[float, Article | ArticleError]] = {}
 

@@ -48,6 +48,8 @@ FROM gcr.io/distroless/python3-debian13:nonroot
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    MALLOC_ARENA_MAX=2 \
+    MALLOC_TRIM_THRESHOLD_=65536 \
     BRIDGE_DATA_DIR=/app/data \
     HOME=/app
 

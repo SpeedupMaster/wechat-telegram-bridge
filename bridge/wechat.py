@@ -705,9 +705,16 @@ class WeChatClient:
                                  timeout=_SEND_TIMEOUT)
         return await self._wait(intent, lambda i: f"sends/{_id(i['id'])}", SEND_DONE, 120)
 
-    async def prepare_sticker(self, media: Media, key: str, *, fit: bool = True) -> dict:
+    async def _upload_media(self, media: Media) -> dict:
+        if media.path is not None:
+            with open(media.path, "rb") as fp:
+                files = {"file": (media.filename, fp, media.mime)}
+                return await self._req("POST", self._a("uploads"), files=files, timeout=httpx.Timeout(600.0))
         files = {"file": (media.filename, media.data, media.mime)}
-        source = await self._req("POST", self._a("uploads"), files=files, timeout=httpx.Timeout(600.0))
+        return await self._req("POST", self._a("uploads"), files=files, timeout=httpx.Timeout(600.0))
+
+    async def prepare_sticker(self, media: Media, key: str, *, fit: bool = True) -> dict:
+        source = await self._upload_media(media)
         job = await self._req("POST", self._a("sticker-preparations"),
                               json={"sourceId": source["id"], "fit": fit, "trim": None},
                               headers={"Idempotency-Key": key}, timeout=_SEND_TIMEOUT)
@@ -731,7 +738,7 @@ class WeChatClient:
             self._sticker_preps.popitem(last=False)
 
     async def send_sticker(self, thread_id: str, media: Media, key: str) -> dict:
-        cache_key = (self.account or "", hashlib.sha256(media.data).hexdigest())
+        cache_key = (self.account or "", hashlib.sha256(media.read()).hexdigest())
         prep_id = self._get_cached_prep(cache_key)
         used_cached = prep_id is not None
         if not prep_id:
@@ -774,8 +781,7 @@ class WeChatClient:
         return {}
 
     async def send_media(self, thread_id: str, kind: str, media: Media, key: str) -> dict:
-        files = {"file": (media.filename, media.data, media.mime)}
-        source = await self._req("POST", self._a("uploads"), files=files, timeout=httpx.Timeout(600.0))
+        source = await self._upload_media(media)
         body = {"threadId": thread_id, "kind": kind, "sourceId": source["id"], "standardSourceId": None,
                 "thumbnailSourceId": None, "playSeconds": None, "durationMs": None}
         if kind == "image":

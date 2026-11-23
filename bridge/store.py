@@ -73,6 +73,8 @@ class Store:
     def __init__(self, path: Path):
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA cache_size=-1024")
+        self.db.execute("PRAGMA journal_size_limit=4194304")
         self.db.executescript(SCHEMA)
         self._cache_seq = 0
 
