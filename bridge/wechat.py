@@ -179,6 +179,7 @@ class Media:
 
 # Downloads up to this size stay in memory; larger ones are streamed to a temp file.
 MEDIA_SPILL_BYTES = 1 * 1024 * 1024
+LOG_MEDIA_MIN_BYTES = 1 * 1024 * 1024
 
 
 class _MediaTooLarge(Exception):
@@ -781,16 +782,28 @@ class WeChatClient:
         return {}
 
     async def send_media(self, thread_id: str, kind: str, media: Media, key: str) -> dict:
+        media_size = media.size
+        t0 = time.monotonic()
         source = await self._upload_media(media)
+        t_upload = time.monotonic() - t0
         body = {"threadId": thread_id, "kind": kind, "sourceId": source["id"], "standardSourceId": None,
                 "thumbnailSourceId": None, "playSeconds": None, "durationMs": None}
         if kind == "image":
             body["imageQuality"] = "original"
         if kind == "video":
             body["videoQuality"] = "original"  # 720p playback copy plus the untouched original
+        t1 = time.monotonic()
         job = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
                               timeout=_SEND_TIMEOUT)
-        return await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
+        res = await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 3600)
+        t_send = time.monotonic() - t1
+        if media_size >= LOG_MEDIA_MIN_BYTES:
+            rate = (media_size / 1048576) / max(t_send, 0.001)
+            log.info(
+                "WeChat media send %s (%s, %.1f MiB): local_upload=%.2fs, wx_send=%.2fs (%.2f MiB/s), state=%s",
+                media.filename, kind, media_size / 1048576, t_upload, t_send, rate, res.get("state"),
+            )
+        return res
 
     async def recall_message(self, message_id: str, server_id: str, key: str) -> dict:
         op = await self._req("POST", self._a(f"messages/{_id(message_id)}/recall"),

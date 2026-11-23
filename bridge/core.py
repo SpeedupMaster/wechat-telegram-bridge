@@ -20,7 +20,7 @@ import httpx
 from telethon import Button, TelegramClient, errors, events, functions, types, utils
 
 from .config import Config
-from . import cards, stickers, tghtml, wechat
+from . import cards, stickers, tghtml, tgtransfer, wechat
 from .contacts import ContactsMixin, friendly as contact_error
 from .emojis import WX_EMOJIS, replace_wx_emojis, unicode_to_wx_emojis
 from .groups import GROUP_COMMANDS, GroupsMixin
@@ -1910,15 +1910,18 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
 
         media: Media | str | None = None
         channels_video_err = ""
+        wx_dl_s = 0.0
         t = msg.get("type")
         is_channels = t == APP and msg.get("appMessageType") == APP_CHANNELS
         if t in (IMAGE, VIDEO, VOICE, STICKER) or (t == APP and msg.get("appMessageType") == APP_FILE):
+            t_dl0 = time.monotonic()
             try:
                 # Animated wxgf stickers keep their frames only in the original bytes (decoding needs ffmpeg).
                 raw_wxgf = t == STICKER and stickers.find_ffmpeg() is not None
                 media = await self.wx.download_media(msg, self.max_media, raw_wxgf=raw_wxgf)
             except WeChatError as e:
                 media = e.code
+            wx_dl_s = time.monotonic() - t_dl0
             if isinstance(media, str):
                 log.info("Could not download the attachment of WeChat message %s (type %s): %s", msg["id"], t, media)
             if isinstance(media, Media) and t == VOICE and media.mime == "audio/wav":
@@ -1926,10 +1929,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                     media.close()
                     media = Media(ogg, "audio/ogg", "voice.ogg")
         elif is_channels:
+            t_dl0 = time.monotonic()
             try:
                 media = await self.wx.download_channels_video(msg, self.max_media)
             except WeChatError as e:
                 media = e.code
+            wx_dl_s = time.monotonic() - t_dl0
             if isinstance(media, str):
                 channels_video_err = media
                 log.info("Could not download Channels video of WeChat message %s: %s", msg["id"], media)
@@ -1953,9 +1958,12 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                 media = Media(card_png, "image/png", "link-card.png")
 
         silent = outgoing and self.cfg.bridge.outgoing_silent
+        media_size = media.size if isinstance(media, Media) else 0
+        media_name = media.filename if isinstance(media, Media) else ""
         should_trim = isinstance(media, Media) and (
-            media.path is not None or media.size >= TRIM_MEDIA_BYTES or t == STICKER
+            media.path is not None or media_size >= TRIM_MEDIA_BYTES or t == STICKER
         )
+        t_tg0 = time.monotonic()
         try:
             sent = await self._send_tg(
                 chat, thread, header, prefix, msg, media, reply_to, silent,
@@ -1967,6 +1975,13 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             media = None
             if should_trim:
                 maybe_trim_memory()
+        tg_send_s = time.monotonic() - t_tg0
+        if media_size >= tgtransfer.LOG_MEDIA_MIN_BYTES:
+            log.info(
+                "WeChat -> Telegram media %s (%s): total=%.2fs (wx_dl=%.2fs %s, tg_send=%.2fs)",
+                media_name, tgtransfer.format_mib(media_size), wx_dl_s + tg_send_s,
+                wx_dl_s, tgtransfer.format_rate(media_size, wx_dl_s), tg_send_s,
+            )
         for m in sent:
             self.store.map_message(chat, "bot", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
             if chat < -1000000000000:
@@ -2186,6 +2201,7 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                             return out
                         send_media = still
                 f = send_media.tg_file()
+                send_size = send_media.size
                 is_voice = t == VOICE and send_media.mime in ("audio/ogg", "audio/opus")
                 is_video = t == VIDEO or (is_channels and send_media.mime.startswith("video/"))
                 kwargs = dict(
@@ -2212,6 +2228,22 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         tf = io.BytesIO(vthumb)
                         tf.name = "thumb.jpg"
                         kwargs["thumb"] = tf
+                uploaded_handle = None
+                upload_workers = 0
+                t_up0 = time.monotonic()
+                as_photo = not kwargs["force_document"] and utils.is_image(f)
+                if send_media.path is not None and not as_photo:
+                    uploaded_handle, upload_workers = await tgtransfer.upload_file_parallel(
+                        self.bot,
+                        send_media.path,
+                        send_media.filename,
+                        send_size,
+                        max_workers=self.cfg.bridge.tg_transfer_workers,
+                    )
+                    if uploaded_handle is not None:
+                        f = uploaded_handle
+                        if send_media.mime and send_media.mime != "application/octet-stream":
+                            kwargs.setdefault("mime_type", send_media.mime)
                 try:
                     out.append(await self.bot.send_file(chat_id, f, **kwargs))
                 except errors.RPCError as e:
@@ -2219,11 +2251,19 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         raise
                     # e.g. a photo too large/odd-sized for Telegram's photo type: send it as a file instead
                     log.info("Telegram refused media as-is (%s); sending as a file", e)
-                    f = send_media.tg_file()
+                    f = uploaded_handle if uploaded_handle is not None else send_media.tg_file()
                     kwargs.update(force_document=True, voice_note=False, supports_streaming=False, nosound_video=None)
                     kwargs.pop("attributes", None)
                     kwargs.pop("thumb", None)
                     out.append(await self.bot.send_file(chat_id, f, **kwargs))
+                if send_size >= tgtransfer.LOG_MEDIA_MIN_BYTES:
+                    t_up = time.monotonic() - t_up0
+                    mode = f"{upload_workers}x512KiB" if upload_workers else "stock"
+                    log.info(
+                        "Telegram media upload %s (%s, %s): %.2fs (%s)",
+                        send_media.filename, tgtransfer.format_mib(send_size), mode,
+                        t_up, tgtransfer.format_rate(send_size, t_up),
+                    )
                 return out
             if (
                 t == LOCATION
@@ -3739,13 +3779,18 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             result = None
             if msg.media and not isinstance(msg.media, (types.MessageMediaWebPage, types.MessageMediaDice,
                                                         types.MessageMediaEmpty)):
+                t_m0 = time.monotonic()
                 kind, media = await self._tg_media(msg)
+                t_dl = time.monotonic() - t_m0
                 if kind is None:
                     await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{media}")
                 else:
+                    media_size = media.size if isinstance(media, Media) else 0
+                    media_name = media.filename if isinstance(media, Media) else ""
                     should_trim = isinstance(media, Media) and (
-                        media.path is not None or media.size >= TRIM_MEDIA_BYTES or kind == "sticker"
+                        media.path is not None or media_size >= TRIM_MEDIA_BYTES or kind == "sticker"
                     )
+                    t_wx0 = time.monotonic()
                     try:
                         if kind == "sticker":
                             result = await self.wx.send_sticker(thread_id, media, key)
@@ -3757,6 +3802,13 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
                         media = None
                         if should_trim:
                             maybe_trim_memory()
+                    t_wx = time.monotonic() - t_wx0
+                    if media_size >= tgtransfer.LOG_MEDIA_MIN_BYTES:
+                        log.info(
+                            "Telegram -> WeChat media %s (%s): total=%.2fs (tg_dl=%.2fs, wx=%.2fs, state=%s)",
+                            media_name, tgtransfer.format_mib(media_size), t_dl + t_wx,
+                            t_dl, t_wx, result.get("state") if isinstance(result, dict) else None,
+                        )
                     self._record_send(chat_id, msg.id, thread_id, result, media=True)
                     if wx_text:  # caption goes as a separate text message
                         result = await self.wx.send_text(thread_id, wx_text, key + "-caption", mentions=mentions)
@@ -3922,11 +3974,22 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
         needs_bytes = bool(msg.sticker or (msg.gif and self.cfg.bridge.gif_as_sticker))
         spill_to_disk = bool(size and size > wechat.MEDIA_SPILL_BYTES and not needs_bytes)
         media_path: str | None = None
+        dl_workers = 0
+        t_dl0 = time.monotonic()
         if spill_to_disk:
             tmp_dir = tempfile.mkdtemp(prefix="tg-media-")
             dst = os.path.join(tmp_dir, wechat._safe_filename(name))
             try:
-                saved = await msg.download_media(file=dst)
+                saved = None
+                msg_client = getattr(msg, "client", None)
+                if msg_client is not None:
+                    used_parallel, dl_workers = await tgtransfer.download_document_parallel(
+                        msg_client, msg, dst, max_workers=self.cfg.bridge.tg_transfer_workers,
+                    )
+                    if used_parallel:
+                        saved = dst
+                if not saved:
+                    saved = await msg.download_media(file=dst)
             except BaseException:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 raise
@@ -3948,6 +4011,15 @@ class Bridge(ContactsMixin, GroupsMixin, LoginMixin):
             if not raw:
                 return None, "无法下载这条 Telegram 媒体"
             data = bytes(raw)
+        actual_size = os.path.getsize(media_path) if media_path is not None else len(data)
+        if actual_size >= tgtransfer.LOG_MEDIA_MIN_BYTES:
+            t_dl = time.monotonic() - t_dl0
+            mode = f"{dl_workers}x512KiB" if dl_workers else "stock"
+            log.info(
+                "Telegram media download %s (%s, %s): %.2fs (%s)",
+                name, tgtransfer.format_mib(actual_size), mode,
+                t_dl, tgtransfer.format_rate(actual_size, t_dl),
+            )
         if msg.photo:
             return "image", Media(data, "image/jpeg", "photo.jpg", path=media_path)
         cache = getattr(self, "sticker_cache", None)

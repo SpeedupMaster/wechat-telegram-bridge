@@ -55,6 +55,7 @@ class BridgeConfig:
     mark_read_on_reply: bool = True
     create_interval_seconds: float = 20.0
     max_media_mb: int = 200
+    tg_transfer_workers: int = 0  # 0 = auto (4-8 parallel 512 KiB MTProto connections), 1 = stock Telethon, 2-16 = cap
     call_notifications: bool = True
     # Answering WeChat calls in a Telegram Mini App / web page (empty URL = off):
     # call_web_url is the public HTTPS address your reverse proxy forwards to call_web_listen.
@@ -156,6 +157,17 @@ class BridgeConfig:
             raise ValueError(
                 f"[bridge] auto_relogin_cooldown_seconds must be >= 0, not {self.auto_relogin_cooldown_seconds!r}"
             )
+        if isinstance(self.tg_transfer_workers, bool):
+            raise ValueError(f"[bridge] tg_transfer_workers must be an integer, not {self.tg_transfer_workers!r}")
+        try:
+            workers = int(self.tg_transfer_workers)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"[bridge] tg_transfer_workers must be an integer, not {self.tg_transfer_workers!r}"
+            ) from None
+        if workers < 0 or workers > 16:
+            raise ValueError(f"[bridge] tg_transfer_workers must be between 0 and 16, not {workers!r}")
+        self.tg_transfer_workers = workers
 
 
 @dataclass
@@ -195,8 +207,9 @@ ENV = {
     "ARTICLE_PROXY": ("bridge", "article_proxy"),
     "EMOJI_TO_WECHAT": ("bridge", "emoji_to_wechat"),
     "AUTO_RELOGIN": ("bridge", "auto_relogin"),
+    "TG_TRANSFER_WORKERS": ("bridge", "tg_transfer_workers"),
 }
-INT_KEYS = {"api_id", "forum_chat", "official_accounts_forum_chat"}
+INT_KEYS = {"api_id", "forum_chat", "official_accounts_forum_chat", "tg_transfer_workers"}
 BOOL_KEYS = {"auto_relogin", "bridge_official_accounts", "emoji_to_wechat"}
 
 

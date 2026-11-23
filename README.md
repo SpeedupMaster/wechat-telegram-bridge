@@ -362,6 +362,7 @@ cp config.example.toml config/config.toml
 | `mark_read_on_reply` | `true` | 在 Telegram 回复消息后，是否自动将该微信会话标记为已读 |
 | `create_interval_seconds` | `20` | 两次自动建群之间的最小间隔秒数，防止触发 Telegram 限流 |
 | `max_media_mb` | `200` | 单个媒体文件的收发体积上限（MB） |
+| `tg_transfer_workers` | `0` | 大文件（`>= 2 MB`）在 Telegram 侧并发收发使用的 MTProto 连接数（环境变量 `TG_TRANSFER_WORKERS`；`0` = 自动 4～8 连接 × 512 KiB 分片，`1` = 回退 Telethon 默认单连接，`2`～`16` = 指定上限） |
 | `call_notifications` | `true` | 是否推送微信语音/视频来电通知与一键拒接按钮（关闭后也无法接听或用 `/call` 拨打） |
 | `link_card_images` | `true` | 是否将微信分享链接渲染为横向图文卡片 |
 | `xhs_reader` | `true` | 同上，小红书笔记卡片在内置阅读页中打开（视频内嵌播放）；被拦截时自动跳转原笔记 |
@@ -470,6 +471,7 @@ python -m unittest discover -s tests -v
 │   ├── callweb.py         # Telegram Mini App 微信语音通话页面与实时 PCM 音频 WebSocket 中转
 │   ├── cards.py           # 微信链接分享横向图文卡片渲染与平台品牌识别（基于 Pillow）
 │   ├── stickers.py        # Telegram 贴纸与微信原生表情双向转换及缓存（基于 Pillow / ffmpeg / rlottie）
+│   ├── tgtransfer.py      # Telegram 大文件 512 KiB 多连接并发下载/上传与速率统计
 │   └── store.py           # SQLite 状态存储（事件游标、群组/话题映射、双向消息 ID 映射）
 ├── tests/                 # 基于 Mock 客户端的完整离线单元测试
 ├── compose.yaml           # Docker Compose 编排（token-init + agent-wechat + telegram-bridge + cloudflared）
