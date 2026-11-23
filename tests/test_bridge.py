@@ -5544,6 +5544,40 @@ class LinkCardTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertIsNotNone(ks_png)
 
+            # Single-weight Regular-only setup (as in the container image without NotoSansSC-Bold.otf)
+            # synthesizes a visibly heavier Bold title and renders CJK brand badges cleanly.
+            reg_only, _, emoji_p, _ = cards._font_paths()
+            assert reg_only is not None
+            with mock.patch("bridge.cards._font_paths", return_value=(reg_only, reg_only, emoji_p, True)):
+                faux_png = cards.render_link_card(
+                    title="周末探店🌟 伪粗体标题与小红书角标测试",
+                    description="单字重环境自动超采样加粗",
+                    url="https://www.xiaohongshu.com/discovery/item/66f2",
+                    app_type=5,
+                )
+                zhihu_png = cards.render_link_card(
+                    title="如何评价单字重超采样加粗？",
+                    description="知乎角标同样走超采样描边",
+                    url="https://www.zhihu.com/question/12345",
+                    app_type=5,
+                )
+            self.assertIsNotNone(faux_png)
+            self.assertIsNotNone(zhihu_png)
+            im_faux = Image.open(io.BytesIO(faux_png))
+            self.assertEqual((im_faux.size[0], im_faux.mode), (cards.CARD_WIDTH, "RGB"))
+
+            from PIL import ImageDraw
+            c_reg = Image.new("RGB", (320, 64), (255, 255, 255))
+            c_faux = Image.new("RGB", (320, 64), (255, 255, 255))
+            f_reg = cards._load_font(reg_only, cards.TITLE_SIZE)
+            cards._draw_mixed_text(c_reg, ImageDraw.Draw(c_reg), (8, 8), "露营装备指南",
+                                   f_reg, cards.TITLE_SIZE, cards.TITLE_COLOR)
+            cards._draw_mixed_text(c_faux, ImageDraw.Draw(c_faux), (8, 8), "露营装备指南",
+                                   f_reg, cards.TITLE_SIZE, cards.TITLE_COLOR, faux_bold_path=reg_only)
+            ink_reg = sum(1 for px in c_reg.getdata() if px != (255, 255, 255))
+            ink_faux = sum(1 for px in c_faux.getdata() if px != (255, 255, 255))
+            self.assertGreater(ink_faux, ink_reg)
+
     async def test_download_link_thumbnail(self):
         thumb_ok = _png(120, 120, (255, 60, 80))
         self.daemon.media["m_avail"] = [{

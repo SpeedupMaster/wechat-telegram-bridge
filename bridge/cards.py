@@ -478,7 +478,7 @@ def _font_paths() -> tuple[str | None, str | None, str | None, bool]:
     return reg, bold, emoji, has_cjk
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=12)
 def _load_font(path: str | None, size: int, *, index: int | None = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     if path:
         idx = _ttc_sc_index(path) if index is None else index
@@ -660,17 +660,39 @@ def _wrap_lines(text: str, font, size: int, max_width: int, max_lines: int) -> l
     return ["".join(c for c, _, _ in ln).rstrip() for ln in lines if ln]
 
 
+def _draw_faux_bold_text(canvas: Image.Image, pos: tuple[int, int], chunk: str,
+                         font_path: str, size: int, fill: tuple[int, int, int]) -> None:
+    """Synthesize a crisp Bold weight from a Regular face via 2x supersampled 1px stroke (=0.5px)."""
+    font2x = _load_font(font_path, size * 2)
+    bbox = font2x.getbbox(chunk, stroke_width=1)
+    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        return
+    ox = ((max(0, -bbox[0]) + 5) // 2) * 2
+    oy = ((max(0, -bbox[1]) + 5) // 2) * 2
+    tw = max(2, ((bbox[2] + ox + 5) // 2) * 2)
+    th = max(2, ((bbox[3] + oy + 5) // 2) * 2)
+    layer = Image.new("RGBA", (tw, th), (*fill, 0))
+    ImageDraw.Draw(layer).text((ox, oy), chunk, font=font2x, fill=(*fill, 255), stroke_width=1)
+    layer = layer.resize((tw // 2, th // 2), Image.LANCZOS)
+    canvas.paste(layer, (pos[0] - ox // 2, pos[1] - oy // 2), layer)
+
+
 def _draw_mixed_text(canvas: Image.Image, draw: ImageDraw.ImageDraw, pos: tuple[int, int],
-                     text: str, font, size: int, fill: tuple[int, int, int]) -> None:
+                     text: str, font, size: int, fill: tuple[int, int, int], *,
+                     faux_bold_path: str | None = None) -> None:
     x, y = float(pos[0]), float(pos[1])
     buf: list[str] = []
+    use_faux = bool(faux_bold_path and isinstance(font, ImageFont.FreeTypeFont))
 
     def flush() -> None:
         nonlocal x
         if not buf:
             return
         chunk = "".join(buf)
-        draw.text((round(x), round(y)), chunk, font=font, fill=fill)
+        if use_faux and faux_bold_path:
+            _draw_faux_bold_text(canvas, (round(x), round(y)), chunk, faux_bold_path, size, fill)
+        else:
+            draw.text((round(x), round(y)), chunk, font=font, fill=fill)
         x += float(font.getlength(chunk))
         buf.clear()
 
@@ -728,7 +750,7 @@ def _draw_rounded_thumb(canvas: Image.Image, thumb: Image.Image, box: tuple[int,
 
 
 def _draw_brand_badge(canvas: Image.Image, x: int, y: int, size: int, source: LinkSource,
-                      bold_path: str | None, has_cjk: bool) -> None:
+                      bold_path: str | None, has_cjk: bool, *, faux_bold: bool = False) -> None:
     scale = 4
     s = size * scale
     badge = Image.new("RGBA", (s, s), (0, 0, 0, 0))
@@ -736,16 +758,17 @@ def _draw_brand_badge(canvas: Image.Image, x: int, y: int, size: int, source: Li
     d.rounded_rectangle((0, 0, s - 1, s - 1), radius=round(s * 0.24), fill=(*source.color, 255))
 
     white = (255, 255, 255, 255)
+    sw = 1 if faux_bold else 0
     if source.brand == "xhs":
         if has_cjk and bold_path:
             f = _load_font(bold_path, round(s * 0.28))
-            d.text((s // 2, round(s * 0.52)), "小红书", font=f, fill=white, anchor="mm")
+            d.text((s // 2, round(s * 0.52)), "小红书", font=f, fill=white, anchor="mm", stroke_width=sw)
         else:
             f = _load_font(bold_path, round(s * 0.34))
-            d.text((s // 2, round(s * 0.52)), "RED", font=f, fill=white, anchor="mm")
+            d.text((s // 2, round(s * 0.52)), "RED", font=f, fill=white, anchor="mm", stroke_width=sw)
     elif source.brand == "zhihu" and (has_cjk or not source.label.isascii()):
         f = _load_font(bold_path, round(s * 0.54))
-        d.text((s // 2, round(s * 0.50)), "知", font=f, fill=white, anchor="mm")
+        d.text((s // 2, round(s * 0.50)), "知", font=f, fill=white, anchor="mm", stroke_width=sw)
     elif source.brand == "wxmp":
         for idx, ratio in enumerate((0.34, 0.50, 0.66)):
             right = 0.56 if idx == 2 else 0.74
@@ -824,6 +847,7 @@ def render_link_card(
         return None
 
     title_font = _load_font(bold_path, TITLE_SIZE)
+    faux_bold = bool(reg_path and bold_path == reg_path)
     desc_font = _load_font(reg_path, DESC_SIZE)
     source_font = _load_font(reg_path, SOURCE_SIZE)
 
@@ -852,7 +876,8 @@ def render_link_card(
 
     y = PAD_TOP
     for line in title_lines:
-        _draw_mixed_text(canvas, draw, (PAD_X, y), line, title_font, TITLE_SIZE, TITLE_COLOR)
+        _draw_mixed_text(canvas, draw, (PAD_X, y), line, title_font, TITLE_SIZE, TITLE_COLOR,
+                         faux_bold_path=reg_path if faux_bold else None)
         y += TITLE_LINE_H
 
     if has_body:
@@ -867,7 +892,7 @@ def render_link_card(
         y += body_h
 
     y += FOOTER_GAP
-    _draw_brand_badge(canvas, PAD_X, y, BADGE_SIZE, source, bold_path, has_cjk)
+    _draw_brand_badge(canvas, PAD_X, y, BADGE_SIZE, source, bold_path, has_cjk, faux_bold=faux_bold)
     try:
         bbox = source_font.getbbox(source.label)
         ink_mid = (bbox[1] + bbox[3]) / 2
