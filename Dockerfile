@@ -75,7 +75,7 @@ RUN set -eux; \
         --enable-protocol=file,pipe \
         --enable-demuxer=hevc,h264,mov,matroska,gif,wav,pcm_s16le,ogg,mp3,aac,amr,avi,flv,mpegts,image2,image2pipe,rawvideo \
         --enable-muxer=ogg,webm,gif,image2,image2pipe,rawvideo,null \
-        --enable-decoder=hevc,h264,vp8,vp9,libvpx_vp9,libdav1d,mpeg4,h263,mpeg2video,mpeg1video,gif,png,pam,mjpeg,webp,bmp,rawvideo,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_u8,pcm_f32le,pcm_f64le,pcm_alaw,pcm_mulaw,adpcm_ima_wav,adpcm_ms,mp3,aac,opus,vorbis,amrnb,amrwb \
+        --enable-decoder=hevc,h264,vp8,vp9,libvpx_vp8,libvpx_vp9,libdav1d,mpeg4,h263,mpeg2video,mpeg1video,gif,png,pam,mjpeg,webp,bmp,rawvideo,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_u8,pcm_f32le,pcm_f64le,pcm_alaw,pcm_mulaw,adpcm_ima_wav,adpcm_ms,mp3,aac,opus,vorbis,amrnb,amrwb \
         --enable-encoder=libopus,libvpx_vp9,gif,pam,png,mjpeg,rawvideo \
         --enable-parser=hevc,h264,vp8,vp9,av1,mpeg4video,mpegaudio,aac,opus,png,gif,mjpeg,bmp \
         --enable-bsf=null,extract_extradata,vp9_superframe,vp9_superframe_split,vp9_raw_reorder \

@@ -82,7 +82,7 @@ async def run_in_media_executor(fn: Callable, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(get_media_executor(), fn, *args)
 
-STICKER_CACHE_VERSION = 3
+STICKER_CACHE_VERSION = 4
 STICKER_CACHE_MAX_BYTES = 100 * 1024 * 1024
 
 WX_STICKER_SIZE = 384
@@ -446,12 +446,17 @@ def _rgba_to_transparent_gif_pillow(frames: list[tuple[Image.Image, int]], max_e
     _ensure_pil()
     pals: list[Image.Image] = []
     durations: list[int] = []
-    any_alpha = False
+    scaled: list[tuple[Image.Image, int]] = []
     for frame, delay_ms in frames:
         im = frame.convert("RGBA")
         if max(im.size) > max_edge:
             w, h = _fit_size(im.size[0], im.size[1], max_edge)
             im = _resize_rgba(im, w, h)
+        scaled.append((im, delay_ms))
+    any_alpha = _rgba_frames_have_alpha([im for im, _ in scaled])
+    for im, delay_ms in scaled:
+        if any_alpha and len(scaled) > 1:
+            im = _ensure_frame_translucent(im, im.size[0], im.size[1])  # type: ignore[assignment]
         pal, has_alpha = _rgba_frame_to_pal(im, max_colors=max_colors)
         any_alpha = any_alpha or has_alpha
         pals.append(pal)
@@ -484,17 +489,38 @@ def _clean_rgba_alpha(im: Image.Image) -> Image.Image:
     return clean
 
 
-def _rgba_frames_have_alpha(frames: Sequence[Image.Image | bytes]) -> bool:
+def _frame_has_transparency(frame: Image.Image | bytes) -> bool:
     _ensure_pil()
-    for frame in frames:
-        if isinstance(frame, Image.Image):
-            rgba = frame if frame.mode == "RGBA" else frame.convert("RGBA")
-            lo, _ = rgba.getchannel("A").getextrema()
-            if lo < 128:
-                return True
-        elif len(frame) >= 4 and frame[3::4].translate(None, _OPAQUE_ALPHA_TABLE):
-            return True
-    return False
+    if isinstance(frame, Image.Image):
+        rgba = frame if frame.mode == "RGBA" else frame.convert("RGBA")
+        lo, _ = rgba.getchannel("A").getextrema()
+        return lo < 128
+    return len(frame) >= 4 and bool(frame[3::4].translate(None, _OPAQUE_ALPHA_TABLE))
+
+
+def _ensure_frame_translucent(frame: Image.Image | bytes, width: int, height: int) -> Image.Image | bytes:
+    """Ensure an all-opaque frame inside a transparent animation has 1 transparent corner pixel.
+
+    FFmpeg's GIF encoder (libavcodec/gif.c) checks translucency per frame: an all-opaque flash/zoom
+    frame inside a transparent sticker otherwise gets `GCE_DISPOSAL_INPLACE` (leaving its solid
+    white/black background stuck behind all subsequent transparent frames) and bogus `transdiff`
+    against the already-disposed previous frame.
+    """
+    if width <= 0 or height <= 0 or _frame_has_transparency(frame):
+        return frame
+    if isinstance(frame, Image.Image):
+        im = frame.convert("RGBA") if frame.mode != "RGBA" else frame.copy()
+        im.putpixel((0, 0), (0, 0, 0, 0))
+        return im
+    if len(frame) >= 4:
+        buf = bytearray(frame)
+        buf[0:4] = b"\x00\x00\x00\x00"
+        return bytes(buf)
+    return frame
+
+
+def _rgba_frames_have_alpha(frames: Sequence[Image.Image | bytes]) -> bool:
+    return any(_frame_has_transparency(frame) for frame in frames)
 
 
 def _dedup_sampled_frames(
@@ -627,7 +653,10 @@ def _ffmpeg_rgba_to_gif(frames: Sequence[Image.Image | bytes], width: int, heigh
             try:
                 assert proc.stdin is not None
                 try:
+                    multi_trans = transparent and len(frames) > 1
                     for frame in frames:
+                        if multi_trans:
+                            frame = _ensure_frame_translucent(frame, width, height)
                         raw = (frame if frame.mode == "RGBA" else frame.convert("RGBA")).tobytes() if isinstance(frame, Image.Image) else frame
                         proc.stdin.write(raw)
                 except BrokenPipeError:
@@ -954,7 +983,7 @@ def _decode_video_rgba_frames(
     scale = (f"scale='min(iw\\,{max_edge})':'min(ih\\,{max_edge})'"
              ":force_original_aspect_ratio=decrease:flags=lanczos")
     if preserve_alpha:
-        vf = f"fps={base_fps:g},format=rgba,premultiply=inplace=1,{scale},unpremultiply=inplace=1"
+        vf = f"fps={base_fps:g},format=rgba,premultiply=inplace=1,{scale},unpremultiply=inplace=1,format=rgba"
     else:
         vf = f"fps={base_fps:g},{scale},format=rgba"
     with tempfile.TemporaryDirectory() as tmp:
@@ -1043,6 +1072,22 @@ def _transcode_video_to_wechat_gif(
     )
 
 
+def _is_webm(data: bytes, mime: str = "") -> bool:
+    if mime == "video/webm":
+        return True
+    return len(data) >= 32 and data[:4] == b"\x1a\x45\xdf\xa3" and b"webm" in data[:64].lower()
+
+
+def _webm_decoder_args(data: bytes) -> tuple[str, ...]:
+    """Select libvpx decoder for VP8/VP9 WebM so Matroska BlockAdditions alpha is preserved."""
+    head = data[:4096]
+    if b"V_VP8" in head:
+        return ("-c:v", "libvpx")
+    if b"V_AV1" in head:
+        return ()
+    return ("-c:v", "libvpx-vp9")
+
+
 def webm_to_wechat_gif(
     data: bytes,
     ffmpeg: str,
@@ -1050,10 +1095,21 @@ def webm_to_wechat_gif(
     max_edge: int = WX_STICKER_SIZE,
     fast_bytes: int | None = None,
 ) -> bytes:
-    return _transcode_video_to_wechat_gif(
-        data, ffmpeg, ext=".webm", input_args=("-c:v", "libvpx-vp9"), preserve_alpha=True,
-        max_edge=max_edge, fast_bytes=fast_bytes,
-    )
+    dec_args = _webm_decoder_args(data)
+    try:
+        return _transcode_video_to_wechat_gif(
+            data, ffmpeg, ext=".webm", input_args=dec_args, preserve_alpha=True,
+            max_edge=max_edge, fast_bytes=fast_bytes,
+        )
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode(errors="replace").lower()
+        if dec_args and ("unknown decoder" in err or ("decoder" in err and "not found" in err)):
+            log.warning("ffmpeg lacks %s decoder; falling back to default WebM decoder (alpha may be lost)", dec_args[-1])
+            return _transcode_video_to_wechat_gif(
+                data, ffmpeg, ext=".webm", input_args=(), preserve_alpha=True,
+                max_edge=max_edge, fast_bytes=fast_bytes,
+            )
+        raise
 
 
 def gif_media_to_wechat_gif(
@@ -1095,7 +1151,7 @@ def gif_media_to_wechat_gif(
         return data if compliant and len(data) <= len(out) else out
     if not ffmpeg:
         raise ValueError("ffmpeg_missing")
-    if mime == "video/webm":
+    if _is_webm(data, mime):
         return webm_to_wechat_gif(data, ffmpeg, max_edge=max_edge, fast_bytes=fast_bytes)
     return _transcode_video_to_wechat_gif(
         data, ffmpeg, ext=".mp4", preserve_alpha=False, max_edge=max_edge, video_attempts=True,
@@ -1243,11 +1299,11 @@ async def to_wechat_sticker(
             ),
             cache=cache, cache_key=key,
         )
-    if mime == "video/webm":
+    if _is_webm(data, mime):
         if not ffmpeg:
             return "需要 ffmpeg 才能转换视频贴纸"
         return await _run_wechat_sticker_convert(
-            "sticker", mime, data,
+            "sticker", "video/webm", data,
             lambda: webm_to_wechat_gif(data, ffmpeg, max_edge=max_edge, fast_bytes=fast_bytes),
             cache=cache, cache_key=key,
         )

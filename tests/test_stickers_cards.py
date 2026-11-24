@@ -772,6 +772,86 @@ class StickerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(small_cache.get("mid"))
         self.assertEqual(small_cache.get("new"), b"N" * 100)
 
+    async def test_transparent_animation_with_full_bleed_flash_frame_preserves_transparency(self):
+        import io
+        from PIL import Image, ImageDraw, ImageSequence
+
+        # Frame 0: full-bleed white flash (all alpha=255); Frame 1: transparent bg; Frame 2: full-bleed black flash;
+        # Frame 3: transparent bg. Without per-frame translucency normalization, Frame 0/2 leave white/black stuck.
+        f0 = Image.new("RGBA", (128, 128), (255, 255, 255, 255))
+        f1 = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+        ImageDraw.Draw(f1).ellipse((32, 32, 96, 96), fill=(255, 30, 30, 255))
+        f2 = Image.new("RGBA", (128, 128), (0, 0, 0, 255))
+        f3 = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
+        ImageDraw.Draw(f3).rectangle((40, 40, 88, 88), fill=(30, 120, 255, 255))
+
+        gif_bytes = self.stickers._rgba_to_transparent_gif_pillow(
+            [(f0, 60), (f1, 60), (f2, 60), (f3, 60)], max_edge=128,
+        )
+        # Caller's source frames must not be mutated in place
+        self.assertEqual(f0.getpixel((0, 0)), (255, 255, 255, 255))
+        self.assertEqual(f2.getpixel((0, 0)), (0, 0, 0, 255))
+
+        with Image.open(io.BytesIO(gif_bytes)) as gim:
+            decoded = [fr.convert("RGBA") for fr in ImageSequence.Iterator(gim)]
+        self.assertEqual(len(decoded), 4)
+        # Frames 1 and 3 must keep transparent backgrounds rather than inheriting white/black from Frame 0/2
+        self.assertEqual(decoded[1].getpixel((10, 10))[3], 0)
+        self.assertColor(decoded[1].getpixel((64, 64))[:3], (255, 30, 30))
+        self.assertEqual(decoded[3].getpixel((10, 10))[3], 0)
+        self.assertColor(decoded[3].getpixel((64, 64))[:3], (30, 120, 255))
+
+        # Raw RGBA bytes path used by _ffmpeg_rgba_to_gif also marks opaque flash frames translucent
+        raw_opaque = bytes([255, 255, 255, 255] * 16)
+        patched_raw = self.stickers._ensure_frame_translucent(raw_opaque, 4, 4)
+        self.assertTrue(self.stickers._frame_has_transparency(patched_raw))
+        self.assertEqual(patched_raw[4:], raw_opaque[4:])
+
+    async def test_webm_codec_detection_ebml_sniffing_and_vp8_support(self):
+        import subprocess
+        from unittest import mock
+
+        ebml_vp8 = b"\x1a\x45\xdf\xa3" + b"\x00" * 8 + b"webm" + b"\x00" * 16 + b"\x86\x85V_VP8" + b"\x00" * 16
+        ebml_vp9 = b"\x1a\x45\xdf\xa3" + b"\x00" * 8 + b"webm" + b"\x00" * 16 + b"\x86\x85V_VP9" + b"\x00" * 16
+        ebml_av1 = b"\x1a\x45\xdf\xa3" + b"\x00" * 8 + b"webm" + b"\x00" * 16 + b"\x86\x85V_AV1" + b"\x00" * 16
+
+        self.assertTrue(self.stickers._is_webm(ebml_vp8, "application/octet-stream"))
+        self.assertFalse(self.stickers._is_webm(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 32, "video/mp4"))
+        self.assertEqual(self.stickers._webm_decoder_args(ebml_vp8), ("-c:v", "libvpx"))
+        self.assertEqual(self.stickers._webm_decoder_args(ebml_vp9), ("-c:v", "libvpx-vp9"))
+        self.assertEqual(self.stickers._webm_decoder_args(ebml_av1), ())
+
+        seen_args: list[tuple[tuple[str, ...], bool]] = []
+
+        def fake_transcode(data, ffmpeg, *, ext, input_args=(), preserve_alpha=True, **kw):
+            seen_args.append((input_args, preserve_alpha))
+            return b"GIF89a-ok"
+
+        with mock.patch.object(self.stickers, "find_ffmpeg", return_value="ffmpeg"), \
+             mock.patch.object(self.stickers, "_transcode_video_to_wechat_gif", side_effect=fake_transcode):
+            out_gif = self.stickers.gif_media_to_wechat_gif(ebml_vp8, "application/octet-stream", "ffmpeg")
+            res_st = await self.stickers.to_wechat_sticker(ebml_vp8, "application/octet-stream")
+        self.assertEqual(out_gif, b"GIF89a-ok")
+        self.assertEqual(res_st, ("sticker", b"GIF89a-ok"))
+        self.assertEqual(seen_args, [(("-c:v", "libvpx"), True), (("-c:v", "libvpx"), True)])
+
+        # Fallback when local ffmpeg build lacks libvpx decoder
+        calls = 0
+
+        def fail_first_unknown_decoder(data, ffmpeg, *, ext, input_args=(), preserve_alpha=True, **kw):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise subprocess.CalledProcessError(1, ["ffmpeg"], stderr=b"Unknown decoder 'libvpx'")
+            return b"GIF89a-fallback"
+
+        with mock.patch.object(self.stickers, "_transcode_video_to_wechat_gif", side_effect=fail_first_unknown_decoder):
+            self.assertEqual(self.stickers.webm_to_wechat_gif(ebml_vp8, "ffmpeg"), b"GIF89a-fallback")
+        self.assertEqual(calls, 2)
+
+        dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("libvpx_vp8,libvpx_vp9", dockerfile)
+
     def test_extract_video_meta_and_thumb(self) -> None:
         self.assertIsNone(self.stickers.extract_video_meta_and_thumb(b"not a video", "bad.mp4"))
         if self.ffmpeg:
