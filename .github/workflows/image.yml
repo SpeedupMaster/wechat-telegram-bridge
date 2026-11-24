@@ -22,7 +22,7 @@ jobs:
       - run: pip install -r requirements.txt imageio-ffmpeg  # ffmpeg for the sticker tests
       - run: python -m unittest discover -s tests -t . -v
         env:
-          PYTHONWARNINGS: ignore::ResourceWarning
+          PYTHONWARNINGS: error::ResourceWarning
 
   image:
     needs: test

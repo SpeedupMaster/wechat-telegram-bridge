@@ -13,7 +13,9 @@ WeChat -> Telegram (native Telegram sticker):
 from __future__ import annotations
 
 import asyncio
+import atexit
 import bisect
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import hashlib
 import io
@@ -50,6 +52,35 @@ def _ensure_pil() -> None:
         Image, ImageChops, ImageSequence, ImageStat = _Image, _ImageChops, _ImageSequence, _ImageStat
 
 log = logging.getLogger("stickers")
+
+_MEDIA_EXECUTOR_LOCK = threading.Lock()
+_MEDIA_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def get_media_executor() -> ThreadPoolExecutor:
+    """Dedicated bounded thread pool for heavy sticker transcoding and video thumbnail extraction."""
+    global _MEDIA_EXECUTOR
+    with _MEDIA_EXECUTOR_LOCK:
+        if _MEDIA_EXECUTOR is None:
+            _MEDIA_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bridge-media")
+        return _MEDIA_EXECUTOR
+
+
+def shutdown_media_executor(*, wait: bool = False) -> None:
+    global _MEDIA_EXECUTOR
+    with _MEDIA_EXECUTOR_LOCK:
+        ex, _MEDIA_EXECUTOR = _MEDIA_EXECUTOR, None
+    if ex is not None:
+        ex.shutdown(wait=wait)
+
+
+atexit.register(shutdown_media_executor)
+
+
+async def run_in_media_executor(fn: Callable, *args):
+    """Run a heavy media/transcode function in the isolated 2-worker media executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(get_media_executor(), fn, *args)
 
 STICKER_CACHE_VERSION = 3
 STICKER_CACHE_MAX_BYTES = 100 * 1024 * 1024
@@ -1163,7 +1194,7 @@ async def _run_wechat_sticker_convert(
             return "sticker", cached
     t0 = time.monotonic()
     try:
-        out = await asyncio.to_thread(fn)
+        out = await run_in_media_executor(fn)
         if cache is not None:
             cache.put(key, out)
         try:

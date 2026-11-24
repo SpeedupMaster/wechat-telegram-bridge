@@ -1,10 +1,16 @@
 """SQLite state: event cursor, WeChat thread <-> Telegram group or forum topic, message id mapping."""
 from __future__ import annotations
 
+import contextlib
 import secrets
 import sqlite3
 import time
 from pathlib import Path
+
+SENT_MAX_ROWS = 5_000
+MSGMAP_MAX_ROWS = 100_000
+ARTICLES_MAX_ROWS = 20_000
+PRUNE_EVERY_WRITES = 200
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -70,7 +76,9 @@ CREATE INDEX IF NOT EXISTS msgmap_wx_server ON msgmap (wx_thread, wx_server);
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, max_sent: int = SENT_MAX_ROWS,
+                 max_msgmap: int = MSGMAP_MAX_ROWS, max_articles: int = ARTICLES_MAX_ROWS,
+                 prune_interval: int = PRUNE_EVERY_WRITES):
         self.db = sqlite3.connect(path, isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA cache_size=-1024")
@@ -78,6 +86,78 @@ class Store:
         self.db.execute("PRAGMA temp_store=FILE")
         self.db.executescript(SCHEMA)
         self._cache_seq = 0
+        self._closed = False
+        self._max_sent = max(0, int(max_sent))
+        self._max_msgmap = max(0, int(max_msgmap))
+        self._max_articles = max(0, int(max_articles))
+        self._prune_interval = max(0, int(prune_interval))
+        self._write_count = 0
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
+    @contextlib.contextmanager
+    def _tx(self):
+        if self.db.in_transaction:
+            yield
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+        else:
+            if self.db.in_transaction:
+                self.db.execute("COMMIT")
+
+    def _table_may_exceed(self, table: str, keep: int) -> bool:
+        if keep <= 0:
+            return False
+        bounds = self.db.execute(f"SELECT MIN(rowid), MAX(rowid) FROM {table}").fetchone()
+        return bool(bounds and bounds[0] is not None and bounds[1] - bounds[0] >= keep)
+
+    def _prune_table(self, table: str, keep: int) -> int:
+        if not self._table_may_exceed(table, keep):
+            return 0
+        row = self.db.execute(
+            f"SELECT rowid FROM {table} ORDER BY rowid DESC LIMIT 1 OFFSET ?",
+            (keep - 1,),
+        ).fetchone()
+        if not row:
+            return 0
+        cur = self.db.execute(f"DELETE FROM {table} WHERE rowid < ?", (row[0],))
+        return max(0, cur.rowcount)
+
+    def prune(self, *, max_sent: int | None = None, max_msgmap: int | None = None,
+              max_articles: int | None = None) -> dict[str, int]:
+        """Trim unbounded history tables down to their latest `rowid` high-water marks."""
+        limits = (
+            ("sent", self._max_sent if max_sent is None else max(0, int(max_sent))),
+            ("msgmap", self._max_msgmap if max_msgmap is None else max(0, int(max_msgmap))),
+            ("articles", self._max_articles if max_articles is None else max(0, int(max_articles))),
+        )
+        candidates = [(t, k) for t, k in limits if self._table_may_exceed(t, k)]
+        removed = {t: 0 for t, _ in limits}
+        if not candidates:
+            return removed
+        with self._tx():
+            for table, keep in candidates:
+                removed[table] = self._prune_table(table, keep)
+        return removed
+
+    def _maybe_prune(self) -> None:
+        self._write_count += 1
+        if self._prune_interval > 0 and self._write_count >= self._prune_interval:
+            self._write_count = 0
+            self.prune()
 
     # --- kv ---------------------------------------------------------------
     def get(self, key: str) -> str | None:
@@ -98,17 +178,19 @@ class Store:
         return row[0] if row else None
 
     def link(self, wx_thread: str, tg_chat: int, title: str) -> None:
-        self.db.execute("DELETE FROM threads WHERE wx_thread=? OR tg_chat=?", (wx_thread, tg_chat))
-        self.db.execute("INSERT INTO threads(wx_thread,tg_chat,title,created_at) VALUES(?,?,?,?)",
-                        (wx_thread, tg_chat, title, int(time.time())))
+        with self._tx():
+            self.db.execute("DELETE FROM threads WHERE wx_thread=? OR tg_chat=?", (wx_thread, tg_chat))
+            self.db.execute("INSERT INTO threads(wx_thread,tg_chat,title,created_at) VALUES(?,?,?,?)",
+                            (wx_thread, tg_chat, title, int(time.time())))
 
     def unlink(self, wx_thread: str) -> None:
         self.db.execute("DELETE FROM threads WHERE wx_thread=?", (wx_thread,))
 
     def migrate_chat(self, old_chat: int, new_chat: int) -> None:
-        self.db.execute("UPDATE threads SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
-        self.db.execute("UPDATE topics SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
-        self.db.execute("UPDATE msgmap SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
+        with self._tx():
+            self.db.execute("UPDATE threads SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
+            self.db.execute("UPDATE topics SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
+            self.db.execute("UPDATE msgmap SET tg_chat=? WHERE tg_chat=?", (new_chat, old_chat))
 
     def linked_chats(self) -> set[int]:
         return {r[0] for r in self.db.execute("SELECT tg_chat FROM threads")}
@@ -135,10 +217,11 @@ class Store:
         return self.thread_for_topic(tg_chat, 0)
 
     def link_topic(self, wx_thread: str, tg_chat: int, tg_topic: int, title: str) -> None:
-        self.db.execute("DELETE FROM topics WHERE wx_thread=? OR (tg_chat=? AND tg_topic=?)",
-                        (wx_thread, tg_chat, tg_topic))
-        self.db.execute("INSERT INTO topics(wx_thread,tg_chat,tg_topic,title,created_at) VALUES(?,?,?,?,?)",
-                        (wx_thread, tg_chat, tg_topic, title, int(time.time())))
+        with self._tx():
+            self.db.execute("DELETE FROM topics WHERE wx_thread=? OR (tg_chat=? AND tg_topic=?)",
+                            (wx_thread, tg_chat, tg_topic))
+            self.db.execute("INSERT INTO topics(wx_thread,tg_chat,tg_topic,title,created_at) VALUES(?,?,?,?,?)",
+                            (wx_thread, tg_chat, tg_topic, title, int(time.time())))
 
     def link_topic_group(self, wx_thread: str, tg_chat: int, title: str) -> None:
         self.link_topic(wx_thread, tg_chat, 0, title)
@@ -180,6 +263,7 @@ class Store:
             "ON CONFLICT(tg_chat,side,tg_msg) DO UPDATE SET wx_msg=COALESCE(excluded.wx_msg,wx_msg), "
             "wx_server=COALESCE(excluded.wx_server,wx_server)",
             (tg_chat, side, tg_msg, wx_thread, wx_msg, wx_server))
+        self._maybe_prune()
 
     def wx_entry_for_tg(self, tg_chat: int, tg_msg: int, side: str = "user") -> tuple[str, str | None, str | None] | None:
         sides = ("user", "bot") if side == "user" and tg_chat < -1000000000000 else (side,)
@@ -195,34 +279,42 @@ class Store:
         entry = self.wx_entry_for_tg(tg_chat, tg_msg, side)
         return (entry[1], entry[2]) if entry else None
 
-    def tg_for_wx(self, wx_thread: str, wx_msg: str | None, wx_server: str | None,
-                  side: str = "bot", tg_chat: int | None = None) -> tuple[int, int] | None:
-        """Telegram copy of a WeChat message; `tg_chat` limits it to one chat (e.g. after switching modes)."""
+    def tg_msgs_for_wx(self, wx_thread: str, wx_msg: str | None, wx_server: str | None,
+                       side: str = "bot", tg_chat: int | None = None) -> tuple[int, list[int]] | None:
+        """All Telegram message IDs (ordered ascending) mapped to a WeChat message in one chat."""
         in_chat, chat_args = ("", ()) if tg_chat is None else (" AND tg_chat=?", (tg_chat,))
         for col, val in (("wx_msg", self._norm_id(wx_msg)), ("wx_server", self._norm_id(wx_server))):
             if not val:
                 continue
-            row = self.db.execute(
+            rows = self.db.execute(
                 f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side=?{in_chat} "
-                "ORDER BY tg_msg LIMIT 1",
-                (wx_thread, val, side, *chat_args)).fetchone()
-            if row:
-                return row[0], row[1]
-            # Supergroups share one message-ID space across user and bot sessions; also match legacy user-only rows.
+                "ORDER BY tg_msg",
+                (wx_thread, val, side, *chat_args)).fetchall()
+            if rows:
+                target_chat = rows[0][0]
+                return target_chat, [r[1] for r in rows if r[0] == target_chat]
             if side == "bot":
-                row = self.db.execute(
+                rows = self.db.execute(
                     f"SELECT tg_chat, tg_msg FROM msgmap WHERE wx_thread=? AND {col}=? AND side='user' "
-                    f"AND tg_chat < -1000000000000{in_chat} ORDER BY tg_msg LIMIT 1",
-                    (wx_thread, val, *chat_args)).fetchone()
-                if row:
-                    return row[0], row[1]
+                    f"AND tg_chat < -1000000000000{in_chat} ORDER BY tg_msg",
+                    (wx_thread, val, *chat_args)).fetchall()
+                if rows:
+                    target_chat = rows[0][0]
+                    return target_chat, [r[1] for r in rows if r[0] == target_chat]
         return None
+
+    def tg_for_wx(self, wx_thread: str, wx_msg: str | None, wx_server: str | None,
+                  side: str = "bot", tg_chat: int | None = None) -> tuple[int, int] | None:
+        """Telegram copy of a WeChat message; `tg_chat` limits it to one chat (e.g. after switching modes)."""
+        hit = self.tg_msgs_for_wx(wx_thread, wx_msg, wx_server, side=side, tg_chat=tg_chat)
+        return (hit[0], hit[1][0]) if hit else None
 
     def add_sent(self, wx_thread: str, wx_server: str) -> None:
         wx_server = self._norm_id(wx_server)
         if not wx_server:
             return
         self.db.execute("INSERT OR IGNORE INTO sent(wx_thread,wx_server) VALUES(?,?)", (wx_thread, wx_server))
+        self._maybe_prune()
 
     def is_sent(self, wx_thread: str, wx_server: str) -> bool:
         wx_server = self._norm_id(wx_server)
@@ -271,6 +363,7 @@ class Store:
                           for _ in range(16))
             try:
                 self.db.execute("INSERT INTO articles(id,url,created_at) VALUES(?,?,?)", (aid, url, int(time.time())))
+                self._maybe_prune()
                 return aid
             except sqlite3.IntegrityError:
                 row = self.db.execute("SELECT id FROM articles WHERE url=?", (url,)).fetchone()
@@ -308,33 +401,34 @@ class Store:
     def save_cached_article(self, url: str, data: dict, *, max_entries: int = 500) -> None:
         now_s = int(time.time())
         now_seq = self._next_cache_ts()
-        self.db.execute(
-            "INSERT INTO article_cache(url, final_url, title, account, author, published, cover, description, content, "
-            "fetched_at, accessed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(url) DO UPDATE SET final_url=excluded.final_url, title=excluded.title, "
-            "account=excluded.account, author=excluded.author, published=excluded.published, cover=excluded.cover, "
-            "description=excluded.description, content=excluded.content, fetched_at=excluded.fetched_at, "
-            "accessed_at=excluded.accessed_at",
-            (
-                url,
-                data.get("url") or url,
-                data.get("title") or "",
-                data.get("account") or "",
-                data.get("author") or "",
-                int(data.get("published") or 0),
-                data.get("cover") or "",
-                data.get("description") or "",
-                data.get("content") or "",
-                now_s,
-                now_seq,
-            ),
-        )
-        if max_entries > 0:
+        with self._tx():
             self.db.execute(
-                "DELETE FROM article_cache WHERE url IN ("
-                "SELECT url FROM article_cache ORDER BY accessed_at DESC LIMIT -1 OFFSET ?)",
-                (max_entries,),
+                "INSERT INTO article_cache(url, final_url, title, account, author, published, cover, description, content, "
+                "fetched_at, accessed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(url) DO UPDATE SET final_url=excluded.final_url, title=excluded.title, "
+                "account=excluded.account, author=excluded.author, published=excluded.published, cover=excluded.cover, "
+                "description=excluded.description, content=excluded.content, fetched_at=excluded.fetched_at, "
+                "accessed_at=excluded.accessed_at",
+                (
+                    url,
+                    data.get("url") or url,
+                    data.get("title") or "",
+                    data.get("account") or "",
+                    data.get("author") or "",
+                    int(data.get("published") or 0),
+                    data.get("cover") or "",
+                    data.get("description") or "",
+                    data.get("content") or "",
+                    now_s,
+                    now_seq,
+                ),
             )
+            if max_entries > 0:
+                self.db.execute(
+                    "DELETE FROM article_cache WHERE url IN ("
+                    "SELECT url FROM article_cache ORDER BY accessed_at DESC LIMIT -1 OFFSET ?)",
+                    (max_entries,),
+                )
 
     def delete_cached_article(self, url: str) -> None:
         self.db.execute("DELETE FROM article_cache WHERE url=?", (url,))

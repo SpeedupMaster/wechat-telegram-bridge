@@ -234,10 +234,14 @@ class LoginMixin:
         if self.qr_task and not self.qr_task.done():
             self.qr_task.cancel()
 
+    def _spawn_login_task(self, coro) -> asyncio.Task:
+        spawn = getattr(self, "_spawn_bg", None)
+        return spawn(coro) if callable(spawn) else asyncio.create_task(coro)
+
     async def _start_tg_qr(self, chat_id: int) -> None:
         self._cancel_qr_task()
         self.login_step = "qr"
-        self.qr_task = asyncio.create_task(self._login_qr(chat_id))
+        self.qr_task = self._spawn_login_task(self._login_qr(chat_id))
 
     @staticmethod
     def _method_text() -> str:
@@ -689,7 +693,7 @@ class LoginMixin:
             elif self._wx_auto_relogin_phase == "running":
                 self._cancel_auto_relogin()
                 await event.answer("正在取消自动登录并切换为扫码登录…")
-                self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=True))
+                self._wx_login_task = self._spawn_login_task(self.request_wechat_login(force_qr=True))
                 return
             if self.wx_login_lock.locked():
                 if self._wx_login_phase == "awaiting_scan":
@@ -700,7 +704,7 @@ class LoginMixin:
                 await event.answer("正在切换为扫码登录…")
                 return
             await event.answer("正在获取登录二维码…")
-            self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=True))
+            self._wx_login_task = self._spawn_login_task(self.request_wechat_login(force_qr=True))
             return
         if self._wx_auto_relogin_phase == "waiting":
             self._cancel_auto_relogin()
@@ -708,7 +712,7 @@ class LoginMixin:
             await event.answer(self._wx_login_busy_hint())
             return
         await event.answer("正在发起微信登录…")
-        self._wx_login_task = asyncio.create_task(self.request_wechat_login(force_qr=False))
+        self._wx_login_task = self._spawn_login_task(self.request_wechat_login(force_qr=False))
 
     async def _finish_authenticated(self, info: dict) -> None:
         if info.get("connection") == "disconnected":

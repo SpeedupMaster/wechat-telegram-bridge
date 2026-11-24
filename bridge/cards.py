@@ -417,9 +417,9 @@ def extract_text_link(text: str | None) -> dict | None:
         return _parse_douyin_share(before, after, url)
     if _host_matches(host, "kuaishou.com", "kuaishouapp.com"):
         return _parse_kuaishou_share(before, after, url)
-    if _host_matches(host, "xhslink.com", "xiaohongshu.com"):
+    if _host_matches(host, "xhslink.com", "xhslink.cn", "xiaohongshu.com", "rednote.com"):
         return _parse_xhs_share(before, after, url)
-    if _host_matches(host, "b23.tv", "bilibili.com"):
+    if _host_matches(host, "b23.tv", "bili2233.cn", "bilibili.com"):
         return _parse_bili_share(before, after, url)
     return None
 
@@ -434,11 +434,11 @@ def identify_link_source(link: dict | None, app_type: int | None = None) -> Link
     def has_domain(*domains: str) -> bool:
         return _host_matches(host, *domains)
 
-    if has_domain("xiaohongshu.com", "xhslink.com") or source_name == "小红书":
+    if has_domain("xiaohongshu.com", "rednote.com", "xhslink.com", "xhslink.cn") or source_name == "小红书":
         return LinkSource("小红书", "xhs", (255, 36, 66), "📕 打开小红书")
     if has_domain("mp.weixin.qq.com"):
         return LinkSource(source_name or "微信公众号", "wxmp", (7, 193, 96), "📄 阅读全文")
-    if has_domain("bilibili.com", "b23.tv"):
+    if has_domain("bilibili.com", "b23.tv", "bili2233.cn"):
         return LinkSource(source_name or "哔哩哔哩", "bili", (251, 114, 153), "📺 打开哔哩哔哩")
     if has_domain("zhihu.com"):
         return LinkSource(source_name or "知乎", "zhihu", (0, 102, 255), "💡 打开知乎")

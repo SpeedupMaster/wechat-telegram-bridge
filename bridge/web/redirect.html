@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<noscript><meta http-equiv="refresh" content="0;url=__URL_ATTR__"></noscript>
+<title>正在打开原文…</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #1f1f1f; --muted: #666; --btn-sec: #f0f2f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17181c; --fg: #e7e8ec; --muted: #989ba6; --btn-sec: #262830; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg); }
+  body { font: 16px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+         display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .box { width: 100%; max-width: 420px; text-align: center; }
+  .msg { color: var(--muted); margin: 0 0 20px; }
+  .open, .retry { display: block; width: 100%; padding: 12px 16px; border-radius: 10px;
+                  text-decoration: none; font-weight: 600; margin-top: 10px; }
+  .open { background: #07c160; color: #fff; }
+  .retry { background: var(--btn-sec); color: var(--fg); }
+</style>
+</head>
+<body>
+<div class="box">
+  <p class="msg">__REASON__</p>
+  __OPEN__
+  __RETRY__
+</div>
+<script nonce="__NONCE__">
+(function () {
+  function post(type, data) {
+    try {
+      if (window.TelegramWebviewProxy && window.TelegramWebviewProxy.postEvent) {
+        window.TelegramWebviewProxy.postEvent(type, JSON.stringify(data || ''));
+      } else if (window.external && 'notify' in window.external) {
+        window.external.notify(JSON.stringify({eventType: type, eventData: data || ''}));
+      } else if (window.parent !== window) {
+        window.parent.postMessage(JSON.stringify({eventType: type, eventData: data || ''}), '*');
+      }
+    } catch (e) {}
+  }
+  post('web_app_expand');
+  post('web_app_ready');
+  var target = __URL_JS__;
+  if (target && /^https?:\/\//i.test(target)) {
+    window.location.replace(target);
+  }
+})();
+</script>
+</body>
+</html>

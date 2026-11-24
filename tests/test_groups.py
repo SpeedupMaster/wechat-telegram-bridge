@@ -11,7 +11,7 @@ import httpx
 
 from bridge.config import BridgeConfig, Config, TelegramConfig, WeChatConfig
 from bridge.core import Bridge
-from tests.test_bridge import ACC, FakeBot, FakeDaemon, FakeUser, _CallbackEvent, tg_event
+from tests.fakes import ACC, FakeBot, FakeDaemon, FakeUser, _CallbackEvent, tg_event
 
 ROOM = "room@chatroom"
 
@@ -89,11 +89,13 @@ class GroupTests(unittest.IsolatedAsyncioTestCase):
                      BridgeConfig(create_interval_seconds=0, sync_avatar=False),
                      Path(self.tmp.name) / "config.toml")
         self.daemon = GroupDaemon()
-        self.b = Bridge(cfg)
+        self.b = Bridge(cfg, user_client=FakeUser(), bot_client=FakeBot())
         await self.b.wx.http.aclose()
         self.b.wx.http = httpx.AsyncClient(transport=httpx.MockTransport(self.daemon.handler),
                                            headers={"Authorization": "Bearer secret-token"})
-        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.wx._poll_initial_delay = 0.0
+        self.b.wx._avatar_poll_interval = 0.0
+        self.b._bot_pair_wait = 0.0
         self.b.bot_input = object()
         self.b.bot_me = SimpleNamespace(username="mybot")
         self.b.owner_id = 999

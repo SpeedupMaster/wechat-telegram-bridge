@@ -39,10 +39,10 @@
 - **文字与富文本**：自动将微信 `#话题#` 转换为 Telegram 可点击高亮标签，完整转换微信内置小黄脸（含简/繁/英、旧式斜杠代码与历史 PUA 表情）为标准 Emoji；支持 Telegram 互动表情（`🎲`/`🎯`/`🏀`/`⚽`/`🎳`/`🎰`）转发，并可通过 `EMOJI_TO_WECHAT` 按需将 Telegram 常见 Emoji 反向转为微信小黄脸。
 - **原图、视频与大文件直传**：
   - **突破 Bot API 体积限制**：直连 Telegram MTProto 协议（协议层最高支持 2 GB，桥接默认限制 `max_media_mb = 200`）。
-  - **流式下载与断点续传**：微信附件采用流式分块下载（`≤ 8 MiB` 留存内存，超出部分自动落盘至临时文件并支持 HTTP `Range` 断点续传，转发后自动清理），传输大视频/大文件不会撑爆内存。
+  - **流式下载与断点续传**：微信附件采用流式分块下载（`≤ 1 MiB` 留存内存，超出部分自动落盘至临时文件并支持 HTTP `Range` 断点续传，转发后自动清理），传输大视频/大文件不会撑爆内存。
   - **双向原图清晰度**：微信端收发图片默认拉取并发送 `original` 原图；在 Telegram 选择「**作为文件发送**」的静态图片（≤ 25 MB）也会自动以**微信原图**形式送达，而非变成文件附件。
 - **原生表情包互通**：
-  - **微信 → Telegram**：静态表情及 WXGF 预览自动转为 Telegram 静态贴纸（`.webp`），GIF 动图表情自动转为 Telegram 动态贴纸（`.webm`）。
+  - **微信 → Telegram**：静态表情及单帧 WXGF 自动转为 Telegram 静态贴纸（`.webp`），GIF 及 WXGF 动图表情自动解码为保留透明通道的 Telegram 动态贴纸（`.webm`，需内置 `ffmpeg`）。
   - **Telegram → 微信**：静态贴纸（`.webp`）、动态贴纸（`.tgs` / `.webm`）以及 GIF 动图自动转换为透明通道 GIF 并作为**微信原生表情**发送（静态最高 512 px、动态最高 384 px，内置转换缓存）。
 - **语音条自动转码**：容器内置 `ffmpeg`，微信语音自动转为 Telegram 原生语音条（OGG/Opus），Telegram 发送的语音条直接作为微信语音发出。
 - **分享卡片与特色消息**：
@@ -203,6 +203,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `/requests` | 查看待处理的微信好友请求，点名字展开卡片后一键通过；没有待处理时显示等待对方通过的请求 |
 | `/add 微信号 [验证消息]` | 按微信号搜索微信用户，预览确认后发送好友请求（可选「仅聊天」）；已是好友时直接给出发起聊天按钮 |
 | `/newgroup 关键词 … [\| 群名]` | 按关键词搜索好友并勾选（至少 2 位）新建微信群；只匹配到一位好友的关键词会自动勾选 |
+| `/syncnames` | 从微信重新同步全部好友资料与备注（不自动修改 Telegram 标题，完成后列出标题与微信不一致的会话） |
 | `/status` | 查看桥接运行时长、收发统计、已绑定会话数、微信在线状态与待处理好友请求数 |
 | `/wxlogin` | 手动触发微信重新登录（支持手机确认或扫码） |
 | `/help` | 查看完整使用指南 |
@@ -213,6 +214,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | :--- | :---: | :--- |
 | `/wx` | 通用 | 查看当前群/话题绑定的微信名称与原始会话 ID |
 | `/contact` | 通用 | 查看微信好友资料（微信号、昵称、备注、好友关系），点按切换朋友圈权限或删除好友（别名 `/info`） |
+| `/remark [新备注]` | 通用 | 修改微信好友备注（`/remark -` 清除备注，仅发 `/remark` 查看当前备注） |
 | `/call [成员]` | 通用 | 单聊里给好友拨打微信语音/视频电话；微信群里弹出成员选择器发起群通话，可带名字预先勾选（如 `/call 张三 李四`）。需配置下文的通话页面 |
 | `/vcall [成员]` | 通用 | 直接发起微信单聊/群视频通话（需要 `agent-wechat >= 3.0.0` 及通话页面） |
 | `/members [关键词]` | 通用 | 列出当前微信群成员，点击代码块即可复制 `@名字`（别名 `/at`） |
@@ -311,7 +313,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 
 - **麦克风权限**：首次接听时需授权 Telegram 或浏览器使用麦克风；若部分客户端内置 WebView 不支持麦克风采集，页面会自动提示「在浏览器中打开」。
 - **前后台保持**：建议佩戴耳机以避免外放回声。通话期间请保持页面处于前台；若意外关闭页面，**20 秒内**通过来电消息上的「🎧 通话界面」按钮重新进入即可无缝恢复通话，超过 20 秒未连接页面则自动挂断（也可直接点击消息下方的「📴 挂断」按钮）。
-- **上游限制**：目前仅支持**语音通话**（视频来电仅支持通知与一键拒接），从 Telegram 主动发起的单聊呼叫在对方约 90 秒未接听时会自动取消；群通话需要 agent-wechat 报告 `conferenceCreate` 能力，通话中追加邀请需要 `conferenceInvite`，加入别人发起的群通话时无法追加邀请；受上游 `agent-wechat` 限制，单次通话最长持续 20 分钟。
+- **上游限制**：双向语音/视频通话中，视频通话需 `agent-wechat >= 3.0.0`（旧版仅支持语音通话，视频来电仅支持通知与一键拒接）；从 Telegram 主动发起的单聊呼叫在对方约 90 秒未接听时会自动取消；群通话需要 agent-wechat 报告 `conferenceCreate` 能力，通话中追加邀请需要 `conferenceInvite`，加入别人发起的群通话时无法追加邀请；受上游 `agent-wechat` 限制，单次通话最长持续 20 分钟。
 
 ---
 
@@ -339,6 +341,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `CF_TUNNEL_TOKEN` | 否 | 空 | Cloudflare Tunnel 的隧道 Token |
 | `EMOJI_TO_WECHAT` | 否 | `false` | 是否将 Telegram 发送的常见 Emoji 反向转为微信自带小黄脸代码（如 `😁` → `[呲牙]`、`🤦` → `[捂脸]`、`🫡` → `[社会社会]`） |
 | `AUTO_RELOGIN` | 否 | `false` | 微信掉线后是否自动尝试重新登录一次（需手机微信开启「自动登录该设备」，内置随机延迟与冷却保护，失败则提醒手动登录） |
+| `TG_TRANSFER_WORKERS` | 否 | `0` | 大文件（`>= 2 MB`）在 Telegram 侧并发收发使用的 MTProto 连接数（`0` = 自动 4～8 连接 × 512 KiB 分片，`1` = 回退单连接，`2`～`16` = 指定上限） |
 | `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v3.0.0-beta.1`） |
 
 ### 高级配置（`config/config.toml`）
@@ -462,18 +465,37 @@ python -m unittest discover -s tests -v
 .
 ├── bridge/
 │   ├── __main__.py        # CLI 入口（python -m bridge [config.toml] [-v]）
+│   ├── article.py         # Mini App 阅读页公共会话、缓存、正文与原地跳转页面渲染
+│   ├── bilibili.py        # 哔哩哔哩视频短链解析与官方嵌入播放器页面
+│   ├── calls.py           # 微信音视频来电与群通话信令状态机、来电拒接与 /call /vcall 发起
+│   ├── callweb.py         # Telegram Mini App 微信音视频通话服务端与实时音视频 WebSocket 中转
+│   ├── cards.py           # 微信链接分享横向图文卡片渲染与平台品牌识别（基于 Pillow）
+│   ├── commands.py        # 私聊与群/话题管理命令、/forum /oaforum 设置及交互式绑定选择器
 │   ├── config.py          # 环境变量与 config.toml 配置解析及校验
 │   ├── contacts.py        # 微信好友请求卡片、/requests、/add、/contact 好友资料与朋友圈权限
+│   ├── core.py            # 双向桥接核心装配、生命周期、SSE 事件流、建群/话题同步与消息收发撤回
+│   ├── douyin.py          # 抖音视频短链解析与官方嵌入播放器页面
+│   ├── embed.py           # 嵌入播放器通用的短链重定向解析与页面渲染
+│   ├── emojis.py          # 微信内置表情代码（简/繁/英、斜杠、PUA）与 Unicode Emoji 双向映射
+│   ├── formatting.py      # 消息正文/引用/链接卡片/视频号格式化、帮助文案、命令菜单与 @提及解析
 │   ├── groups.py          # 微信群管理：/group 资料卡、建群、改名、邀请/移出成员、免打扰、清空公告、退群
-│   ├── core.py            # 双向桥接核心逻辑、消息转换、@提及解析、命令与菜单注册
 │   ├── login.py           # Bot 交互式引导配对、Telegram 内联键盘/扫码登录、微信重登逻辑
-│   ├── wechat.py          # agent-wechat HTTP/SSE 异步客户端、流式媒体下载与断点续传
-│   ├── callweb.py         # Telegram Mini App 微信语音通话页面与实时 PCM 音频 WebSocket 中转
-│   ├── cards.py           # 微信链接分享横向图文卡片渲染与平台品牌识别（基于 Pillow）
-│   ├── stickers.py        # Telegram 贴纸与微信原生表情双向转换及缓存（基于 Pillow / ffmpeg / rlottie）
+│   ├── mem.py             # 运行期内存裁剪辅助（glibc malloc_trim 限频调用）
+│   ├── stickers.py        # Telegram 贴纸与微信原生表情（含 WXGF 动图）双向转换及缓存
+│   ├── store.py           # SQLite 状态存储（事件游标、群组/话题映射、双向消息 ID 映射与容量治理）
+│   ├── tghtml.py          # Telethon HTML 解析扩展（<tg-time> 日期实体与 UTF-16 安全分片）
 │   ├── tgtransfer.py      # Telegram 大文件 512 KiB 多连接并发下载/上传与速率统计
-│   └── store.py           # SQLite 状态存储（事件游标、群组/话题映射、双向消息 ID 映射）
-├── tests/                 # 基于 Mock 客户端的完整离线单元测试
+│   ├── wechat.py          # agent-wechat HTTP/SSE/WS 异步客户端、流式媒体下载与断点续传
+│   ├── xhs.py             # 小红书笔记抓取与内置阅读页解析
+│   └── web/               # Mini App 静态前端模板（通话页、AudioWorklet、阅读页、跳转与播放器）
+│       ├── __init__.py    # 静态模板内存缓存加载器
+│       ├── call.html      # 音视频通话 Mini App 前端页面
+│       ├── worklet.js     # 浏览器端 PCM16 AudioWorklet 处理器
+│       ├── reader.html    # 小红书内置阅读页模板
+│       ├── redirect.html  # Mini App 原地跳转模板
+│       └── player.html    # 抖音/B 站官方嵌入播放器切换页模板
+├── tests/                 # 基于 Mock 客户端的按领域拆分离线单元测试（fakes.py + 各功能测试模块）
+├── pyproject.toml         # 项目元数据与 Ruff 静态检查配置
 ├── compose.yaml           # Docker Compose 编排（token-init + agent-wechat + telegram-bridge + cloudflared）
 ├── compose.build.yaml     # 可选 Compose 覆盖文件（从本机源码构建 telegram-bridge 镜像）
 ├── Dockerfile             # 桥接服务镜像构建文件（内置 ffmpeg、gifsicle 与 Noto CJK/Emoji 字体）
@@ -522,7 +544,7 @@ python -m unittest discover -s tests -v
 <details>
 <summary><b>6. 为什么个别微信表情显示为静态图或提示 <code>[表情，无法获取：…]</code>？</b></summary>
 
-- **WXGF 动图表情**：受限于上游 `agent-wechat` 目前仅对 WXGF 编码表情提供单帧预览解码，这类表情转发到 Telegram 时会作为高清静态贴纸展示（普通 GIF 微信表情则为动态贴纸）。
+- **WXGF 动图表情**：容器内置 `ffmpeg` 时，WXGF 动图表情会自动解码为保留透明通道的 Telegram 动态贴纸（`.webm`）；仅在缺少 `ffmpeg`、超体积上限或极少数无法解码的情况下才会回退为单帧高清静态贴纸（`.webp`）。
 - **无法获取的表情**：极少数商城加密表情或特殊自定义表情在微信消息体中不携带可下载的 CDN 链接，属于上游协议限制。
 - **企业微信发来的图片/文件**：企业微信联系人（`@openim`）与外部群（`@im.chatroom`）的加密媒体需要 `agent-wechat >= 3.0`（[thisnick/agent-wechat#660](https://github.com/thisnick/agent-wechat/pull/660)）才能下载；在旧版 `agent-wechat` 上桥接会提示需升级或先在手机微信查看。
 </details>

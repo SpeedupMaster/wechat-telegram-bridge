@@ -21,7 +21,7 @@ from bridge.wechat import (
     WXCM_KIND_PCM_S16LE,
     decode_wxcm_frame,
 )
-from tests.test_bridge import FakeBot, FakeUser, _FakeCallsSocket, _button_texts, _button_urls, tg_event
+from tests.fakes import FakeBot, FakeUser, _FakeCallsSocket, _button_texts, _button_urls, tg_event
 from tests.test_groups import GroupDaemon
 from tests.test_v3_compat import _FakeV3MediaSocket
 
@@ -71,13 +71,15 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
             Path(self.tmp.name) / "config.toml",
         )
         self.daemon = GroupDaemon()
-        self.b = Bridge(cfg)
+        self.b = Bridge(cfg, user_client=FakeUser(), bot_client=FakeBot())
         await self.b.wx.http.aclose()
         self.b.wx.http = httpx.AsyncClient(
             transport=httpx.MockTransport(self.daemon.handler),
             headers={"Authorization": "Bearer secret-token"},
         )
-        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.wx._poll_initial_delay = 0.0
+        self.b.wx._avatar_poll_interval = 0.0
+        self.b._bot_pair_wait = 0.0
         self.b.bot_input = object()
         self.b.bot_me = SimpleNamespace(username="mybot")
         self.b.tg_ready.set()
@@ -465,7 +467,7 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3.0", self.b.bot.sent[-1].text)
 
     async def _press(self, msg, label: str, user: int = 999):
-        from tests.test_bridge import _CallbackEvent
+        from tests.fakes import _CallbackEvent
 
         data = next(
             d for row in msg.kwargs["buttons"] for b in row

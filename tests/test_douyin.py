@@ -92,7 +92,7 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
                      BridgeConfig(create_interval_seconds=0, sync_avatar=False, call_web_app="app",
                                   call_web_url="http://127.0.0.1/wxcall", call_web_listen="127.0.0.1:0"),
                      Path(self.tmp.name) / "config.toml")
-        self.b = Bridge(cfg)
+        self.b = Bridge(cfg, user_client=None, bot_client=None)
         self.b.bot_me = SimpleNamespace(username="mybot")
         self.web = self.b.call_web
         await self.web.start()
@@ -101,9 +101,7 @@ class ReaderWebTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.http.close()
-        await self.web.stop()
-        await self.b.wx.http.aclose()
-        self.b.store.db.close()
+        await self.b.close()
         self.tmp.cleanup()
 
     async def test_link_prefetches_and_serves_the_player(self):

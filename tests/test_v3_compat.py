@@ -22,7 +22,7 @@ import httpx
 from bridge.config import BridgeConfig, Config, TelegramConfig, WeChatConfig
 from bridge.core import Bridge
 from bridge.wechat import WeChatClient, WeChatError
-from tests.test_bridge import FakeBot, FakeDaemon, FakeUser, _FakeCallsSocket, _button_urls
+from tests.fakes import FakeBot, FakeDaemon, FakeUser, _FakeCallsSocket, _button_urls
 from tests.test_groups import GroupDaemon
 
 
@@ -246,13 +246,15 @@ class CallWebV3Tests(unittest.IsolatedAsyncioTestCase):
             Path(self.tmp.name) / "config.toml",
         )
         self.daemon = FakeDaemon()
-        self.b = Bridge(cfg)
+        self.b = Bridge(cfg, user_client=FakeUser(), bot_client=FakeBot())
         await self.b.wx.http.aclose()
         self.b.wx.http = httpx.AsyncClient(
             transport=httpx.MockTransport(self.daemon.handler),
             headers={"Authorization": "Bearer secret-token"},
         )
-        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.wx._poll_initial_delay = 0.0
+        self.b.wx._avatar_poll_interval = 0.0
+        self.b._bot_pair_wait = 0.0
         self.b.bot_input = object()
         self.b.bot_me = SimpleNamespace(username="mybot")
         self.b.tg_ready.set()
@@ -435,13 +437,15 @@ class WeComExternalGroupAndMediaTests(unittest.IsolatedAsyncioTestCase):
             Path(self.tmp.name) / "config.toml",
         )
         self.daemon = GroupDaemon()
-        self.b = Bridge(cfg)
+        self.b = Bridge(cfg, user_client=FakeUser(), bot_client=FakeBot())
         await self.b.wx.http.aclose()
         self.b.wx.http = httpx.AsyncClient(
             transport=httpx.MockTransport(self.daemon.handler),
             headers={"Authorization": "Bearer secret-token"},
         )
-        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.wx._poll_initial_delay = 0.0
+        self.b.wx._avatar_poll_interval = 0.0
+        self.b._bot_pair_wait = 0.0
         self.b.bot_input = object()
         self.b.bot_me = SimpleNamespace(username="mybot")
         self.b.tg_ready.set()
@@ -463,7 +467,7 @@ class WeComExternalGroupAndMediaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_im_chatroom_recognized_as_group_across_core_contacts_and_groups(self):
         from bridge.wechat import is_group_id
-        from tests.test_bridge import tg_event
+        from tests.fakes import tg_event
 
         room = "12345@im.chatroom"
         self.assertTrue(is_group_id(room))
@@ -554,13 +558,15 @@ class BigXmlAndMessageUpdatedTests(unittest.IsolatedAsyncioTestCase):
             Path(self.tmp.name) / "config.toml",
         )
         self.daemon = GroupDaemon()
-        self.b = Bridge(cfg)
+        self.b = Bridge(cfg, user_client=FakeUser(), bot_client=FakeBot())
         await self.b.wx.http.aclose()
         self.b.wx.http = httpx.AsyncClient(
             transport=httpx.MockTransport(self.daemon.handler),
             headers={"Authorization": "Bearer secret-token"},
         )
-        self.b.user, self.b.bot = FakeUser(), FakeBot()
+        self.b.wx._poll_initial_delay = 0.0
+        self.b.wx._avatar_poll_interval = 0.0
+        self.b._bot_pair_wait = 0.0
         self.b.bot_input = object()
         self.b.bot_me = SimpleNamespace(username="mybot")
         self.b.tg_ready.set()

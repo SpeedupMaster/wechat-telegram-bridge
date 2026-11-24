@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import httpx
 
 from .article import USER_AGENT, ArticleError, MAX_REDIRECTS
+from .web import load_text
 
 
 def host_of(url: str) -> str:
@@ -70,46 +71,4 @@ def render_player(src: str, *, title: str, nonce: str = "") -> str:
             .replace("__TITLE__", html.escape(title)).replace("__NONCE__", nonce))
 
 
-PLAYER_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="referrer" content="no-referrer">
-<noscript><meta http-equiv="refresh" content="0;url=__SRC_ATTR__"></noscript>
-<title>__TITLE__</title>
-<style>
-  html, body { margin: 0; height: 100%; background: #000; color: #8a8a8a; }
-  body { display: flex; align-items: center; justify-content: center;
-         font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }
-  a { color: #8a8a8a; }
-</style>
-</head>
-<body>
-<a href="__SRC_ATTR__">正在打开__TITLE__…</a>
-<script nonce="__NONCE__">
-(function () {
-  function post(type, data) {
-    try {
-      if (window.TelegramWebviewProxy && window.TelegramWebviewProxy.postEvent) {
-        window.TelegramWebviewProxy.postEvent(type, JSON.stringify(data || ''));
-      } else if (window.external && 'notify' in window.external) {
-        window.external.notify(JSON.stringify({eventType: type, eventData: data || ''}));
-      } else if (window.parent !== window) {
-        window.parent.postMessage(JSON.stringify({eventType: type, eventData: data || ''}), '*');
-      }
-    } catch (e) {}
-  }
-  // The player pages are dark; set Telegram's chrome before leaving, since they cannot.
-  post('web_app_set_header_color', {color: '#000000'});
-  post('web_app_set_background_color', {color: '#000000'});
-  post('web_app_set_bottom_bar_color', {color: '#000000'});
-  post('web_app_expand');
-  post('web_app_ready');
-  var target = __SRC_JS__;
-  if (/^https:\/\//.test(target)) window.location.replace(target);
-})();
-</script>
-</body>
-</html>
-"""
+PLAYER_HTML = load_text("player.html")

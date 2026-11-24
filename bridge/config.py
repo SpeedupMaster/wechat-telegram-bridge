@@ -95,28 +95,69 @@ class BridgeConfig:
         if mode is None:
             raise ValueError(f"[bridge] mode must be \"groups\" or \"topics\", not {self.mode!r}")
         self.mode = mode
+        if isinstance(self.forum_chat, bool):
+            raise ValueError(f"[bridge] forum_chat must be a number, not {self.forum_chat!r}")
         self.forum_chat = int(self.forum_chat or 0)
-        if not isinstance(self.bridge_official_accounts, bool):
-            raise ValueError(
-                f"[bridge] bridge_official_accounts must be true or false, not {self.bridge_official_accounts!r}"
-            )
         if isinstance(self.official_accounts_forum_chat, bool):
             raise ValueError(
                 f"[bridge] official_accounts_forum_chat must be a number, not {self.official_accounts_forum_chat!r}"
             )
         self.official_accounts_forum_chat = int(self.official_accounts_forum_chat or 0)
+        for name in (
+            "bridge_groups",
+            "bridge_official_accounts",
+            "forward_outgoing",
+            "outgoing_silent",
+            "sync_avatar",
+            "mark_read_on_reply",
+            "call_notifications",
+            "link_card_images",
+            "article_reader",
+            "xhs_reader",
+            "douyin_reader",
+            "bilibili_reader",
+            "links_in_app",
+            "friend_requests",
+            "auto_rename",
+            "gif_as_sticker",
+            "emoji_to_wechat",
+            "auto_relogin",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"[bridge] {name} must be true or false, not {getattr(self, name)!r}")
+        if isinstance(self.max_media_mb, bool) or isinstance(self.max_media_mb, float):
+            raise ValueError(f"[bridge] max_media_mb must be a positive integer, not {self.max_media_mb!r}")
+        try:
+            max_mb = int(self.max_media_mb)
+        except (TypeError, ValueError):
+            raise ValueError(f"[bridge] max_media_mb must be a positive integer, not {self.max_media_mb!r}") from None
+        if max_mb <= 0:
+            raise ValueError(f"[bridge] max_media_mb must be > 0, not {max_mb!r}")
+        self.max_media_mb = max_mb
+        if isinstance(self.create_interval_seconds, bool):
+            raise ValueError(
+                f"[bridge] create_interval_seconds must be a number, not {self.create_interval_seconds!r}"
+            )
+        try:
+            create_interval = float(self.create_interval_seconds)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"[bridge] create_interval_seconds must be a number, not {self.create_interval_seconds!r}"
+            ) from None
+        if not math.isfinite(create_interval) or create_interval < 0:
+            raise ValueError(
+                f"[bridge] create_interval_seconds must be >= 0 and finite, not {self.create_interval_seconds!r}"
+            )
+        self.create_interval_seconds = create_interval
+        if not isinstance(self.skip_threads, list) or not all(isinstance(x, str) for x in self.skip_threads):
+            raise ValueError(f"[bridge] skip_threads must be a list of strings, not {self.skip_threads!r}")
         self.call_web_url = str(self.call_web_url or "").strip().rstrip("/")
         if self.call_web_url and not self.call_web_url.lower().startswith(("https://", "http://")):
             raise ValueError(f"[bridge] call_web_url must start with https://, not {self.call_web_url!r}")
         self.call_web_app = str(self.call_web_app or "").strip().strip("/")
         host, sep, port = str(self.call_web_listen or "").strip().rpartition(":")
-        if not sep or not port.isdigit() or not host:
+        if not sep or not port.isdigit() or not host or not (0 <= int(port) <= 65535):
             raise ValueError(f"[bridge] call_web_listen must look like \"127.0.0.1:8780\", not {self.call_web_listen!r}")
-        for name in ("xhs_reader", "douyin_reader", "bilibili_reader", "links_in_app"):
-            if not isinstance(getattr(self, name), bool):
-                raise ValueError(f"[bridge] {name} must be true or false, not {getattr(self, name)!r}")
-        if not isinstance(self.article_reader, bool):
-            raise ValueError(f"[bridge] article_reader must be true or false, not {self.article_reader!r}")
         self.article_proxy = str(self.article_proxy or "").strip()
         if self.article_proxy and not self.article_proxy.lower().startswith(
                 ("http://", "https://", "socks5://", "socks5h://")):
@@ -124,10 +165,6 @@ class BridgeConfig:
                 f"[bridge] article_proxy must start with http://, https://, socks5:// or socks5h://, "
                 f"not {self.article_proxy!r}"
             )
-        if not isinstance(self.emoji_to_wechat, bool):
-            raise ValueError(f"[bridge] emoji_to_wechat must be true or false, not {self.emoji_to_wechat!r}")
-        if not isinstance(self.auto_relogin, bool):
-            raise ValueError(f"[bridge] auto_relogin must be true or false, not {self.auto_relogin!r}")
         for name in (
             "auto_relogin_delay_min",
             "auto_relogin_delay_max",

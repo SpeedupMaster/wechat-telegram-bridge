@@ -75,8 +75,7 @@ class ClientAndStoreMemoryTests(unittest.TestCase):
                 self.assertEqual(b_topics.bot.session._conn.execute("PRAGMA temp_store").fetchone()[0], 1)
                 self.assertIsNone(b_topics.call_web)
             finally:
-                b_topics.store.db.close()
-                b_topics.bot.session.close()
+                asyncio.run(b_topics.close())
 
             cfg_groups = Config(
                 WeChatConfig(token="tok"),
@@ -91,9 +90,7 @@ class ClientAndStoreMemoryTests(unittest.TestCase):
                 self.assertEqual(b_groups.bot._entity_cache_limit, core.TG_ENTITY_CACHE_LIMIT)
                 self.assertEqual(b_groups.user.session._conn.execute("PRAGMA cache_size").fetchone()[0], -512)
             finally:
-                b_groups.store.db.close()
-                b_groups.user.session.close()
-                b_groups.bot.session.close()
+                asyncio.run(b_groups.close())
 
     def test_store_sets_bounded_sqlite_cache_and_journal_limit(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -397,9 +394,7 @@ class StickerAndMemTests(unittest.TestCase):
                 self.assertNotIn("members", req)
                 self.assertEqual(set(req["names"]), {"u1", "u2"})
             finally:
-                b.store.db.close()
-                b.user.session.close()
-                b.bot.session.close()
+                asyncio.run(b.close())
 
     def test_rgba_frames_have_alpha_supports_pil_and_bytes(self):
         opaque = Image.new("RGBA", (4, 4), (10, 20, 30, 255))

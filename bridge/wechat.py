@@ -161,6 +161,17 @@ class Media:
         with open(self.path, "rb") as f:
             return f.read()
 
+    def sha256(self) -> str:
+        """Hex-encoded SHA-256 digest (streams file-backed media in 64 KiB chunks)."""
+        h = hashlib.sha256()
+        if self.path is None:
+            h.update(self.data)
+            return h.hexdigest()
+        with open(self.path, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest()
+
     def tg_file(self) -> str | io.BytesIO:
         """What to hand Telethon: the temp file's path, or a fresh named in-memory buffer."""
         if self.path is not None:
@@ -260,12 +271,18 @@ def _id(value: str) -> str:
 
 class WeChatClient:
     def __init__(self, base_url: str, token: str, account: str = "",
-                 *, read_retry_delays: tuple[float, ...] = (1.0, 2.0)):
+                 *, read_retry_delays: tuple[float, ...] = (1.0, 2.0),
+                 poll_initial_delay: float = 0.3,
+                 avatar_poll_interval: float = 1.5,
+                 recall_timeout: float = 30.0):
         self.base = base_url.rstrip("/") + "/v1/"
         self._token = token
         self.account = account
         self._sticker_preps: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._read_retry_delays = read_retry_delays
+        self._poll_initial_delay = max(0.0, float(poll_initial_delay))
+        self._avatar_poll_interval = max(0.0, float(avatar_poll_interval))
+        self._recall_timeout = max(0.0, float(recall_timeout))
         # trust_env=False: never route the local daemon (and its token) through a system HTTP proxy
         self.http = httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}, trust_env=False,
                                       timeout=_DEFAULT_TIMEOUT)
@@ -631,7 +648,10 @@ class WeChatClient:
         deadline = loop.time() + wait
         while op.get("state") not in ("succeeded", "failed", "expired", "rejected", "cancelled", "needs_review") \
                 and loop.time() < deadline:
-            await asyncio.sleep(1.5)
+            if self._avatar_poll_interval > 0:
+                await asyncio.sleep(self._avatar_poll_interval)
+            else:
+                await asyncio.sleep(0)
             op = await self.operation(op["id"])
         state = op.get("state")
         if state != "succeeded":
@@ -739,7 +759,7 @@ class WeChatClient:
             self._sticker_preps.popitem(last=False)
 
     async def send_sticker(self, thread_id: str, media: Media, key: str) -> dict:
-        cache_key = (self.account or "", hashlib.sha256(media.read()).hexdigest())
+        cache_key = (self.account or "", media.sha256())
         prep_id = self._get_cached_prep(cache_key)
         used_cached = prep_id is not None
         if not prep_id:
@@ -810,15 +830,15 @@ class WeChatClient:
                              json={"serverId": str(server_id)}, headers={"Idempotency-Key": key})
         done = {"succeeded", "completed", "failed", "expired", "rejected", "cancelled", "needs_review"}
         if isinstance(op, dict) and op.get("id") and op.get("state") not in done:
-            op = await self._wait(op, lambda o: f"operations/{_id(o['id'])}", done, 30)
+            op = await self._wait(op, lambda o: f"operations/{_id(o['id'])}", done, self._recall_timeout)
         return op if isinstance(op, dict) else {}
 
     async def _wait(self, item: dict, path, done: set[str], timeout: float, *, max_delay: float = 2.0) -> dict:
         loop = asyncio.get_running_loop()
-        deadline, delay = loop.time() + timeout, 0.3
+        deadline, delay = loop.time() + timeout, self._poll_initial_delay
         while item.get("state") not in done and loop.time() < deadline:
             await asyncio.sleep(delay)
-            delay = min(delay * 1.5, max_delay)
+            delay = min(delay * 1.5, max_delay) if delay > 0 else 0.0
             item = await self._req("GET", self._a(path(item)))
         return item
 
@@ -1104,6 +1124,8 @@ class CallsSocket:
         self._reader_task: asyncio.Task | None = None
         self._closed = False
         self._closing = False
+        self._close_sent = False
+        self._writer_closed = False
         self.protocol_version: int = 2
 
     @property
@@ -1209,8 +1231,8 @@ class CallsSocket:
                 payload = _ws_mask(payload, mask)
 
             if opcode == 0x8:  # Close
-                if not self._closing:
-                    self._closing = True
+                if not self._close_sent:
+                    self._close_sent = True
                     try:
                         await self._send_frame(0x8, payload[:2])
                     except Exception:
@@ -1366,11 +1388,12 @@ class CallsSocket:
             self._pending_cmds.pop(req_id, None)
 
     async def close(self) -> None:
-        if self._closing:
+        if self._writer_closed:
             return
         self._closing = True
         try:
-            if not self._closed:
+            if not self._closed and not self._close_sent:
+                self._close_sent = True
                 await self._send_frame(0x8, b"\x03\xe8")
         except Exception:
             pass
@@ -1381,6 +1404,7 @@ class CallsSocket:
                 await self._reader_task
             except (asyncio.CancelledError, Exception):
                 pass
+        self._writer_closed = True
         try:
             self.writer.close()
             await self.writer.wait_closed()

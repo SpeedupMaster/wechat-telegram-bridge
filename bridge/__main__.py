@@ -31,15 +31,17 @@ def main() -> None:
     async def run() -> None:
         # Cap worker threads so glibc does not spawn many long-lived malloc arenas for asyncio.to_thread().
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(ThreadPoolExecutor(max_workers=2, thread_name_prefix="bridge-worker"))
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=4, thread_name_prefix="bridge-worker"))
         bridge = Bridge(cfg)
         try:
             await bridge.run()
         finally:
-            await bridge.close()
             for client in (bridge.user, bridge.bot):
                 if client is not None and client.is_connected():
                     await client.disconnect()
+            await bridge.close()
+            if (st_mod := sys.modules.get("bridge.stickers")) is not None:
+                st_mod.shutdown_media_executor(wait=False)
 
     try:
         asyncio.run(run())

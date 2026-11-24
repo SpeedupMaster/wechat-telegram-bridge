@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>__TITLE__</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1f1f1f;
+    --muted: #8a8a8a;
+    --border: #eeeeee;
+    --link: #576b95;
+    --bar-bg: rgba(255,255,255,.94);
+    --img-bg: #f3f3f3;
+    --code-bg: #f6f8fa;
+    --err: #c0392b;
+    --btn-sec-bg: #f0f2f5;
+    --btn-sec-fg: #1f1f1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181c;
+      --fg: #e7e8ec;
+      --muted: #989ba6;
+      --border: #2b2d35;
+      --link: #7aa7e0;
+      --bar-bg: rgba(23,24,28,.94);
+      --img-bg: #22242b;
+      --code-bg: #1f222a;
+      --err: #f07167;
+      --btn-sec-bg: #262830;
+      --btn-sec-fg: #e7e8ec;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body { font: 17px/1.75 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+         "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif; -webkit-text-size-adjust: 100%;
+         overflow-wrap: break-word; }
+  main { max-width: 680px; margin: 0 auto; padding: 20px 16px calc(88px + env(safe-area-inset-bottom)); }
+  .title { font-size: 22px; line-height: 1.4; margin: 0 0 10px; font-weight: 700; }
+  .meta { color: var(--muted); font-size: 14px; margin-bottom: 22px; }
+  .content { overflow-x: hidden; }
+  .content img { max-width: 100% !important; height: auto !important; background: var(--img-bg);
+                 cursor: zoom-in; border-radius: 4px; }
+  .content figure.wx-pic { margin: 14px 0; text-align: center; }
+  .content .xhs-video { margin: 0 0 14px; }
+  .content video { display: block; width: 100%; height: auto; max-height: 78vh; background: #000;
+                   border-radius: 8px; }
+  .content section, .content div, .content p, .content table { max-width: 100% !important; }
+  .content table { border-collapse: collapse; display: block; overflow-x: auto; }
+  .content pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto;
+                 font-size: 14px; line-height: 1.55; }
+  .content code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+  .content blockquote { margin: 12px 0; padding: 6px 12px; border-left: 3px solid var(--border); color: var(--muted); }
+  .content a { color: var(--link); }
+  .content p { margin: 0 0 8px; }
+  .wx-media { color: var(--muted); font-size: 14px; text-align: center; margin: 12px 0 !important; }
+  .err { color: var(--err); }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+         background: var(--bar-bg); border-top: 1px solid var(--border); display: flex; justify-content: center;
+         -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+  .bar-inner { display: flex; gap: 10px; width: 100%; max-width: 680px; }
+  .open, .retry { display: block; flex: 1; text-align: center; padding: 11px 14px; border-radius: 10px;
+                  text-decoration: none; font-size: 16px; font-weight: 600; }
+  .open { background: #07c160; color: #fff; }
+  .retry { flex: 0 0 auto; min-width: 96px; background: var(--btn-sec-bg); color: var(--btn-sec-fg); }
+  .wx-lightbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,.92);
+                 display: flex; align-items: center; justify-content: center; padding: 16px; cursor: zoom-out; }
+  .wx-lightbox[hidden] { display: none; }
+  .wx-lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; }
+  @media (prefers-color-scheme: dark) {
+    .content [style*="background-color: rgb(255, 255, 255)"],
+    .content [style*="background-color:#fff"],
+    .content [style*="background-color: #fff"] { background-color: transparent !important; }
+  }
+</style>
+</head>
+<body>
+<main>
+__HEAD__
+<div class="content">__BODY__</div>
+</main>
+<div class="bar">__BAR__</div>
+<div class="wx-lightbox" id="lightbox" hidden><img alt=""></div>
+<script nonce="__NONCE__">
+(function () {
+  var hp = {};
+  try {
+    location.hash.slice(1).split('&').forEach(function (kv) {
+      var i = kv.indexOf('=');
+      if (i > 0) hp[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
+    });
+  } catch (e) {}
+  var inTg = !!(hp.tgWebAppData || hp.tgWebAppVersion);
+  try { if (!inTg) inTg = !!sessionStorage.getItem('tgWebAppData'); } catch (e) {}
+  var theme = null;
+  try {
+    var rawTheme = hp.tgWebAppThemeParams || sessionStorage.getItem('tgWebAppThemeParams');
+    if (rawTheme) {
+      sessionStorage.setItem('tgWebAppThemeParams', rawTheme);
+      theme = JSON.parse(rawTheme);
+    }
+  } catch (e) {}
+  var root = document.documentElement;
+  function okColor(c) { return typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c); }
+  if (theme) {
+    if (okColor(theme.bg_color)) root.style.setProperty('--bg', theme.bg_color);
+    if (okColor(theme.text_color)) root.style.setProperty('--fg', theme.text_color);
+    if (okColor(theme.hint_color)) root.style.setProperty('--muted', theme.hint_color);
+    if (okColor(theme.link_color)) root.style.setProperty('--link', theme.link_color);
+    if (okColor(theme.secondary_bg_color)) {
+      root.style.setProperty('--btn-sec-bg', theme.secondary_bg_color);
+      root.style.setProperty('--code-bg', theme.secondary_bg_color);
+    }
+  }
+  function post(type, data) {
+    try {
+      if (window.TelegramWebviewProxy && window.TelegramWebviewProxy.postEvent) {
+        window.TelegramWebviewProxy.postEvent(type, JSON.stringify(data || ''));
+      } else if (window.external && 'notify' in window.external) {
+        window.external.notify(JSON.stringify({eventType: type, eventData: data || ''}));
+      } else if (window.parent !== window) {
+        window.parent.postMessage(JSON.stringify({eventType: type, eventData: data || ''}), '*');
+      } else { return false; }
+      return true;
+    } catch (e) { return false; }
+  }
+  var bg = (theme && okColor(theme.bg_color)) ? theme.bg_color : (
+    window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? '#17181c' : '#ffffff'
+  );
+  if (inTg) {
+    post('web_app_set_header_color', {color: bg});
+    post('web_app_set_background_color', {color: bg});
+    post('web_app_set_bottom_bar_color', {color: bg});
+    post('web_app_expand');
+    post('web_app_ready');
+  }
+  var lb = document.getElementById('lightbox');
+  var lbImg = lb ? lb.querySelector('img') : null;
+  if (lb && lbImg) {
+    lb.addEventListener('click', function () { lb.hidden = true; lbImg.removeAttribute('src'); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !lb.hidden) { lb.hidden = true; lbImg.removeAttribute('src'); }
+    });
+  }
+  // External links open in Telegram's browser; internal [data-inapp] links stay inside the Mini App.
+  document.addEventListener('click', function (e) {
+    var img = e.target && e.target.closest ? e.target.closest('.content img') : null;
+    if (img && lb && lbImg && !img.closest('a[href]')) {
+      lbImg.src = img.currentSrc || img.src;
+      lb.hidden = false;
+      return;
+    }
+    var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+    if (!a || a.hasAttribute('data-inapp') || !/^https?:/i.test(a.href)) return;
+    e.preventDefault();
+    if (!(inTg && post('web_app_open_link', {url: a.href}))) window.open(a.href, '_blank', 'noopener');
+  });
+})();
+</script>
+</body>
+</html>

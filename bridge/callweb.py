@@ -27,6 +27,7 @@ from aiohttp import WSMsgType, web
 
 from . import article as articles
 from . import bilibili, douyin, xhs
+from .web import load_text
 from .wechat import (
     WXCM_KIND_H264,
     WXCM_KIND_H265,
@@ -53,6 +54,7 @@ DIAL_REQUEST_TTL = 600.0
 # agent-wechat accepts 1-100 invitees when starting a group call.
 MAX_INVITEES = 100
 INIT_DATA_MAX_AGE = 24 * 3600
+HANDOFF_TICKET_TTL = 1800.0
 MAX_PCM_CHUNK = 65536
 MAX_VIDEO_FRAME = WXCM_MAX_VIDEO_PAYLOAD + 4096
 # Browser <-> CallWeb binary video frame header (20 bytes, big endian):
@@ -195,6 +197,33 @@ def verify_init_data(init_data: str, bot_token: str, *, max_age: float = INIT_DA
     if max_age and abs((time.time() if now is None else now) - auth_date) > max_age:
         return None
     return uid
+
+
+def make_handoff_ticket(token: str, bot_token: str, *, ttl: float = HANDOFF_TICKET_TTL,
+                        now: float | None = None) -> str:
+    """Sign a short-lived browser handoff ticket bound to `token` after verified Mini App auth."""
+    exp = int((time.time() if now is None else now) + ttl)
+    payload = f"{token}:{exp}"
+    secret = hmac.new(b"CallHandoff", bot_token.encode(), hashlib.sha256).digest()
+    sig = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def verify_handoff_ticket(ticket: str, token: str, bot_token: str, *, now: float | None = None) -> bool:
+    """Verify a browser handoff ticket issued by `make_handoff_ticket`."""
+    if not ticket or not token or not bot_token:
+        return False
+    exp_s, sep, sig = ticket.partition(".")
+    if not sep or not exp_s.isdigit() or not sig:
+        return False
+    exp = int(exp_s)
+    cur = time.time() if now is None else now
+    if cur > exp:
+        return False
+    payload = f"{token}:{exp}"
+    secret = hmac.new(b"CallHandoff", bot_token.encode(), hashlib.sha256).digest()
+    expected = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
 
 
 def _err_text(code: str | None, default: str) -> str:
@@ -1304,12 +1333,32 @@ class CallWeb:
         start = request.query.get("tgWebAppStartParam", "")
         if start.startswith(READER_PREFIX):  # reader links share the Mini App's single URL
             return await self._reader_response(start[len(READER_PREFIX):])
+        nonce = secrets.token_urlsafe(12)
         cfg = json.dumps({"base": self.prefix}, ensure_ascii=False)
+        html_body = (
+            PAGE_HTML.replace("__NONCE__", nonce)
+            .replace("__CFG__", cfg)
+            .replace("__WORKLET__", json.dumps(WORKLET_JS))
+        )
         return web.Response(
-            text=PAGE_HTML.replace("__CFG__", cfg).replace("__WORKLET__", json.dumps(WORKLET_JS)),
+            text=html_body,
             content_type="text/html", charset="utf-8",
-            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
-                     "X-Content-Type-Options": "nosniff"},
+            headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": (
+                    "default-src 'none'; "
+                    f"script-src 'nonce-{nonce}' blob:; "
+                    "style-src 'unsafe-inline'; "
+                    "connect-src 'self' ws: wss:; "
+                    "img-src 'self' blob: data:; "
+                    "media-src 'self' blob: mediastream:; "
+                    "worker-src blob:; "
+                    "base-uri 'none'; "
+                    "form-action 'none'"
+                ),
+            },
         )
 
     async def _read(self, request: web.Request) -> web.Response:
@@ -1396,13 +1445,22 @@ class CallWeb:
         token = str(msg.get("token") or "")
         if not token or token not in self.tokens:
             return None, "链接已失效或通话已结束"
+        bot_token = self.bridge.cfg.telegram.bot_token
         init_data = str(msg.get("initData") or "")
         if init_data:
-            uid = verify_init_data(init_data, self.bridge.cfg.telegram.bot_token)
+            uid = verify_init_data(init_data, bot_token)
             if uid is None:
                 return None, "Telegram 身份校验失败，请从机器人消息重新打开"
             if uid != self.bridge.owner_id:
                 return None, "只有桥接账号本人可以接听"
+            return token, ""
+        if self.app_name:
+            handoff = str(msg.get("handoff") or msg.get("ticket") or "")
+            if handoff:
+                if verify_handoff_ticket(handoff, token, bot_token):
+                    return token, ""
+                return None, "浏览器跳转凭证无效或已过期，请从 Telegram Mini App 重新打开"
+            return None, "请从 Telegram Mini App 打开通话页面"
         return token, ""
 
     async def _ws(self, request: web.Request) -> web.WebSocketResponse:
@@ -1423,15 +1481,19 @@ class CallWeb:
                 hello = json.loads(first.data)
             except ValueError:
                 hello = {}
-            if isinstance(hello, dict) and isinstance(hello.get("videoCaps"), dict):
-                client_video_caps = hello["videoCaps"]
-            token, why = self._authorize(hello if isinstance(hello, dict) else {})
+            hello_dict = hello if isinstance(hello, dict) else {}
+            if isinstance(hello_dict.get("videoCaps"), dict):
+                client_video_caps = hello_dict["videoCaps"]
+            token, why = self._authorize(hello_dict)
             if token is None:
                 await _safe_send(ws, {"type": "fatal", "message": why})
                 await ws.close(code=4403, message=b"forbidden")
                 return ws
             self.clients.setdefault(token, set()).add(ws)
-            await _safe_send(ws, self._state(token, ws))
+            init_state = self._state(token, ws)
+            if self.app_name:
+                init_state["handoff"] = make_handoff_ticket(token, self.bridge.cfg.telegram.bot_token)
+            await _safe_send(ws, init_state)
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
                     sess = self._session_for(token)
@@ -1564,1088 +1626,5 @@ async def _safe_send(ws: web.WebSocketResponse, obj: dict) -> None:
 # ---------------------------------------------------------------------- browser side
 # AudioWorklet: captures the microphone, downsamples it to the call rate in 20 ms PCM16 frames, and plays every
 # receive track from its own jitter buffer (resampled to the device rate and mixed).
-WORKLET_JS = r"""
-class BridgeIO extends AudioWorkletProcessor {
-  constructor(o) {
-    super();
-    const p = (o && o.processorOptions) || {};
-    this.setRate(p.net || 16000, p.frame || 320);
-    this.port.onmessage = (e) => {
-      const d = e.data;
-      if (d.t === 'pcm') this.push(d.id, d.pcm);
-      else if (d.t === 'drop') this.tracks.delete(d.id);
-      else if (d.t === 'rate') this.setRate(d.net, d.frame);
-    };
-  }
-  setRate(net, frame) {
-    this.net = net; this.frame = frame; this.step = net / sampleRate;
-    this.acc = 0; this.sum = 0; this.cnt = 0; this.buf = new Int16Array(frame); this.n = 0;
-    this.tracks = new Map();
-  }
-  push(id, pcm) {
-    let t = this.tracks.get(id);
-    if (!t) { const size = this.net * 2; t = {b: new Float32Array(size), size, w: 0, r: 0, on: false}; this.tracks.set(id, t); }
-    for (let i = 0; i < pcm.length; i++) { t.b[t.w % t.size] = pcm[i] / 32768; t.w++; }
-    if (t.w - t.r > this.net * 0.4) t.r = t.w - this.net * 0.12;  // cap latency
-  }
-  process(inputs, outputs) {
-    const inp = inputs[0] && inputs[0][0];
-    if (inp) {
-      for (let i = 0; i < inp.length; i++) {
-        this.sum += inp[i]; this.cnt++; this.acc += this.step;
-        if (this.acc >= 1) {
-          this.acc -= 1;
-          let v = this.sum / this.cnt; this.sum = 0; this.cnt = 0;
-          v = v < -1 ? -1 : v > 1 ? 1 : v;
-          this.buf[this.n++] = v < 0 ? v * 32768 : v * 32767;
-          if (this.n === this.frame) {
-            const out = this.buf; this.buf = new Int16Array(this.frame); this.n = 0;
-            this.port.postMessage(out.buffer, [out.buffer]);
-          }
-        }
-      }
-    }
-    const out = outputs[0], ch = out && out[0];
-    if (!ch) return true;
-    ch.fill(0);
-    for (const t of this.tracks.values()) {
-      if (!t.on) { if (t.w - t.r >= this.net * 0.06) t.on = true; else continue; }
-      for (let i = 0; i < ch.length; i++) {
-        if (t.w - t.r < 2) { t.on = false; break; }
-        const i0 = Math.floor(t.r), f = t.r - i0;
-        const a = t.b[i0 % t.size], b = t.b[(i0 + 1) % t.size];
-        ch[i] += a + (b - a) * f; t.r += this.step;
-      }
-    }
-    for (let i = 0; i < ch.length; i++) { const v = ch[i]; ch[i] = v > 1 ? 1 : v < -1 ? -1 : v; }
-    for (let c = 1; c < out.length; c++) out[c].set(ch);
-    return true;
-  }
-}
-registerProcessor('bridge-io', BridgeIO);
-"""
-
-PAGE_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="referrer" content="no-referrer">
-<meta name="robots" content="noindex">
-<meta name="theme-color" content="#14161b">
-<title>微信通话</title>
-<script>
-// Article reader links share this Mini App URL. When the start parameter only arrives in the URL fragment (so the
-// server could not route it), switch to the reader before the call UI is ever painted, on the reader's background.
-(function () {
-  try {
-    if (/\/(call|read)\//.test(location.pathname)) return;
-    var hp = new URLSearchParams(location.hash.slice(1));
-    var sp = new URLSearchParams(hp.get('tgWebAppData') || '').get('start_param') || hp.get('tgWebAppStartParam') ||
-             new URLSearchParams(location.search).get('tgWebAppStartParam') || '';
-    if (sp.indexOf('r_') !== 0) return;
-    window.__wxReader = true;
-    var bg = '';
-    try { bg = JSON.parse(hp.get('tgWebAppThemeParams') || '{}').bg_color || ''; } catch (e) {}
-    if (!/^#[0-9a-fA-F]{3,8}$/.test(bg)) {
-      bg = window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches ? '#17181c' : '#ffffff';
-    }
-    document.documentElement.style.cssText = 'background:' + bg + ';color-scheme:light dark;visibility:hidden';
-    var base = (__CFG__).base;
-    location.replace(location.origin + base + '/read/' + encodeURIComponent(sp.slice(2)) + location.hash);
-  } catch (e) {}
-})();
-</script>
-<style>
-:root{color-scheme:dark;--bg:#14161b;--fg:#f4f5f7;--hint:#8d929c;--glass:rgba(255,255,255,.12);
---green:#07c160;--red:#f2484b;--amber:#f5a524;--gray:#7b808a}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);overflow:hidden;
-font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
--webkit-user-select:none;user-select:none}
-body{background:radial-gradient(130% 70% at 50% -10%,#1f3a2b 0%,rgba(20,22,27,0) 60%),var(--bg)}
-.stage{position:fixed;inset:0;z-index:1;background:#0c0e12;display:grid;grid-template-columns:1fr;gap:4px;padding:0}
-.stage[hidden]{display:none}
-.stage.grid-2,.stage.grid-many{gap:8px;padding:calc(max(12px,env(safe-area-inset-top)) + 116px) 8px calc(128px + env(safe-area-inset-bottom))}
-.stage.grid-2{grid-template-columns:1fr;grid-template-rows:1fr 1fr}
-.stage.grid-many{grid-template-columns:1fr 1fr;grid-auto-rows:1fr}
-@media (min-width:680px){
-  .stage.grid-2{grid-template-columns:1fr 1fr;grid-template-rows:1fr}
-}
-.tile{position:relative;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;background:#11141a;
-display:flex;align-items:center;justify-content:center}
-.stage.grid-2 .tile,.stage.grid-many .tile{border-radius:14px}
-.tile canvas{width:100%;height:100%;object-fit:contain;display:block}
-.tile .wait{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
-gap:10px;color:var(--hint);font-size:13px;background:#11141a}
-.tile.has-frame .wait{display:none}
-.tile .wait-av{width:64px;height:64px;border-radius:50%;background:rgba(255,255,255,.08);
-display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:600;color:var(--fg)}
-.tile .tag{position:absolute;left:12px;bottom:12px;max-width:calc(100% - 24px);padding:4px 10px;border-radius:10px;
-background:rgba(14,16,21,.64);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
-font-size:12px;color:#f4f5f7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.stage:not(.grid-2):not(.grid-many) .tile .tag{display:none}
-.pip{position:fixed;top:max(68px,calc(env(safe-area-inset-top) + 52px));right:14px;z-index:3;
-width:clamp(92px,24vw,136px);aspect-ratio:3/4;border-radius:14px;overflow:hidden;background:#1a1e26;
-border:1px solid rgba(255,255,255,.18);box-shadow:0 10px 28px rgba(0,0,0,.48);cursor:pointer}
-.pip[hidden]{display:none}
-.pip video{width:100%;height:100%;object-fit:cover;display:block}
-.pip.mirror video{transform:scaleX(-1)}
-main{position:relative;z-index:2;height:100%;display:flex;flex-direction:column;align-items:center;text-align:center;
-padding:max(48px,env(safe-area-inset-top)) 24px calc(40px + env(safe-area-inset-bottom))}
-main.video-live{padding:0;justify-content:space-between;pointer-events:none}
-.info{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;width:100%;
-padding-bottom:6vh}
-main.video-live .info{flex:0 0 auto;padding:max(12px,env(safe-area-inset-top)) 20px 18px;gap:3px;
-background:linear-gradient(180deg,rgba(12,14,18,.78) 0%,rgba(12,14,18,.38) 65%,rgba(12,14,18,0) 100%)}
-main.video-live .avatar{display:none}
-main.video-live .title{font-size:12px;color:rgba(244,245,247,.72)}
-main.video-live .name{font-size:20px;text-shadow:0 1px 6px rgba(0,0,0,.55)}
-main.video-live .timer{font-size:14px;min-height:18px;color:rgba(244,245,247,.9);text-shadow:0 1px 4px rgba(0,0,0,.55)}
-main.video-live .status{padding:3px 10px;min-height:24px;font-size:12px;background:rgba(14,16,21,.56)}
-main.video-live .hint{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(134px + env(safe-area-inset-bottom));
-z-index:4;pointer-events:auto;width:max-content;max-width:calc(100vw - 32px);padding:6px 14px;border-radius:14px;
-background:rgba(14,16,21,.82);border:1px solid rgba(255,255,255,.1);-webkit-backdrop-filter:blur(10px);
-backdrop-filter:blur(10px);box-shadow:0 6px 18px rgba(0,0,0,.35)}
-main.video-live .hint:empty{display:none}
-.avatar{position:relative;width:112px;height:112px;border-radius:50%;display:flex;align-items:center;
-justify-content:center;font-size:46px;font-weight:600;color:#fff;margin-bottom:14px;
-background:linear-gradient(145deg,#10d673,#06a352);box-shadow:0 10px 30px rgba(7,193,96,.28)}
-.avatar svg{width:52px;height:52px}
-.avatar::before,.avatar::after{content:"";position:absolute;inset:0;border-radius:50%;border:2px solid var(--green);
-opacity:0;pointer-events:none}
-.ringing .avatar::before{animation:ring 2s ease-out infinite}
-.ringing .avatar::after{animation:ring 2s ease-out 1s infinite}
-@keyframes ring{0%{transform:scale(1);opacity:.55}100%{transform:scale(1.55);opacity:0}}
-.ended .avatar{filter:grayscale(.85);opacity:.7;box-shadow:none}
-.title{font-size:14px;color:var(--hint);letter-spacing:.5px}
-.name{font-size:28px;font-weight:600;line-height:1.25;max-width:100%;overflow-wrap:anywhere}
-.status{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:16px;
-background:rgba(255,255,255,.07);font-size:14px;line-height:20px;color:#c9ccd2;min-height:32px;max-width:100%;
-text-align:left}
-.status:empty{visibility:hidden}
-.dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--gray)}
-.tone-ring .dot{background:var(--amber);animation:blink 1s ease-in-out infinite}
-.tone-wait .dot{background:var(--amber);animation:blink 1.4s ease-in-out infinite}
-.tone-live .dot{background:var(--green)}
-.tone-err .dot{background:var(--red)}
-@keyframes blink{50%{opacity:.25}}
-.timer{font-size:20px;font-variant-numeric:tabular-nums;color:var(--fg);min-height:26px;letter-spacing:1px}
-.hint{font-size:13px;color:var(--hint);max-width:320px;line-height:1.55;min-height:20px}
-.hint.err{color:#ff7b7d}
-.hint a{color:#5eb5f7;text-decoration:none;font-weight:500}
-.actions{display:flex;justify-content:center;gap:clamp(32px,12vw,68px);min-height:104px;width:100%;
-pointer-events:auto}
-main.video-live .actions{padding:20px 16px calc(20px + env(safe-area-inset-bottom));min-height:auto;
-gap:clamp(14px,5vw,32px);
-background:linear-gradient(0deg,rgba(12,14,18,.84) 0%,rgba(12,14,18,.44) 68%,rgba(12,14,18,0) 100%)}
-.actions.compact{gap:clamp(14px,4.5vw,28px)}
-.btn{display:flex;flex-direction:column;align-items:center;gap:8px;font-size:13px;color:#d6d9df;
-background:none;border:0;padding:0;font-family:inherit;cursor:pointer;touch-action:manipulation;min-width:60px}
-.btn .c{position:relative;width:72px;height:72px;border-radius:50%;display:flex;align-items:center;
-justify-content:center;color:#fff;transition:transform .12s ease,opacity .2s,background .2s}
-.actions.compact .btn{font-size:12px;min-width:56px}
-.actions.compact .btn .c{width:60px;height:60px}
-.actions.compact .btn svg{width:26px;height:26px}
-@media (max-width:400px){
-  .actions.compact{gap:10px}
-  .actions.compact .btn{font-size:11px;min-width:52px}
-  .actions.compact .btn .c{width:54px;height:54px}
-  .actions.compact .btn svg{width:24px;height:24px}
-}
-.btn svg{width:32px;height:32px}
-.btn:active:not(:disabled) .c{transform:scale(.9)}
-.btn:disabled{cursor:default}
-.btn:disabled:not(.busy) .c{opacity:.45}
-.green .c{background:var(--green);box-shadow:0 8px 22px rgba(7,193,96,.35)}
-.red .c{background:var(--red);box-shadow:0 8px 22px rgba(242,72,75,.3)}
-.glass .c{background:var(--glass);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px)}
-.glass.on .c{background:#f4f5f7;color:#14161b}
-.busy .c svg{opacity:.35}
-.busy .c::after{content:"";position:absolute;inset:-6px;border-radius:50%;border:3px solid rgba(255,255,255,.25);
-border-top-color:#fff;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-</style>
-</head>
-<body>
-<div class="stage" id="stage" hidden></div>
-<div class="pip mirror" id="pip" hidden><video id="selfVideo" autoplay playsinline muted></video></div>
-<main id="main">
-  <section class="info">
-    <div class="avatar" id="avatar"></div>
-    <div class="title" id="title">微信通话</div>
-    <div class="name" id="name">正在连接…</div>
-    <div class="status" id="status"></div>
-    <div class="timer" id="timer"></div>
-    <div class="hint" id="hint"></div>
-  </section>
-  <section class="actions" id="actions"></section>
-</main>
-<script>
-(function () {
-  if (window.__wxReader) return;  // already on the way to the article reader (see <head>)
-  const CFG = __CFG__;
-  const WORKLET = __WORKLET__;
-  const PENDING_MS = 30000;
-  const $ = (id) => document.getElementById(id);
-
-  // Minimal Telegram Mini App bridge: reads the signed initData from the URL fragment and talks to the client
-  // directly, so the page does not wait for telegram-web-app.js from telegram.org before it can render.
-  const tg = (function () {
-    const hp = {};
-    try {
-      location.hash.slice(1).split('&').forEach((kv) => {
-        const i = kv.indexOf('=');
-        if (i > 0) hp[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
-      });
-    } catch (e) {}
-    let initData = hp.tgWebAppData || '';
-    try {
-      if (initData) sessionStorage.setItem('tgWebAppData', initData);
-      else initData = sessionStorage.getItem('tgWebAppData') || '';
-    } catch (e) {}
-    if (!initData) return null;
-    function post(type, data) {
-      try {
-        if (window.TelegramWebviewProxy && window.TelegramWebviewProxy.postEvent) {
-          window.TelegramWebviewProxy.postEvent(type, JSON.stringify(data || ''));
-        } else if (window.external && 'notify' in window.external) {
-          window.external.notify(JSON.stringify({eventType: type, eventData: data || ''}));
-        } else if (window.parent !== window) {
-          window.parent.postMessage(JSON.stringify({eventType: type, eventData: data || ''}), '*');
-        }
-      } catch (e) {}
-    }
-    return {initData: initData, startParam: new URLSearchParams(initData).get('start_param') || hp.tgWebAppStartParam || '',
-            post: post};
-  })();
-  if (tg) {
-    tg.post('web_app_set_header_color', {color: '#14161b'});
-    tg.post('web_app_set_background_color', {color: '#14161b'});
-    tg.post('web_app_setup_swipe_behavior', {allow_vertical_swipe: false});
-    tg.post('web_app_expand');
-    tg.post('web_app_ready');
-  }
-  const haptic = (style) => tg && tg.post('web_app_trigger_haptic_feedback', {type: 'impact', impact_style: style || 'medium'});
-
-  const ICON = {
-    phone: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6.62 10.79a15.1 15.1 0 0 0 6.59 6.59l2.2-2.2a1 1 0 0 1 1.02-.24c1.12.37 2.33.57 3.57.57a1 1 0 0 1 1 1V20a1 1 0 0 1-1 1A17 17 0 0 1 3 4a1 1 0 0 1 1-1h3.5a1 1 0 0 1 1 1c0 1.25.2 2.45.57 3.57a1 1 0 0 1-.25 1.02l-2.2 2.2z"/></svg>',
-    hangup: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.96.96 0 0 1-.29-.7c0-.28.11-.53.29-.71C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.18.18.29.43.29.71s-.11.53-.29.71l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28a11.3 11.3 0 0 0-2.67-1.85 1 1 0 0 1-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/></svg>',
-    mic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2.5" width="6" height="12" rx="3"/><path d="M5 10.5v.5a7 7 0 0 0 14 0v-.5M12 18v3.5"/></svg>',
-    micOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 9.3V5.5a3 3 0 0 0-5.7-1.3M9 9v2.5a3 3 0 0 0 4.9 2.3M5 10.5v.5a7 7 0 0 0 11.9 5M19 10.5v.5a7 7 0 0 1-.5 2.6M12 18v3.5M3 3l18 18"/></svg>',
-    cam: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="13.5" height="12" rx="2.5"/><path d="M16 10.5l5.5-3.2v9.4L16 13.5"/></svg>',
-    camOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 6H13.5a2.5 2.5 0 0 1 2.5 2.5v2M16 16v-.5a2.5 2.5 0 0 1-2.5 2.5H5a2.5 2.5 0 0 1-2.5-2.5v-7A2.5 2.5 0 0 1 5 6h1.2M16 10.5l5.5-3.2v9.4L18 14.6M3 3l18 18"/></svg>',
-    flip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-3.2l-1.5-2H8.7L7.2 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M9.5 13a2.8 2.8 0 0 1 4.7-1.6l.8.8M14.5 14a2.8 2.8 0 0 1-4.7 1.6l-.8-.8"/></svg>',
-    headset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 18v-5.5a8.5 8.5 0 0 1 17 0V18"/><path d="M20.5 18.5a2 2 0 0 1-2 2H17v-6.5h3.5zM3.5 18.5a2 2 0 0 0 2 2H7v-6.5H3.5z"/></svg>',
-    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-    group: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.2a6.5 6.5 0 0 1 3.5 5.8"/></svg>',
-  };
-  const PENDING_TEXT = {answer: '正在接听…', join: '正在加入…', reject: '正在拒接…', hangup: '正在挂断…',
-                        attach: '正在切换到此设备…', dial: '正在呼叫…'};
-  // Phases in which this browser may own the call's media.
-  const LIVE = {calling: true, connecting: true, active: true};
-
-  function findToken() {
-    const m = location.pathname.match(/\/call\/([A-Za-z0-9_-]{8,})\/?$/);
-    if (m) return m[1];
-    if (tg && tg.startParam) return tg.startParam;
-    const q = new URLSearchParams(location.search);
-    return q.get('tgWebAppStartParam') || q.get('t') || '';
-  }
-  const token = findToken();
-  if (token.indexOf('r_') === 0) {  // article reader link opened through the shared Mini App URL
-    location.replace(location.origin + CFG.base + '/read/' + encodeURIComponent(token.slice(2)) + location.hash);
-    return;
-  }
-  const pageUrl = location.origin + CFG.base + '/call/' + token;
-  const workletUrl = URL.createObjectURL(new Blob([WORKLET], {type: 'application/javascript'}));
-
-  let ws = null, wsOpen = false, st = null, audio = null, audioStarting = null, ended = false, fatal = false, retry = 0, reattach = false;
-  let timerBase = null, timerId = null, wakeLock = null, pending = null, lastPhase = null, micGranted = false;
-  let closingConfirm = null;
-
-  // Video state (WebCodecs H.264 Annex-B preferred when supported, Canvas JPEG universal fallback)
-  let videoCaps = {sendCodecs: ['jpeg'], receiveCodecs: ['jpeg'], maxWidth: 640, maxHeight: 480, maxFps: 15};
-  const videoCapsReady = (async () => {
-    let enc = false, dec = false;
-    try {
-      if (typeof VideoEncoder === 'function' && VideoEncoder.isConfigSupported) {
-        const s = await VideoEncoder.isConfigSupported({
-          codec: 'avc1.42001e', width: 640, height: 480, avc: {format: 'annexb'},
-        });
-        enc = !!(s && s.supported);
-      }
-    } catch (e) {}
-    try {
-      if (typeof VideoDecoder === 'function' && VideoDecoder.isConfigSupported) {
-        const s = await VideoDecoder.isConfigSupported({codec: 'avc1.42001e'});
-        dec = !!(s && s.supported);
-      }
-    } catch (e) {}
-    videoCaps = {
-      sendCodecs: enc ? ['h264', 'jpeg'] : ['jpeg'],
-      receiveCodecs: dec ? ['h264', 'jpeg'] : ['jpeg'],
-      maxWidth: 640, maxHeight: 480, maxFps: 15,
-    };
-    return videoCaps;
-  })();
-
-  let camStream = null, camStarting = null, camFacing = 'user', camGen = 0;
-  let videoEncoder = null, encDims = null, encRotated = false, forceKeyframe = true, lastSendGen = null;
-  let captureTimer = null, captureBusy = false;
-  const capCanvas = document.createElement('canvas');
-  const capCtx = capCanvas.getContext('2d');
-  const remoteTiles = new Map();  // trackId -> {el, canvas, ctx, av, wt, tag, hasFrame, lastFrameAt, decodingJpeg, decoder, awaitingKf, codec, rot, lastKfAt}
-
-  try {
-    navigator.permissions.query({name: 'microphone'}).then((p) => {
-      micGranted = p.state === 'granted';
-      p.onchange = () => { micGranted = p.state === 'granted'; };
-    }).catch(() => {});
-  } catch (e) {}
-
-  function hint(text, isErr) {
-    const h = $('hint');
-    h.className = 'hint' + (isErr ? ' err' : '');
-    h.textContent = text || '';
-  }
-
-  function browserFallback() {
-    if (!tg) return;
-    const a = document.createElement('a');
-    a.href = pageUrl; a.textContent = '在浏览器中打开';
-    a.onclick = (e) => { e.preventDefault(); tg.post('web_app_open_link', {url: pageUrl}); };
-    const h = $('hint');
-    h.appendChild(document.createTextNode(' '));
-    h.appendChild(a);
-  }
-
-  function isWxv1(buf) {
-    if (!buf || buf.byteLength <= 20) return false;
-    const u = new Uint8Array(buf, 0, 4);
-    return u[0] === 0x57 && u[1] === 0x58 && u[2] === 0x56 && u[3] === 0x31;
-  }
-
-  function packWxv1(gen, kind, flags, tsMicros, payload) {
-    const out = new Uint8Array(20 + payload.byteLength);
-    out[0] = 0x57; out[1] = 0x58; out[2] = 0x56; out[3] = 0x31;
-    out[4] = kind & 0xff;
-    out[5] = flags & 0x0f;
-    const dv = new DataView(out.buffer);
-    dv.setUint16(6, 0, false);
-    dv.setUint32(8, gen >>> 0, false);
-    const ts = Math.max(0, Math.floor(tsMicros || 0));
-    dv.setUint32(12, Math.floor(ts / 4294967296) >>> 0, false);
-    dv.setUint32(16, ts >>> 0, false);
-    out.set(payload, 20);
-    return out.buffer;
-  }
-
-  function unpackWxv1(buf) {
-    const u = new Uint8Array(buf);
-    const dv = new DataView(buf);
-    const kind = u[4], flags = u[5];
-    const trackId = dv.getUint32(8, false);
-    const ts = dv.getUint32(12, false) * 4294967296 + dv.getUint32(16, false);
-    const rotBits = flags & 0x0c;
-    const rot = rotBits === 4 ? 90 : rotBits === 8 ? 180 : rotBits === 12 ? 270 : 0;
-    return {kind: kind, flags: flags, keyframe: !!(flags & 1), rot: rot, trackId: trackId,
-            ts: ts, payload: u.subarray(20)};
-  }
-
-  function sendVideoBinary(gen, kind, flags, tsMicros, payload) {
-    if (!ws || ws.readyState !== 1 || ws.bufferedAmount > 256000) return;
-    if (!st || !st.mine || !isCameraOn() || !st.videoSend || !st.videoSend.active) return;
-    ws.send(packWxv1(gen, kind, flags, tsMicros, payload));
-  }
-
-  function closeEncoder() {
-    if (videoEncoder) { try { videoEncoder.close(); } catch (e) {} videoEncoder = null; }
-    encDims = null; encRotated = false;
-  }
-
-  function ensureH264Encoder(w, h, fps, bitrateKbps, rotated) {
-    if (typeof VideoEncoder !== 'function' || typeof VideoFrame !== 'function') return false;
-    if (videoEncoder && videoEncoder.state === 'configured' && encDims && encDims.w === w && encDims.h === h && encRotated === rotated) {
-      return true;
-    }
-    closeEncoder();
-    try {
-      const encoder = new VideoEncoder({
-        output: (chunk) => {
-          if (!camStream || !st || !st.videoSend || !isCameraOn()) return;
-          const bytes = new Uint8Array(chunk.byteLength);
-          chunk.copyTo(bytes);
-          const flags = (chunk.type === 'key' ? 1 : 0) | (rotated ? 4 : 0);
-          sendVideoBinary(st.videoSend.generation, 3, flags, chunk.timestamp, bytes);
-        },
-        error: () => { closeEncoder(); },
-      });
-      encoder.configure({
-        codec: 'avc1.42001e', width: w, height: h,
-        bitrate: Math.max(200, bitrateKbps || 600) * 1000,
-        framerate: fps, avc: {format: 'annexb'},
-      });
-      videoEncoder = encoder; encDims = {w: w, h: h}; encRotated = rotated; forceKeyframe = true;
-      return true;
-    } catch (e) { closeEncoder(); return false; }
-  }
-
-  function startCamera(facing) {
-    const target = facing || camFacing || 'user';
-    if (camStream && camFacing === target) return Promise.resolve(camStream);
-    if (camStarting && camFacing === target) return camStarting;
-    if (!window.isSecureContext) return Promise.reject(new Error('页面必须通过 HTTPS 打开才能使用摄像头'));
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('当前环境不支持摄像头'));
-    stopCamera();
-    camFacing = target;
-    const myGen = ++camGen;
-    const gum = navigator.mediaDevices.getUserMedia({
-      video: {facingMode: target, width: {ideal: 640}, height: {ideal: 480}, frameRate: {ideal: 15}},
-      audio: false,
-    });
-    camStarting = (async () => {
-      try {
-        const stream = await gum;
-        if (myGen !== camGen || ended) { stream.getTracks().forEach((t) => t.stop()); return null; }
-        camStream = stream;
-        const vid = $('selfVideo');
-        vid.srcObject = stream;
-        vid.play().catch(() => {});
-        $('pip').className = 'pip' + (camFacing === 'user' ? ' mirror' : '');
-        forceKeyframe = true;
-        scheduleCapture();
-        render();
-        return stream;
-      } finally {
-        camStarting = null;
-      }
-    })();
-    return camStarting;
-  }
-
-  function stopCamera() {
-    camGen++;
-    if (captureTimer) { clearTimeout(captureTimer); captureTimer = null; }
-    captureBusy = false;
-    closeEncoder();
-    if (camStream) {
-      try { camStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
-      camStream = null;
-    }
-    const vid = $('selfVideo');
-    if (vid) vid.srcObject = null;
-  }
-
-  function scheduleCapture() {
-    if (captureTimer) return;
-    const tick = () => {
-      captureTimer = null;
-      if (!camStream || ended) return;
-      const vs = st && st.videoSend;
-      const fps = Math.max(5, Math.min((vs && vs.maxFps) || 15, 15));
-      const vid = $('selfVideo');
-      if (st && st.mine && st.phase === 'active' && isCameraOn() && vs && vs.active && vid && vid.readyState >= 2 && vid.videoWidth > 0 && !captureBusy) {
-        const vw = vid.videoWidth, vh = vid.videoHeight;
-        const maxW = Math.min(vs.maxWidth || 640, 640), maxH = Math.min(vs.maxHeight || 480, 480);
-        const scale = Math.min(1, maxW / vw, maxH / vh);
-        const w = Math.max(16, Math.round((vw * scale) / 2) * 2);
-        const h = Math.max(16, Math.round((vh * scale) / 2) * 2);
-        if (vs.codec === 'h264' && typeof VideoEncoder === 'function' && typeof VideoFrame === 'function' && capCtx) {
-          // Pre-rotate outgoing H.264 90 deg CCW and signal FLAG_ROTATE_90 (+90 deg CW) per agent-wechat #661
-          const encW = h, encH = w;
-          if (ensureH264Encoder(encW, encH, fps, vs.bitrateKbps || 600, true) && videoEncoder.encodeQueueSize <= 2) {
-            let vf = null;
-            try {
-              if (capCanvas.width !== encW || capCanvas.height !== encH) { capCanvas.width = encW; capCanvas.height = encH; }
-              capCtx.save();
-              capCtx.setTransform(1, 0, 0, 1, 0, 0);
-              capCtx.translate(0, encH);
-              capCtx.rotate(-Math.PI / 2);
-              capCtx.drawImage(vid, 0, 0, w, h);
-              capCtx.restore();
-              vf = new VideoFrame(capCanvas, {timestamp: Math.round(performance.now() * 1000)});
-              const kf = forceKeyframe; forceKeyframe = false;
-              videoEncoder.encode(vf, {keyFrame: kf});
-            } catch (e) {} finally { if (vf) vf.close(); }
-          }
-        } else if (capCtx) {
-          // JPEG path: send upright image; daemon TX transcoder handles orientation
-          if (capCanvas.width !== w || capCanvas.height !== h) { capCanvas.width = w; capCanvas.height = h; }
-          capCtx.setTransform(1, 0, 0, 1, 0, 0);
-          capCtx.drawImage(vid, 0, 0, w, h);
-          captureBusy = true;
-          const gen = vs.generation, myCamGen = camGen;
-          capCanvas.toBlob((blob) => {
-            captureBusy = false;
-            if (!blob || myCamGen !== camGen || !camStream || !isCameraOn()) return;
-            blob.arrayBuffer().then((ab) => {
-              if (myCamGen !== camGen || !camStream || !isCameraOn()) return;
-              sendVideoBinary(gen, 4, 1, Math.round(performance.now() * 1000), new Uint8Array(ab));
-            }).catch(() => {});
-          }, 'image/jpeg', 0.72);
-        }
-      }
-      if (camStream && !ended) captureTimer = setTimeout(tick, Math.round(1000 / fps));
-    };
-    captureTimer = setTimeout(tick, 60);
-  }
-
-  function ensureRemoteTile(trackId, name) {
-    let tile = remoteTiles.get(trackId);
-    if (!tile) {
-      const el = document.createElement('div'); el.className = 'tile';
-      const canvas = document.createElement('canvas');
-      const wait = document.createElement('div'); wait.className = 'wait';
-      const av = document.createElement('div'); av.className = 'wait-av';
-      const wt = document.createElement('span'); wt.textContent = '等待对方画面…';
-      wait.appendChild(av); wait.appendChild(wt);
-      const tag = document.createElement('div'); tag.className = 'tag';
-      el.appendChild(canvas); el.appendChild(wait); el.appendChild(tag);
-      $('stage').appendChild(el);
-      tile = {id: trackId, el: el, canvas: canvas, ctx: canvas.getContext('2d'), av: av, wt: wt, tag: tag,
-              hasFrame: false, lastFrameAt: 0, decodingJpeg: false, decoder: null, awaitingKf: true, codec: '', rot: 0, lastKfAt: 0};
-      remoteTiles.set(trackId, tile);
-    }
-    const label = name || (st && st.name) || '对方';
-    tile.tag.textContent = label;
-    tile.av.textContent = (Array.from(label.trim())[0] || '?').toUpperCase();
-    return tile;
-  }
-
-  function dropRemoteTile(trackId) {
-    const tile = remoteTiles.get(trackId);
-    if (!tile) return;
-    if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} tile.decoder = null; }
-    if (tile.el.parentNode) tile.el.parentNode.removeChild(tile.el);
-    remoteTiles.delete(trackId);
-    updateStageLayout();
-  }
-
-  function clearRemoteVideo() {
-    for (const tid of Array.from(remoteTiles.keys())) dropRemoteTile(tid);
-  }
-
-  function updateStageLayout() {
-    const stage = $('stage');
-    const n = remoteTiles.size;
-    stage.className = 'stage' + (n === 2 ? ' grid-2' : (n >= 3 ? ' grid-many' : ''));
-  }
-
-  function drawRotated(tile, img, iw, ih, rot) {
-    if (!tile.ctx || !iw || !ih) return;
-    const swap = rot === 90 || rot === 270;
-    const cw = swap ? ih : iw, ch = swap ? iw : ih;
-    if (tile.canvas.width !== cw || tile.canvas.height !== ch) {
-      tile.canvas.width = cw; tile.canvas.height = ch;
-    }
-    const ctx = tile.ctx;
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.translate(cw / 2, ch / 2);
-    if (rot) ctx.rotate((rot * Math.PI) / 180);
-    ctx.drawImage(img, -iw / 2, -ih / 2, iw, ih);
-    ctx.restore();
-    if (!tile.hasFrame) { tile.hasFrame = true; tile.el.classList.add('has-frame'); }
-  }
-
-  function requestKeyframe(tile) {
-    const now = Date.now();
-    if (now - tile.lastKfAt < 2000) return;
-    tile.lastKfAt = now;
-    send({type: 'request_keyframe', trackId: tile.id});
-  }
-
-  function handleVideoFrame(buf) {
-    const f = unpackWxv1(buf);
-    const meta = (st && st.videoTracks || []).find((t) => t.id === f.trackId);
-    const tile = ensureRemoteTile(f.trackId, meta && meta.name);
-    tile.lastFrameAt = Date.now();
-    updateStageLayout();
-    if ($('stage').hidden && st && st.phase === 'active') render();
-    tile.rot = f.rot;
-    if (f.kind === 4) {  // JPEG
-      if (tile.decodingJpeg) return;
-      tile.decodingJpeg = true;
-      const blob = new Blob([f.payload], {type: 'image/jpeg'});
-      if (typeof createImageBitmap === 'function') {
-        createImageBitmap(blob).then((bmp) => {
-          tile.decodingJpeg = false;
-          if (remoteTiles.get(f.trackId) === tile) drawRotated(tile, bmp, bmp.width, bmp.height, tile.rot);
-          bmp.close();
-        }, () => { tile.decodingJpeg = false; });
-      } else {
-        const url = URL.createObjectURL(blob);
-        const im = new Image();
-        im.onload = () => {
-          tile.decodingJpeg = false;
-          if (remoteTiles.get(f.trackId) === tile) drawRotated(tile, im, im.naturalWidth, im.naturalHeight, tile.rot);
-          URL.revokeObjectURL(url);
-        };
-        im.onerror = () => { tile.decodingJpeg = false; URL.revokeObjectURL(url); };
-        im.src = url;
-      }
-      return;
-    }
-    if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return;
-    const codec = f.kind === 3 ? 'avc1.42001e' : 'hvc1.1.6.L93.B0';
-    if (!tile.decoder || tile.codec !== codec || tile.decoder.state === 'closed') {
-      if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} }
-      try {
-        const dec = new VideoDecoder({
-          output: (vf) => {
-            if (remoteTiles.get(f.trackId) === tile) {
-              drawRotated(tile, vf, vf.displayWidth || vf.codedWidth, vf.displayHeight || vf.codedHeight, tile.rot);
-            }
-            vf.close();
-          },
-          error: () => { tile.awaitingKf = true; requestKeyframe(tile); },
-        });
-        dec.configure({codec: codec, optimizeForLatency: true});
-        tile.decoder = dec; tile.codec = codec; tile.awaitingKf = true;
-      } catch (e) { tile.decoder = null; return; }
-    }
-    if (tile.awaitingKf && !f.keyframe) { requestKeyframe(tile); return; }
-    if (f.keyframe) tile.awaitingKf = false;
-    try {
-      tile.decoder.decode(new EncodedVideoChunk({type: f.keyframe ? 'key' : 'delta', timestamp: f.ts, data: f.payload}));
-    } catch (e) { tile.awaitingKf = true; requestKeyframe(tile); }
-  }
-
-  // Creates the AudioContext synchronously (inside the tap) so iOS lets it play, then loads the
-  // microphone and the audio worklet in parallel.
-  function startAudio(rate, frame) {
-    if (audio) {
-      if (audio.rate !== rate) { audio.node.port.postMessage({t: 'rate', net: rate, frame: frame}); audio.rate = rate; }
-      return Promise.resolve(audio);
-    }
-    if (audioStarting) return audioStarting;
-    if (!window.isSecureContext) return Promise.reject(new Error('页面必须通过 HTTPS 打开才能使用麦克风'));
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('当前环境不支持麦克风'));
-    // iOS: a two-way call needs the play-and-record session, or Web Audio follows the silent switch / gets
-    // interrupted once the microphone starts.
-    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AC({latencyHint: 'interactive'});
-    ctx.resume().catch(() => {});
-    if (!ctx.audioWorklet) { ctx.close(); return Promise.reject(new Error('当前浏览器不支持 AudioWorklet')); }
-    const gum = navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
-      autoGainControl: true, channelCount: 1}, video: false});
-    const mod = ctx.audioWorklet.addModule(workletUrl);
-    audioStarting = (async () => {
-      let stream = null;
-      try {
-        stream = await gum;
-        await mod;
-        const node = new AudioWorkletNode(ctx, 'bridge-io', {numberOfInputs: 1, numberOfOutputs: 1,
-          outputChannelCount: [1], processorOptions: {net: rate, frame: frame}});
-        ctx.createMediaStreamSource(stream).connect(node);
-        node.connect(ctx.destination);
-        node.port.onmessage = (e) => {
-          if (st && st.mine && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 64000) ws.send(e.data);
-        };
-        // Never wait for resume(): on iOS the microphone starting can leave the context "interrupted" and the
-        // promise pending indefinitely, which used to leave the call connected with no sound either way.
-        audio = {ctx: ctx, stream: stream, node: node, rate: rate};
-        micGranted = true;
-        ctx.onstatechange = checkAudio;
-        checkAudio();
-        try {
-          if (navigator.wakeLock) {
-            navigator.wakeLock.request('screen').then((l) => {
-              if (audio && audio.ctx === ctx) wakeLock = l; else l.release();
-            }).catch(() => {});
-          }
-        } catch (e) {}
-        return audio;
-      } catch (e) {
-        gum.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
-        try { ctx.close(); } catch (_) {}
-        throw e;
-      } finally {
-        audioStarting = null;
-      }
-    })();
-    return audioStarting;
-  }
-
-  // Keeps the AudioContext running: the system can suspend or interrupt it (iOS when the mic starts, another
-  // app takes audio, the page is backgrounded). Resume quietly, and ask for a tap if that is not allowed.
-  const SOUND_HINT = '声音被系统暂停了，轻点屏幕任意位置恢复';
-  let soundHint = false, soundTimer = null;
-  function checkAudio() {
-    if (!audio) return;
-    const s = audio.ctx.state;
-    if (s === 'running') {
-      if (soundHint) { soundHint = false; hint(''); }
-      return;
-    }
-    if (s === 'closed') return;
-    audio.ctx.resume().catch(() => {});
-    clearTimeout(soundTimer);
-    soundTimer = setTimeout(() => {
-      if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') {
-        soundHint = true;
-        hint(SOUND_HINT, true);
-      }
-    }, 800);
-  }
-  ['touchend', 'click'].forEach((t) => document.addEventListener(t, () => {
-    if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') audio.ctx.resume().then(checkAudio, () => {});
-  }, true));
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAudio(); });
-
-  function stopAudio() {
-    clearTimeout(soundTimer);
-    if (soundHint) { soundHint = false; hint(''); }
-    if (!audio) return;
-    try { audio.ctx.onstatechange = null; } catch (e) {}
-    try { audio.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
-    try { audio.ctx.close(); } catch (e) {}
-    audio = null;
-    try { wakeLock && wakeLock.release(); } catch (e) {}
-    wakeLock = null;
-  }
-
-  function send(obj) {
-    if (ws && ws.readyState === 1) { ws.send(JSON.stringify(obj)); return true; }
-    return false;
-  }
-
-  function isMuted() { return pending && pending.action === 'mute' ? pending.muted : !!(st && st.muted); }
-  function isCameraOn() { return pending && pending.action === 'camera' ? pending.enabled : !!(st && st.camera); }
-
-  // Show the tap at once: the agent-wechat round trip (it drives the real WeChat client) can take seconds.
-  function begin(action, extra) {
-    if (pending || !st) return false;
-    pending = Object.assign({action: action, phase: st.phase, at: Date.now()}, extra || {});
-    const mine = pending;
-    setTimeout(() => { if (pending === mine) { pending = null; render(); } }, PENDING_MS);
-    haptic(action === 'hangup' || action === 'reject' ? 'heavy' : 'medium');
-    hint('');
-    render();
-    return true;
-  }
-
-  function settle() {
-    if (!pending || !st) return;
-    const p = st.phase;
-    if (pending.action === 'mute') { if (!!st.muted === pending.muted || !(p === 'active' || p === 'connecting')) pending = null; }
-    else if (pending.action === 'camera') { if (!!st.camera === pending.enabled || !(p === 'active' || p === 'connecting')) pending = null; }
-    else if (pending.action === 'attach') { if (st.mine || !LIVE[p]) pending = null; }
-    else if (p !== pending.phase) pending = null;
-  }
-
-  function act(action, extra) {
-    if (!begin(action, extra)) return;
-    if (!send(Object.assign({type: action}, extra || {}))) { wsOpen = false; pending = null; render(); }
-  }
-
-  async function withMedia(action, wantVideo) {
-    if (!st || !begin(action)) return;
-    const early = !wantVideo && (!!audio || micGranted);
-    // Start audio synchronously inside the user tap gesture before any await so iOS Safari unlocks AudioContext.
-    const audioP = startAudio(st.rate || 16000, st.frame || 320);
-    const caps = await videoCapsReady;
-    let camOk = false;
-    if (early) {
-      const payload = {type: action, videoCaps: caps};
-      if (st.videoEnabled || st.videoCall) payload.cameraEnabled = false;
-      send(payload);
-    }
-    try {
-      await audioP;
-    } catch (e) {
-      const name = e && e.name;
-      let msg = (e && e.message) || String(e);
-      if (name === 'NotAllowedError' || name === 'SecurityError') msg = '没有麦克风权限，请允许 Telegram / 浏览器使用麦克风';
-      else if (name === 'NotFoundError') msg = '没有找到麦克风';
-      if (!early) pending = null;
-      render();
-      hint(msg, true);
-      browserFallback();
-      return;
-    }
-    if (wantVideo) {
-      try {
-        await startCamera(camFacing);
-        camOk = !!camStream;
-      } catch (e) {
-        camOk = false;
-        hint('未能开启摄像头，将以仅语音方式接入', false);
-      }
-    }
-    if (!early) {
-      const payload = {type: action, videoCaps: caps};
-      if (wantVideo || st.videoEnabled || st.videoCall) payload.cameraEnabled = camOk;
-      if (action === 'dial' && wantVideo) payload.callType = 'video';
-      if (!send(payload)) { wsOpen = false; pending = null; render(); }
-    }
-  }
-
-  async function toggleCamera() {
-    if (!st || !st.mine) return;
-    const next = !isCameraOn();
-    if (next) {
-      try { await startCamera(camFacing); } catch (e) {
-        hint('无法开启摄像头，请检查权限', true);
-        browserFallback();
-        return;
-      }
-      act('camera', {enabled: true});
-    } else {
-      stopCamera();
-      act('camera', {enabled: false});
-    }
-  }
-
-  async function flipCamera() {
-    if (!camStream) return;
-    const next = camFacing === 'user' ? 'environment' : 'user';
-    try { await startCamera(next); haptic('light'); } catch (e) {
-      hint('当前设备不支持切换前后摄像头', false);
-    }
-  }
-  $('pip').onclick = flipCamera;
-
-  function button(cls, icon, label, onClick, action) {
-    const b = document.createElement('button');
-    const busy = pending && pending.action === action;
-    b.className = 'btn ' + cls + (busy ? ' busy' : '');
-    b.disabled = !!pending || (!wsOpen && action !== 'close');
-    b.innerHTML = '<span class="c">' + icon + '</span>';
-    b.appendChild(document.createTextNode(label));
-    b.onclick = onClick;
-    return b;
-  }
-
-  function fmt(sec) {
-    const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
-    return (h ? h + ':' + String(m).padStart(2, '0') : String(m).padStart(2, '0')) + ':' + String(s).padStart(2, '0');
-  }
-  function tick() { $('timer').textContent = timerBase == null ? '' : fmt(Math.floor((Date.now() - timerBase) / 1000)); }
-
-  const EMOJI = /^[\s\u2190-\u2BFF\uFE0F\u200D]*(?:[\uD83C-\uD83E][\uDC00-\uDFFF][\uFE0F\u200D\s]*)*/;
-  function cleanStatus(s) { return String(s || '').replace(EMOJI, '').trim(); }
-
-  function setStatus(text, tone) {
-    const el = $('status');
-    el.className = 'status tone-' + tone;
-    el.innerHTML = '';
-    if (!text) return;
-    const d = document.createElement('i'); d.className = 'dot';
-    el.appendChild(d);
-    el.appendChild(document.createTextNode(text));
-  }
-
-  function setClosingConfirmation(on) {
-    if (!tg || closingConfirm === on) return;
-    closingConfirm = on;
-    tg.post('web_app_setup_closing_behavior', {need_confirmation: on});
-  }
-
-  function syncRemoteTiles() {
-    const wanted = new Set();
-    const tracks = (st && st.videoTracks) || [];
-    const now = Date.now();
-    const remoteOff = !!(st && !st.group && st.remoteCamera === false);
-    for (let i = 0; i < tracks.length; i++) {
-      const t = tracks[i];
-      wanted.add(t.id);
-      const tile = ensureRemoteTile(t.id, t.name);
-      tile.wt.textContent = remoteOff ? '对方已关闭摄像头' : '等待对方画面…';
-      if (remoteOff && tile.hasFrame) { tile.hasFrame = false; tile.el.classList.remove('has-frame'); }
-    }
-    for (const [tid, tile] of Array.from(remoteTiles.entries())) {
-      if (!wanted.has(tid) && !(st && st.phase === 'active' && now - tile.lastFrameAt < 1500)) {
-        dropRemoteTile(tid);
-      }
-    }
-    updateStageLayout();
-  }
-
-  function render() {
-    if (!st) return;
-    const p = st.phase;
-    if (p !== lastPhase) { if (lastPhase !== null) hint(''); lastPhase = p; }
-    const person = st.name || st.caller || '';
-    let title = st.title || '微信通话';
-    if ((p === 'connecting' || p === 'active') && title === '微信语音来电') title = '微信语音通话';
-    if ((p === 'connecting' || p === 'active') && title === '微信视频来电') title = '微信视频通话';
-    $('title').textContent = title;
-    $('name').textContent = person;
-    const av = $('avatar');
-    const first = Array.from(person.trim())[0];
-    const groupIcon = st.phase === 'invite' || st.group;
-    if (groupIcon || !first) av.innerHTML = groupIcon ? ICON.group : ICON.phone;
-    else av.textContent = first.toUpperCase();
-
-    if (p === 'active') syncRemoteTiles();
-    if (!st.mine && !pending && camStream && !camStarting) stopCamera();
-    if (st.videoSend && st.videoSend.generation != null && st.videoSend.generation !== lastSendGen) {
-      lastSendGen = st.videoSend.generation;
-      forceKeyframe = true;
-    }
-    const showStage = p === 'active' && remoteTiles.size > 0;
-    const showPip = p === 'active' && !!st.mine && isCameraOn() && !!camStream;
-    $('stage').hidden = !showStage;
-    $('pip').hidden = !showPip;
-    if (showPip && st.videoSend && st.videoSend.active) scheduleCapture();
-
-    const mainCls = [];
-    if (p === 'ringing' || p === 'invite' || p === 'calling') mainCls.push('ringing');
-    else if (p === 'ended') mainCls.push('ended');
-    if (showStage) mainCls.push('video-live');
-    $('main').className = mainCls.join(' ');
-
-    let text = cleanStatus(st.status), tone = 'off';
-    if (p === 'ringing' || p === 'invite' || p === 'calling') tone = 'ring';
-    else if (p === 'connecting') tone = 'wait';
-    else if (p === 'active') tone = st.elapsed != null ? 'live' : 'wait';
-    else if (p === 'dial' && st.dialable) tone = 'live';
-    $('timer').hidden = p === 'dial';
-    if (p === 'invite' && st.caller) text = '发起人：' + st.caller + ' · ' + text;
-    if (p === 'active' && st.videoCall && !st.group && st.remoteCamera === false) text = '对方已关闭摄像头';
-    if (pending && PENDING_TEXT[pending.action]) {
-      text = pending.action === 'hangup' && p === 'calling' ? '正在取消…' : PENDING_TEXT[pending.action];
-      tone = 'wait';
-    }
-    if (!wsOpen && !ended && !fatal) { text = '连接中断，正在重连…'; tone = 'wait'; }
-    setStatus(text, tone);
-
-    if (st.elapsed != null && p !== 'ended') {
-      timerBase = Date.now() - st.elapsed * 1000;
-      if (!timerId) timerId = setInterval(tick, 1000);
-    } else {
-      timerBase = null;
-      if (timerId) { clearInterval(timerId); timerId = null; }
-    }
-    tick();
-
-    const a = $('actions');
-    a.innerHTML = '';
-    let count = 0;
-    const addBtn = (b) => { a.appendChild(b); count++; };
-    if (p === 'ringing') {
-      addBtn(button('red', ICON.hangup, '拒接', () => act('reject'), 'reject'));
-      if (st.answerable) {
-        addBtn(button('green', st.videoCall ? ICON.cam : ICON.phone, st.videoCall ? '视频接听' : '接听',
-          () => withMedia('answer', !!st.videoCall), 'answer'));
-      } else if (!$('hint').textContent) {
-        hint('当前 agent-wechat 不支持在网页接听此通话');
-      }
-    } else if (p === 'invite') {
-      if (st.joinable) {
-        if (st.videoEnabled) {
-          addBtn(button('glass', ICON.phone, '语音加入', () => withMedia('join', false), 'join'));
-          addBtn(button('green', ICON.cam, '视频加入', () => withMedia('join', true), 'join'));
-        } else {
-          addBtn(button('green', ICON.phone, '加入', () => withMedia('join', false), 'join'));
-        }
-      } else if (!$('hint').textContent) {
-        hint('当前 agent-wechat 不支持加入群语音通话');
-      }
-    } else if (p === 'dial') {
-      if (st.dialable) {
-        addBtn(button('green', st.videoCall ? ICON.cam : ICON.phone, st.videoCall ? '视频呼叫' : '呼叫',
-          () => withMedia('dial', !!st.videoCall), 'dial'));
-      }
-      if (!$('hint').classList.contains('err')) hint(st.note || '');
-    } else if (p === 'calling') {
-      if (!st.mine) addBtn(button('green', ICON.headset, '切换到此设备', () => withMedia('attach', !!st.camera), 'attach'));
-      addBtn(button('red', ICON.hangup, '取消', () => act('hangup'), 'hangup'));
-    } else if (p === 'connecting' || p === 'active') {
-      if (st.mine) {
-        const muted = isMuted();
-        addBtn(button('glass' + (muted ? ' on' : ''), muted ? ICON.micOff : ICON.mic,
-          muted ? '已静音' : '麦克风已开', () => act('mute', {muted: !muted}), 'mute'));
-        if (st.videoCall || st.videoEnabled) {
-          const camOn = isCameraOn();
-          addBtn(button('glass' + (camOn ? ' on' : ''), camOn ? ICON.cam : ICON.camOff,
-            camOn ? '摄像头已开' : '摄像头已关', toggleCamera, 'camera'));
-          if (camOn && camStream) {
-            addBtn(button('glass', ICON.flip, '翻转镜头', flipCamera, 'flip'));
-          }
-        }
-      } else {
-        addBtn(button('green', ICON.headset, '在此接听', () => withMedia('attach', !!st.camera), 'attach'));
-      }
-      addBtn(button('red', ICON.hangup, '挂断', () => act('hangup'), 'hangup'));
-      if (audio && st.rate && audio.rate !== st.rate) startAudio(st.rate, st.frame);
-    } else if (tg) {
-      addBtn(button('glass', ICON.close, '关闭', () => tg.post('web_app_close'), 'close'));
-    }
-    a.className = 'actions' + (count >= 3 ? ' compact' : '');
-    setClosingConfirmation(!!LIVE[p] && !!st.mine);
-    if (p === 'ended' || p === 'elsewhere') {
-      if (p === 'ended') ended = true;
-      stopCamera();
-      clearRemoteVideo();
-      stopAudio();
-    }
-    if (soundHint) hint(SOUND_HINT, true);  // a phase change clears the hint; this one still applies
-  }
-
-  function connect() {
-    if (!token) { $('name').textContent = '链接无效'; fatal = true; return; }
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(proto + '//' + location.host + CFG.base + '/ws');
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = async () => {
-      wsOpen = true;
-      retry = 0;
-      const caps = await videoCapsReady;
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({type: 'auth', token: token, initData: tg ? tg.initData : '', videoCaps: caps}));
-      }
-    };
-    ws.onmessage = (e) => {
-      if (typeof e.data !== 'string') {
-        if (isWxv1(e.data)) { handleVideoFrame(e.data); return; }
-        if (!audio || e.data.byteLength < 6) return;
-        const id = new DataView(e.data).getUint32(0, true);
-        const pcm = new Int16Array(e.data.slice(4));
-        audio.node.port.postMessage({t: 'pcm', id: id, pcm: pcm}, [pcm.buffer]);
-        return;
-      }
-      let m; try { m = JSON.parse(e.data); } catch (_) { return; }
-      if (m.type === 'state') {
-        const wasMine = st && st.mine;
-        if (m.mine && !wasMine) forceKeyframe = true;
-        st = m; settle(); render();
-        if (!m.mine && !wasMine && audio && LIVE[m.phase] && reattach) {
-          reattach = false; send({type: 'attach'});
-        }
-      } else if (m.type === 'error') {
-        pending = null; render();
-        hint(m.message, true);
-        haptic('rigid');
-      } else if (m.type === 'drop') {
-        audio && audio.node.port.postMessage({t: 'drop', id: m.trackId});
-      } else if (m.type === 'video_drop') {
-        dropRemoteTile(m.trackId);
-        render();
-      } else if (m.type === 'keyframe_requested') {
-        forceKeyframe = true;
-      } else if (m.type === 'fatal') {
-        fatal = true; pending = null;
-        stopCamera(); clearRemoteVideo();
-        $('name').textContent = ''; setStatus(m.message, 'err'); $('actions').innerHTML = '';
-      }
-    };
-    ws.onclose = () => {
-      wsOpen = false;
-      if (fatal || ended) return;
-      if (audio) reattach = true;
-      pending = null;
-      if (st) render();
-      else setStatus('连接中断，正在重连…', 'wait');
-      setTimeout(connect, Math.min(5000, 300 * Math.pow(2, retry++)));
-    };
-  }
-  connect();
-})();
-</script>
-</body>
-</html>
-"""
+WORKLET_JS = load_text("worklet.js")
+PAGE_HTML = load_text("call.html")
