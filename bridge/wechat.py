@@ -28,8 +28,8 @@ _MAX_WS_FRAME = 4 * 1024 * 1024
 _WS_IDLE_PING_SECONDS = 45.0
 _WS_PONG_TIMEOUT_SECONDS = 15.0
 
-# Calls Protocol v3 (agent-wechat >= 3.0) with v2 fallback (agent-wechat <= 2.9).
-CALL_PROTOCOL_VERSIONS = (3, 2)
+# Calls Protocol v3 (agent-wechat >= 3.0).
+CALL_PROTOCOL_VERSIONS = (3,)
 WXCM_MAGIC = b"WXCM"
 WXCM_VERSION = 3
 WXCM_HEADER_STRUCT = struct.Struct("!4sBBHIIQQI")  # 36-byte big-endian header
@@ -1132,7 +1132,7 @@ class CallsSocket:
         self._closing = False
         self._close_sent = False
         self._writer_closed = False
-        self.protocol_version: int = 2
+        self.protocol_version: int = WXCM_VERSION
 
     @property
     def closed(self) -> bool:
@@ -1310,10 +1310,9 @@ class CallsSocket:
         if msg.get("type") != "hello":
             raise WeChatError(502, "unexpected_hello", True)
         ver = msg.get("protocolVersion")
-        if ver is not None:
-            if ver not in CALL_PROTOCOL_VERSIONS:
-                raise WeChatError(400, "unsupported_protocol_version", False)
-            self.protocol_version = int(ver)
+        if ver not in CALL_PROTOCOL_VERSIONS:
+            raise WeChatError(400, "unsupported_protocol_version", False)
+        self.protocol_version = int(ver)
         self._reader_task = asyncio.create_task(self._read_loop())
         return msg
 

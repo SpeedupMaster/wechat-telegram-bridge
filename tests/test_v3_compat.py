@@ -1,5 +1,5 @@
-"""Tests for agent-wechat 3.0.0-beta.0 / beta.1 compatibility:
-- Calls Protocol v3 (WXCM binary media framing, sendTracks[], track.start, v2 fallback)
+"""Tests for agent-wechat 3.0.0 compatibility:
+- Calls Protocol v3 (WXCM binary media framing, sendTracks[], track.start, v2 rejection)
 - Media-close vs call.state(ended) race guard
 - Enterprise WeChat (@im.chatroom) group recognition and TP media error reasons
 - Oversized forwarded chat history (49:40) rendering and message.updated in-place refresh
@@ -34,7 +34,6 @@ class _FakeV3MediaSocket:
         self.sent_bytes: list[bytes] = []
         self.queue: asyncio.Queue = asyncio.Queue()
         self.closed = False
-        self.protocol_version = 3
 
     async def send_json(self, obj: dict) -> None:
         self.sent_json.append(obj)
@@ -209,13 +208,13 @@ class CallsProtocolV3SocketTests(unittest.IsolatedAsyncioTestCase):
             ctl_sock, hello = await wx.calls_socket()
             self.assertEqual(hello["protocolVersion"], 3)
             self.assertEqual(ctl_sock.protocol_version, 3)
-            self.assertEqual(control_seen[0]["supportedProtocolVersions"], [3, 2])
+            self.assertEqual(control_seen[0]["supportedProtocolVersions"], [3])
             await ctl_sock.close()
 
             msock, ready = await wx.call_media("c1", "ctl-v3", "own-1")
             self.assertEqual(ready["protocolVersion"], 3)
             self.assertEqual(msock.protocol_version, 3)
-            self.assertEqual(media_seen_json[0]["supportedProtocolVersions"], [3, 2])
+            self.assertEqual(media_seen_json[0]["supportedProtocolVersions"], [3])
             await msock.send_json({"type": "track.start", "trackId": 1, "generation": 1})
             pcm = bytes(range(256)) * 5  # 1280 bytes (> 125-byte WS header threshold)
             await msock.send_bytes(encode_wxcm_frame(1, 1, pcm, sequence=1, timestamp_micros=0))

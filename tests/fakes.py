@@ -664,11 +664,15 @@ class _FakeMediaSocket:
 
     def __init__(self):
         self.sent: list[dict] = []
+        self.sent_bytes: list[bytes] = []
         self.queue: asyncio.Queue = asyncio.Queue()
         self.closed = False
 
     async def send_json(self, obj: dict) -> None:
         self.sent.append(obj)
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.sent_bytes.append(data)
 
     async def events(self):
         while True:

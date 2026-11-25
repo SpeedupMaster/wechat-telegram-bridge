@@ -11,7 +11,6 @@ when the page runs as a Telegram Mini App its signed initData must additionally 
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import hmac
 import json
@@ -234,14 +233,13 @@ def _err_text(code: str | None, default: str) -> str:
 
 
 def _find_audio_send_track(ready: dict) -> dict:
-    """Extract the audio send track from media.ready (v3 sendTracks[] or v2 sendTrack)."""
+    """Extract the audio send track from v3 media.ready sendTracks[]."""
     tracks = ready.get("sendTracks")
     if isinstance(tracks, list):
         for t in tracks:
-            if isinstance(t, dict) and t.get("media") in (None, "audio") and t.get("direction") in (None, "send"):
+            if isinstance(t, dict) and t.get("media") == "audio" and t.get("direction") == "send":
                 return t
-    track = ready.get("sendTrack")
-    return track if isinstance(track, dict) else {}
+    return {}
 
 
 def _find_video_send_track(ready: dict) -> dict | None:
@@ -249,7 +247,7 @@ def _find_video_send_track(ready: dict) -> dict | None:
     tracks = ready.get("sendTracks")
     if isinstance(tracks, list):
         for t in tracks:
-            if isinstance(t, dict) and t.get("media") == "video" and t.get("direction") in (None, "send"):
+            if isinstance(t, dict) and t.get("media") == "video" and t.get("direction") == "send":
                 return t
     return None
 
@@ -264,7 +262,6 @@ class CallSession:
         self.owner_token = owner_token
         self.readied = readied
         self.media = None
-        self.protocol_version: int = 2
         self.send_track: int | None = None
         self.send_gen: int | None = None
         self.rate = 16000
@@ -407,7 +404,6 @@ class CallSession:
                 return
             sock, ready = await bridge.wx.call_media(self.call_id, bridge._calls_client_id, self.owner_token)
             self.media = sock
-            self.protocol_version = int(ready.get("protocolVersion") or getattr(sock, "protocol_version", 2) or 2)
             send = _find_audio_send_track(ready)
             fmt = send.get("format") or bridge._calls_audio_format
             if int(fmt.get("channels") or 1) != 1:
@@ -431,8 +427,8 @@ class CallSession:
             if self.video_send_active and self.camera_enabled:
                 await self._start_video_send()
             await self.web.push_state(self.entry)
-            log.info("Call %s media attached (v%d): %d Hz, frame %d, send track %s, video send %s",
-                     self.call_id, self.protocol_version, self.rate, self.frame, self.send_track, self.video_send_track)
+            log.info("Call %s media attached: %d Hz, frame %d, send track %s, video send %s",
+                     self.call_id, self.rate, self.frame, self.send_track, self.video_send_track)
             self.watch_task = asyncio.create_task(self._watch_audio())
             async for ev in sock.events():
                 etype = ev.get("type")
@@ -503,12 +499,10 @@ class CallSession:
             self._tx_seq = 0
             self._tx_samples = 0
             self._tx_last_ts = -1
-            msg_type = "track.start" if self.protocol_version >= 3 else "audio.start"
-            await self.media.send_json({"type": msg_type, "trackId": self.send_track, "generation": self.send_gen})
+            await self.media.send_json({"type": "track.start", "trackId": self.send_track, "generation": self.send_gen})
 
     async def _start_video_send(self) -> None:
-        if (self.media is None or self.protocol_version < 3
-                or self.video_send_track is None or self.video_send_gen is None):
+        if self.media is None or self.video_send_track is None or self.video_send_gen is None:
             return
         key = (self.video_send_track, self.video_send_gen)
         if self._video_started_key == key:
@@ -563,7 +557,7 @@ class CallSession:
         await self.on_track_updated(track)
 
     async def on_track_updated(self, track: dict) -> None:
-        if (track.get("media") not in (None, "audio")
+        if (track.get("media") != "audio"
                 or track.get("direction") != "send"
                 or track.get("id") != self.send_track):
             return
@@ -579,17 +573,10 @@ class CallSession:
         if ws is None or ws.closed:
             return
         raw_pcm = ev.get("pcm")
-        if isinstance(raw_pcm, (bytes, bytearray)):
-            pcm = bytes(raw_pcm)
-        else:
-            try:
-                pcm = base64.b64decode(ev.get("pcmBase64") or "")
-            except ValueError:
-                return
-        if not pcm:
+        if not isinstance(raw_pcm, (bytes, bytearray)) or not raw_pcm:
             return
         try:
-            await ws.send_bytes(struct.pack("<I", int(ev.get("trackId") or 0)) + pcm)
+            await ws.send_bytes(struct.pack("<I", int(ev.get("trackId") or 0)) + bytes(raw_pcm))
             self.rx_to_page += 1
         except (ConnectionError, RuntimeError):
             pass
@@ -650,7 +637,8 @@ class CallSession:
                 pass
 
     async def from_page(self, ws: web.WebSocketResponse, data: bytes) -> None:
-        if ws is not self.active_ws or self.muted or self.media is None or self.send_gen is None:
+        if (ws is not self.active_ws or self.muted or self.media is None
+                or self.send_track is None or self.send_gen is None):
             return
         if len(data) & 1:
             data = data[:-1]
@@ -658,32 +646,23 @@ class CallSession:
             return
         self.tx_chunks += 1
         try:
-            if self.protocol_version >= 3 and self.send_track is not None:
-                self._tx_seq += 1
-                ts = self._tx_samples * 1_000_000 // max(1, self.rate)
-                if ts <= self._tx_last_ts:
-                    ts = self._tx_last_ts + 1
-                self._tx_last_ts = ts
-                self._tx_samples += len(data) // 2
-                frame = encode_wxcm_frame(
-                    self.send_track, self.send_gen, data,
-                    kind=WXCM_KIND_PCM_S16LE, sequence=self._tx_seq, timestamp_micros=ts,
-                )
-                await self.media.send_bytes(frame)
-            else:
-                await self.media.send_json({
-                    "type": "audio.chunk",
-                    "trackId": self.send_track,
-                    "generation": self.send_gen,
-                    "pcmBase64": base64.b64encode(data).decode("ascii"),
-                })
+            self._tx_seq += 1
+            ts = self._tx_samples * 1_000_000 // max(1, self.rate)
+            if ts <= self._tx_last_ts:
+                ts = self._tx_last_ts + 1
+            self._tx_last_ts = ts
+            self._tx_samples += len(data) // 2
+            frame = encode_wxcm_frame(
+                self.send_track, self.send_gen, data,
+                kind=WXCM_KIND_PCM_S16LE, sequence=self._tx_seq, timestamp_micros=ts,
+            )
+            await self.media.send_bytes(frame)
         except (OSError, WeChatError):
             pass
 
     async def from_page_video(self, ws: web.WebSocketResponse, data: bytes) -> None:
         if (ws is not self.active_ws or not self.camera_enabled or not self.video_send_active
-                or self.media is None or self.protocol_version < 3
-                or self.video_send_track is None or self.video_send_gen is None):
+                or self.media is None or self.video_send_track is None or self.video_send_gen is None):
             return
         parsed = decode_wxv1_frame(data)
         if parsed is None:
@@ -718,7 +697,7 @@ class CallSession:
             pass
 
     async def request_keyframe(self, track_id: int) -> None:
-        if self.media is None or self.protocol_version < 3 or track_id <= 0:
+        if self.media is None or track_id <= 0:
             return
         try:
             await self.media.send_json({"type": "video.request_keyframe", "trackId": int(track_id)})
@@ -866,8 +845,6 @@ class CallWeb:
         return req["web_token"]
 
     def can_video(self, conference: bool = False) -> bool:
-        if self.bridge._calls_protocol_version < 3:
-            return False
         caps = self.bridge._calls_caps
         return bool(caps.get("conferenceVideo") if conference else caps.get("directVideo"))
 
@@ -971,7 +948,7 @@ class CallWeb:
     async def _ready(self, scope: dict, *, video: dict | None = None) -> dict:
         cmd: dict = {"type": "call.ready", "ready": True,
                      "format": self.bridge._calls_audio_format, "scope": scope}
-        if video is not None and self.bridge._calls_protocol_version >= 3:
+        if video is not None:
             cmd["video"] = video
         return await self._command(cmd)
 
@@ -1035,7 +1012,7 @@ class CallWeb:
 
             def _answer_cmd() -> dict:
                 cmd: dict = {"type": "call.answer", "callId": call_id, "expectedRevision": entry["revision"]}
-                if is_video and self.bridge._calls_protocol_version >= 3:
+                if is_video:
                     cmd["cameraEnabled"] = want_cam
                 return cmd
 
@@ -1090,7 +1067,7 @@ class CallWeb:
             readied = True
             join_cmd: dict = {"type": "call.join", "invitationId": inv["invitation_id"],
                               "invitationRevision": inv.get("revision", 0)}
-            if self.bridge._calls_protocol_version >= 3 and camera_enabled is not None:
+            if camera_enabled is not None:
                 join_cmd["cameraEnabled"] = want_cam
             res = await self._command(join_cmd)
             if res.get("status") not in ("accepted", "replayed") or not res.get("callId"):
@@ -1160,7 +1137,7 @@ class CallWeb:
                 raise CallActionError(_err_text(res.get("code"), "呼叫失败"))
             readied = True
             dial_cmd: dict = {"type": "call.dial", "callType": ctype, "target": target}
-            if is_video and self.bridge._calls_protocol_version >= 3:
+            if is_video:
                 dial_cmd["cameraEnabled"] = want_cam
             res = await self._command(dial_cmd)
             if res.get("status") not in ("accepted", "replayed") or not res.get("callId"):
@@ -1248,8 +1225,6 @@ class CallWeb:
         await self.push_state(sess.entry)
 
     async def set_camera(self, sess: CallSession, enabled: bool) -> None:
-        if self.bridge._calls_protocol_version < 3:
-            raise CallActionError("当前 agent-wechat 不支持摄像头开关")
         res = await self._command({"type": "call.camera", "callId": sess.call_id, "enabled": bool(enabled)})
         if res.get("status") not in ("accepted", "replayed"):
             raise CallActionError(_err_text(res.get("code"), "摄像头切换失败"))
@@ -1681,7 +1656,6 @@ class CallWeb:
                         if meta.get("active", True) and meta.get("codec") in ("h264", "h265"):
                             await sess._maybe_request_keyframe(tid)
                 if (cam_opt is not None and cam_opt != sess.camera_enabled
-                        and self.bridge._calls_protocol_version >= 3
                         and (entry.get("call_type") == "video" or sess.video_send_track is not None)):
                     try:
                         await self.set_camera(sess, cam_opt)

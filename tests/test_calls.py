@@ -82,7 +82,7 @@ class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         await self.b.handle_call_event({
             "type": "hello",
-            "protocolVersion": 2,
+            "protocolVersion": 3,
             "clientId": "c1",
             "conferenceInvitations": [],
             "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
@@ -384,7 +384,7 @@ class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
                 received_client_msgs.append(json.loads(hello_bytes))
                 writer.write(ws_frame(0x1, json.dumps({
                     "type": "hello",
-                    "protocolVersion": 2,
+                    "protocolVersion": 3,
                     "clientId": "c-ws",
                     "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
                 }).encode()))
@@ -431,7 +431,8 @@ class CallBridgeTests(unittest.IsolatedAsyncioTestCase):
             wx = WeChatClient(f"http://127.0.0.1:{port}", "secret-token", ACC)
             try:
                 sock, hello = await wx.calls_socket()
-                self.assertEqual(hello["protocolVersion"], 2)
+                self.assertEqual(hello["protocolVersion"], 3)
+                self.assertEqual(received_client_msgs[0]["supportedProtocolVersions"], [3])
                 events_iter = sock.events()
                 ev = await anext(events_iter)
                 self.assertEqual(ev["type"], "call.offered")
@@ -488,10 +489,10 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
 
         async def call_media(call_id, client_id, owner_token, timeout=10.0):
             self.media_calls.append((call_id, client_id, owner_token))
-            return self.media, {"type": "media.ready", "protocolVersion": 2,
-                                "sendTrack": {"id": 1, "generation": 1, "direction": "send",
-                                              "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}},
-                                "receiveTracks": [{"id": 2, "generation": 1, "direction": "receive",
+            return self.media, {"type": "media.ready", "protocolVersion": 3,
+                                "sendTracks": [{"media": "audio", "id": 1, "generation": 1, "direction": "send",
+                                                "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
+                                "receiveTracks": [{"media": "audio", "id": 2, "generation": 1, "direction": "receive",
                                                    "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}]}
 
         self.b.wx.call_media = call_media
@@ -499,7 +500,7 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         self.http = aiohttp.ClientSession()
         self.base = f"http://127.0.0.1:{self.b.call_web.bound_port}/wxcall"
         await self.b.handle_call_event({
-            "type": "hello", "protocolVersion": 2, "clientId": "ctl-1", "conferenceInvitations": [],
+            "type": "hello", "protocolVersion": 3, "clientId": "ctl-1", "conferenceInvitations": [],
             "capabilities": {"directAudio": True, "conferenceJoin": True, "conferenceAudio": True},
             "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
         })
@@ -556,8 +557,8 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_answer_pending_call_relay_audio_mute_and_hangup(self):
         import aiohttp
-        import base64
         import struct
+        from bridge.wechat import WXCM_KIND_PCM_S16LE, decode_wxcm_frame
         self.daemon.add_thread("wxid_alice", "Alice")
 
         async def on_cmd(cmd):
@@ -615,21 +616,22 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sock.commands[0]["scope"], {"kind": "offer", "callId": "call-1", "expectedRevision": 1})
         self.assertEqual(self.sock.commands[1]["expectedRevision"], 3)
         self.assertEqual(self.media_calls, [("call-1", "ctl-1", "own-1")])
-        self.assertEqual(self.media.sent[0], {"type": "audio.start", "trackId": 1, "generation": 1})
+        self.assertEqual(self.media.sent[0], {"type": "track.start", "trackId": 1, "generation": 1})
         self.assertIn("通话中（Telegram 接听）", msg.text)
         self.assertEqual(_button_texts(msg), ["🎧 通话界面", "📴 挂断"])
 
-        # page -> WeChat
+        # page -> WeChat (WXCM v3 binary frame)
         pcm = struct.pack("<4h", 1, -1, 32767, -32768)
         await ws.send_bytes(pcm)
-        await self._until(lambda: any(m["type"] == "audio.chunk" for m in self.media.sent))
-        chunk = next(m for m in self.media.sent if m["type"] == "audio.chunk")
-        self.assertEqual((chunk["trackId"], chunk["generation"]), (1, 1))
-        self.assertEqual(base64.b64decode(chunk["pcmBase64"]), pcm)
+        await self._until(lambda: len(self.media.sent_bytes) >= 1)
+        chunk = decode_wxcm_frame(self.media.sent_bytes[0])
+        assert chunk is not None
+        self.assertEqual((chunk["kind"], chunk["trackId"], chunk["generation"]), (WXCM_KIND_PCM_S16LE, 1, 1))
+        self.assertEqual(chunk["payload"], pcm)
 
         # WeChat -> page: track id header + PCM
         self.media.queue.put_nowait({"type": "audio.chunk", "trackId": 2, "generation": 1, "sequence": 1,
-                                     "sampleOffset": 0, "pcmBase64": base64.b64encode(b"\x01\x00\x02\x00").decode()})
+                                     "timestampMicros": 0, "pcm": b"\x01\x00\x02\x00"})
         got = None
         while got is None:
             m = await asyncio.wait_for(ws.receive(), timeout=2)
@@ -644,13 +646,13 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
         st = await self._next(ws, pred=lambda m: m.get("muted"))
         self.assertEqual(self.sock.commands[-1], {"type": "call.mute", "callId": "call-1", "muted": True})
         await self.b.handle_call_event({"type": "track.updated", "callId": "call-1", "track": {
-            "id": 1, "generation": 2, "direction": "send",
+            "media": "audio", "id": 1, "generation": 2, "direction": "send",
             "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}})
-        self.assertEqual(self.media.sent[-1], {"type": "audio.start", "trackId": 1, "generation": 2})
-        n_chunks = sum(m["type"] == "audio.chunk" for m in self.media.sent)
+        self.assertEqual(self.media.sent[-1], {"type": "track.start", "trackId": 1, "generation": 2})
+        n_chunks = len(self.media.sent_bytes)
         await ws.send_bytes(pcm)  # muted: dropped
         await asyncio.sleep(0.05)
-        self.assertEqual(sum(m["type"] == "audio.chunk" for m in self.media.sent), n_chunks)
+        self.assertEqual(len(self.media.sent_bytes), n_chunks)
 
         # hang up from the page
         await ws.send_json({"type": "hangup"})
@@ -1176,9 +1178,13 @@ class CallWebTests(unittest.IsolatedAsyncioTestCase):
 
 class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_call_media_attach_and_audio_roundtrip(self):
-        import base64
         from aiohttp import WSMsgType, web
-        from bridge.wechat import WeChatError
+        from bridge.wechat import (
+            WXCM_KIND_PCM_S16LE,
+            WeChatError,
+            decode_wxcm_frame,
+            encode_wxcm_frame,
+        )
         seen: list[dict] = []
         auth: list[str] = []
 
@@ -1188,22 +1194,27 @@ class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
             await ws.prepare(request)
             attach = await ws.receive_json()
             seen.append(attach)
+            if request.match_info["call"] == "v2-call":
+                await ws.send_json({"type": "media.ready", "protocolVersion": 2, "sendTracks": [], "receiveTracks": []})
+                await ws.close()
+                return ws
             if attach.get("ownerToken") != "own-1":
                 await ws.send_json({"type": "call.error", "code": "not_owner"})
                 await ws.close()
                 return ws
-            await ws.send_json({"type": "media.ready", "protocolVersion": 2,
-                                "sendTrack": {"id": 1, "generation": 1, "direction": "send",
-                                              "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}},
+            await ws.send_json({"type": "media.ready", "protocolVersion": 3,
+                                "sendTracks": [{"media": "audio", "id": 1, "generation": 1, "direction": "send",
+                                                "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
                                 "receiveTracks": []})
             async for msg in ws:
-                if msg.type != WSMsgType.TEXT:
-                    continue
-                m = json.loads(msg.data)
-                seen.append(m)
-                if m["type"] == "audio.chunk":
-                    await ws.send_json({"type": "audio.chunk", "trackId": 2, "generation": 1, "sequence": 0,
-                                        "sampleOffset": 0, "pcmBase64": m["pcmBase64"]})
+                if msg.type == WSMsgType.TEXT:
+                    seen.append(json.loads(msg.data))
+                elif msg.type == WSMsgType.BINARY:
+                    frame = decode_wxcm_frame(msg.data)
+                    assert frame is not None
+                    await ws.send_bytes(encode_wxcm_frame(
+                        2, 1, frame["payload"], kind=WXCM_KIND_PCM_S16LE, sequence=1, timestamp_micros=0,
+                    ))
                     await ws.close()
             return ws
 
@@ -1217,22 +1228,25 @@ class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
         wx = WeChatClient(f"http://127.0.0.1:{port}", "tok", "acc1")
         try:
             sock, ready = await wx.call_media("c1", "ctl-1", "own-1")
-            self.assertEqual(ready["sendTrack"]["id"], 1)
-            await sock.send_json({"type": "audio.start", "trackId": 1, "generation": 1})
+            self.assertEqual(ready["sendTracks"][0]["id"], 1)
+            await sock.send_json({"type": "track.start", "trackId": 1, "generation": 1})
             pcm = bytes(range(256)) * 5  # > 125 bytes: exercises the 16-bit length + masking paths
-            await sock.send_json({"type": "audio.chunk", "trackId": 1, "generation": 1,
-                                  "pcmBase64": base64.b64encode(pcm).decode()})
+            await sock.send_bytes(encode_wxcm_frame(1, 1, pcm, sequence=1, timestamp_micros=0))
             events = [ev async for ev in sock.events()]
             await sock.close()
             self.assertEqual(auth[0], "Bearer tok")
-            self.assertEqual(seen[0], {"type": "media.attach", "supportedProtocolVersions": [3, 2],
+            self.assertEqual(seen[0], {"type": "media.attach", "supportedProtocolVersions": [3],
                                        "clientId": "ctl-1", "ownerToken": "own-1"})
-            self.assertEqual([m["type"] for m in seen[1:]], ["audio.start", "audio.chunk"])
-            self.assertEqual(base64.b64decode(events[0]["pcmBase64"]), pcm)
+            self.assertEqual([m["type"] for m in seen[1:]], ["track.start"])
+            self.assertEqual(events[0]["pcm"], pcm)
 
             with self.assertRaises(WeChatError) as cm:
                 await wx.call_media("c1", "ctl-1", "wrong")
             self.assertEqual(cm.exception.code, "not_owner")
+
+            with self.assertRaises(WeChatError) as v2_cm:
+                await wx.call_media("v2-call", "ctl-1", "own-1")
+            self.assertEqual(v2_cm.exception.code, "unsupported_protocol_version")
         finally:
             await wx.close()
             await runner.cleanup()

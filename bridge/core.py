@@ -217,7 +217,6 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
         self._group_picks: dict[str, dict] = {}  # pick id -> /invite, /kick or /newgroup member picker
         self._calls_retry_sleep: float = 300.0
         self._calls_client_id: str = ""
-        self._calls_protocol_version: int = 2
         self._calls_caps: dict = {}
         self._calls_video_caps: dict = {}
         self._orphan_call_states: dict[str, dict] = {}

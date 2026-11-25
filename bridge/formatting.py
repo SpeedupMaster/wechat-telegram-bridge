@@ -664,7 +664,7 @@ APP_TYPE_NAMES = {
 
 
 # agent-wechat < 3.0 only knows ordinary WeChat CDN fields; images and files from WeCom (`@openim` / `@im.chatroom`)
-# use encrypted HTTP (`tp*`) downloads added in agent-wechat 3.0.0-beta.1 (thisnick/agent-wechat#660).
+# use encrypted HTTP (`tp*`) downloads added in agent-wechat 3.0.0 (thisnick/agent-wechat#660).
 UNSUPPORTED_TRANSPORT_CODES = {"unsupported_media", "unsupported_media_transport", "unsupported_attachment_transport"}
 OPENIM_MEDIA_NOTE = "企业微信发来的图片/文件需 agent-wechat 3.0 及以上版本才能下载，请升级或先在手机微信查看"
 

@@ -81,7 +81,6 @@ class CallsMixin:
             if fmt := event.get("audioFormat"):
                 self._calls_audio_format = fmt
             self._calls_client_id = event.get("clientId") or ""
-            self._calls_protocol_version = int(event.get("protocolVersion") or 2)
             self._calls_caps = event.get("capabilities") or {}
             self._calls_video_caps = event.get("videoCapabilities") or {}
             live_ids = {

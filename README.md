@@ -313,7 +313,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 
 - **麦克风权限**：首次接听时需授权 Telegram 或浏览器使用麦克风；若部分客户端内置 WebView 不支持麦克风采集，页面会自动提示「在浏览器中打开」。
 - **前后台保持**：建议佩戴耳机以避免外放回声。通话期间请保持页面处于前台；若意外关闭页面，**20 秒内**通过来电消息上的「🎧 通话界面」按钮重新进入即可无缝恢复通话，超过 20 秒未连接页面则自动挂断（也可直接点击消息下方的「📴 挂断」按钮）。
-- **上游限制**：双向语音/视频通话中，视频通话需 `agent-wechat >= 3.0.0`（旧版仅支持语音通话，视频来电仅支持通知与一键拒接）；从 Telegram 主动发起的单聊呼叫在对方约 90 秒未接听时会自动取消；群通话需要 agent-wechat 报告 `conferenceCreate` 能力，通话中追加邀请需要 `conferenceInvite`，加入别人发起的群通话时无法追加邀请；受上游 `agent-wechat` 限制，单次通话最长持续 20 分钟。
+- **上游限制**：来电通知与双向语音/视频通话基于 Calls Protocol v3，需 `agent-wechat >= 3.0.0`；从 Telegram 主动发起的单聊呼叫在对方约 90 秒未接听时会自动取消；群通话需要 agent-wechat 报告 `conferenceCreate` 能力，通话中追加邀请需要 `conferenceInvite`，加入别人发起的群通话时无法追加邀请；受上游 `agent-wechat` 限制，单次通话最长持续 20 分钟。
 
 ---
 
@@ -342,7 +342,7 @@ docker compose logs telegram-bridge | grep "PAIRING CODE"
 | `EMOJI_TO_WECHAT` | 否 | `false` | 是否将 Telegram 发送的常见 Emoji 反向转为微信自带小黄脸代码（如 `😁` → `[呲牙]`、`🤦` → `[捂脸]`、`🫡` → `[社会社会]`） |
 | `AUTO_RELOGIN` | 否 | `false` | 微信掉线后是否自动尝试重新登录一次（需手机微信开启「自动登录该设备」，内置随机延迟与冷却保护，失败则提醒手动登录） |
 | `TG_TRANSFER_WORKERS` | 否 | `0` | 大文件（`>= 2 MB`）在 Telegram 侧并发收发使用的 MTProto 连接数（`0` = 自动 4～8 连接 × 512 KiB 分片，`1` = 回退单连接，`2`～`16` = 指定上限） |
-| `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v3.0.0-beta.1`） |
+| `AGENT_WECHAT_VERSION` | 否 | `latest` | 上游 `agent-wechat` 镜像版本标签（想固定版本可填如 `v3.0.0`） |
 
 ### 高级配置（`config/config.toml`）
 

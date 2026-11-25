@@ -550,12 +550,15 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await ws.close()
 
-    async def test_v2_daemon_never_receives_v3_video_fields(self):
+    async def test_audio_only_capabilities_omit_video_fields_and_v2_handshake_rejected(self):
+        from aiohttp import web
+        from bridge.wechat import WeChatClient, WeChatError
+
         self.daemon.add_thread("wxid_alice", "Alice")
         chat = await self.b.ensure_chat(self.daemon.threads["wxid_alice"])
         assert chat is not None
         await self.b.handle_call_event({
-            "type": "hello", "protocolVersion": 2, "clientId": "ctl-v2", "conferenceInvitations": [],
+            "type": "hello", "protocolVersion": 3, "clientId": "ctl-audio-only", "conferenceInvitations": [],
             "capabilities": {
                 "directAudio": True, "conferenceCreate": True, "conferenceJoin": True, "conferenceAudio": True,
             },
@@ -563,12 +566,13 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
         })
         self.ready_payload = {
             "type": "media.ready",
-            "sendTracks": [{"id": 1, "generation": 1, "direction": "send",
+            "protocolVersion": 3,
+            "sendTracks": [{"media": "audio", "id": 1, "generation": 1, "direction": "send",
                             "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
-            "receiveTracks": [{"id": 2, "generation": 1, "direction": "receive",
+            "receiveTracks": [{"media": "audio", "id": 2, "generation": 1, "direction": "receive",
                                "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
         }
-        # Legacy v2 /call shows single voice button
+        # Audio-only capabilities on /call show a single voice button and omit video fields
         await self.b.on_tg_message(tg_event(chat, 40, "/call"))
         card = self.b.bot.sent[-1]
         self.assertEqual(_button_texts(card), ["📞 开始呼叫", "✖️ 取消"])
@@ -579,10 +583,10 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
                 async def connected():
                     await asyncio.sleep(0.01)
                     await self.b.handle_call_event({"type": "call.state", "call": {
-                        "callId": "v2-dial", "revision": 2, "kind": "direct", "callType": "voice",
+                        "callId": "ao-dial", "revision": 2, "kind": "direct", "callType": "voice",
                         "direction": "outgoing", "state": "connected", "ownedByThisClient": True}})
                 asyncio.create_task(connected())
-                return {"type": "command.result", "status": "accepted", "callId": "v2-dial", "ownerToken": "own-v2"}
+                return {"type": "command.result", "status": "accepted", "callId": "ao-dial", "ownerToken": "own-ao"}
             return None
 
         self.sock.on_command = on_cmd
@@ -598,6 +602,31 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("cameraEnabled", dial_cmd)
         finally:
             await ws.close()
+
+        # Legacy Calls Protocol v2 control socket is rejected cleanly
+        async def v2_control(request):
+            cws = web.WebSocketResponse()
+            await cws.prepare(request)
+            hello_req = await cws.receive_json()
+            self.assertEqual(hello_req["supportedProtocolVersions"], [3])
+            await cws.send_json({"type": "hello", "protocolVersion": 2, "clientId": "ctl-v2"})
+            await cws.close()
+            return cws
+
+        app = web.Application()
+        app.router.add_get("/v1/accounts/acc1/calls/socket", v2_control)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        wx = WeChatClient(f"http://127.0.0.1:{runner.addresses[0][1]}", "tok", "acc1")
+        try:
+            with self.assertRaises(WeChatError) as cm:
+                await wx.calls_socket()
+            self.assertEqual(cm.exception.code, "unsupported_protocol_version")
+        finally:
+            await wx.close()
+            await runner.cleanup()
 
     async def test_attach_device_switch_honors_camera_denied_fallback(self):
         self.daemon.add_thread("wxid_alice", "Alice")
@@ -646,6 +675,8 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
             'id="pip"',
             'id="selfVideo"',
             'avc1.42001e',
+            'parseH264SpsCodec',
+            'pickH264Codec',
             'image/jpeg',
             'request_keyframe',
             '摄像头已开',
@@ -1121,6 +1152,26 @@ class FakeWorkletNode {{
   connect() {{}}
 }}
 
+const decoderConfigs = [], decodedChunks = [];
+let rejectLevel51 = false;
+class FakeVideoDecoder {{
+  static isConfigSupported(cfg) {{ return Promise.resolve({{supported: true}}); }}
+  constructor(init) {{ this._out = init.output; this._err = init.error; this.state = 'unconfigured'; }}
+  configure(cfg) {{
+    if (rejectLevel51 && cfg.codec.endsWith('33')) throw new Error('Level 5.1 unsupported on hw decoder');
+    decoderConfigs.push(cfg);
+    this.state = 'configured';
+  }}
+  decode(chunk) {{
+    decodedChunks.push(chunk);
+    this._out({{displayWidth: 640, displayHeight: 480, codedWidth: 640, codedHeight: 480, close() {{}}}});
+  }}
+  close() {{ this.state = 'closed'; }}
+}}
+class FakeEncodedVideoChunk {{
+  constructor(init) {{ this.type = init.type; this.timestamp = init.timestamp; this.data = init.data; }}
+}}
+
 const sandbox = {{
   window: null, document: null, navigator: null, location: {{
     protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com',
@@ -1130,7 +1181,7 @@ const sandbox = {{
   Blob: class {{}}, WebSocket: FakeWS, DataView, Uint8Array, Int16Array, ArrayBuffer, Math, JSON, Date, Number, String,
   Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
   performance: {{now: () => 100}},
-  VideoEncoder: FakeVideoEncoder, VideoDecoder: {{isConfigSupported: () => Promise.resolve({{supported: true}})}},
+  VideoEncoder: FakeVideoEncoder, VideoDecoder: FakeVideoDecoder, EncodedVideoChunk: FakeEncodedVideoChunk,
   VideoFrame: FakeVideoFrame, AudioWorkletNode: FakeWorkletNode, RTCPeerConnection: FakeRTCPeerConnection,
   setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
   clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
@@ -1225,6 +1276,43 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
   if (!encodedKeyFlags[encodedKeyFlags.length - 1]) {{
     throw new Error('Expected forced IDR keyframe immediately after uplink buffer drop');
   }}
+
+  // Dynamic H.264 SPS codec detection:
+  // 1) Initial hardware H.264 Constrained Baseline 3.1 (`00 00 00 01 67 42 c0 1f`) -> configures avc1.42c01f
+  // 2) Mid-call switch to agent-wechat #685 Vcodec1 CABAC Main Profile Level 5.1 (`00 00 00 01 67 4d 40 33`) -> reconfigures avc1.4d4033
+  // 3) Strict mobile decoder rejecting Level 5.1 (`avc1.4d4033`) -> falls back cleanly to `avc1.4d4029` on the same keyframe!
+  function wxv1Frame(trackId, kind, flags, ts, payloadBytes) {{
+    const out = new Uint8Array(20 + payloadBytes.length);
+    out.set([0x57, 0x58, 0x56, 0x31, kind, flags, 0, 0], 0);
+    const dv = new DataView(out.buffer);
+    dv.setUint32(8, trackId, false);
+    dv.setUint32(16, ts, false);
+    out.set(payloadBytes, 20);
+    return out.buffer;
+  }}
+  ws1.onmessage({{data: wxv1Frame(65538, 3, 0x05, 10000, [0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1f, 0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 0, 1, 0x65, 0x88])}});
+  if (decoderConfigs.length !== 1 || decoderConfigs[0].codec !== 'avc1.42c01f') {{
+    throw new Error('Expected initial SPS codec avc1.42c01f, got ' + JSON.stringify(decoderConfigs));
+  }}
+  // Subsequent P-frame reuses existing configured decoder without reconfiguring
+  ws1.onmessage({{data: wxv1Frame(65538, 3, 0x04, 30000, [0, 0, 0, 1, 0x41, 0x9a])}});
+  if (decoderConfigs.length !== 1 || decodedChunks.length !== 2) {{
+    throw new Error('Expected P-frame to decode without reconfiguring, got ' + decoderConfigs.length + '/' + decodedChunks.length);
+  }}
+  // Mid-call QoS switch to Vcodec1 CABAC Main Profile Level 5.1 (preceded by AUD NALU 0x09)
+  ws1.onmessage({{data: wxv1Frame(65538, 3, 0x05, 50000, [0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x67, 0x4d, 0x40, 0x33, 0, 0, 0, 1, 0x65, 0x88])}});
+  if (decoderConfigs.length !== 2 || decoderConfigs[1].codec !== 'avc1.4d4033') {{
+    throw new Error('Expected mid-call Vcodec1 SPS reconfiguration to avc1.4d4033, got ' + JSON.stringify(decoderConfigs));
+  }}
+  // Track 2 on a strict mobile hardware decoder rejecting Level 5.1 (`33`) falls back to Level 4.1 (`avc1.4d4029`)
+  rejectLevel51 = true;
+  ws1.onmessage({{data: wxv1Frame(65539, 3, 0x05, 70000, [0, 0, 1, 0x67, 0x4d, 0x40, 0x33, 0, 0, 1, 0x65, 0x88])}});
+  rejectLevel51 = false;
+  if (decoderConfigs.length !== 3 || decoderConfigs[2].codec !== 'avc1.4d4029' || decodedChunks.length !== 4) {{
+    throw new Error('Expected Level 5.1 rejection fallback to avc1.4d4029, got ' + JSON.stringify(decoderConfigs));
+  }}
+  ws1.onmessage({{data: JSON.stringify({{type: 'video_drop', trackId: 65538}})}});
+  ws1.onmessage({{data: JSON.stringify({{type: 'video_drop', trackId: 65539}})}});
 
   // Simulate WS drop + reconnect: camera must NOT stop, and attach must be sent automatically!
   const stopsBefore = camStops;

@@ -455,7 +455,7 @@ class CallWebSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.http = aiohttp.ClientSession()
         self.base = f"http://127.0.0.1:{self.b.call_web.bound_port}/wxcall"
         await self.b.handle_call_event({
-            "type": "hello", "protocolVersion": 2, "clientId": "ctl-1", "conferenceInvitations": [],
+            "type": "hello", "protocolVersion": 3, "clientId": "ctl-1", "conferenceInvitations": [],
             "capabilities": {"directAudio": True},
             "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
         })

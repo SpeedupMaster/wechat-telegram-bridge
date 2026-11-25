@@ -269,7 +269,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       }
     }
     if (typeof VideoDecoder === 'function' && VideoDecoder.isConfigSupported) {
-      for (const c of ['avc1.42001e', 'avc1.42e01e']) {
+      for (const c of ['avc1.42001e', 'avc1.42e01e', 'avc1.4d401f', 'avc1.64001f']) {
         try {
           const s = await VideoDecoder.isConfigSupported({codec: c});
           if (s && s.supported) { h264DecCodec = c; dec = true; break; }
@@ -519,6 +519,48 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     captureTimer = setTimeout(tick, 60);
   }
 
+  function hex2(b) { return (b & 0xff).toString(16).padStart(2, '0'); }
+
+  // Extract RFC 6381 `avc1.PPCCLL` from an in-band Annex-B SPS NALU (nal_unit_type == 7) so streams such as
+  // agent-wechat #685 Vcodec1->H.264 rewraps (Main Profile / Level 5.1 `avc1.4d4033`) configure mobile WebCodecs
+  // hardware decoders with the exact profile/constraints/level instead of a hardcoded Baseline Level 3.0 string.
+  function parseH264SpsCodec(u) {
+    if (!u || u.byteLength < 7) return '';
+    const lim = u.byteLength - 6;
+    for (let i = 0; i < lim; i++) {
+      if (u[i] !== 0 || u[i + 1] !== 0) continue;
+      let hdrIdx = -1;
+      if (u[i + 2] === 1) hdrIdx = i + 3;
+      else if (u[i + 2] === 0 && i + 7 <= u.byteLength && u[i + 3] === 1) hdrIdx = i + 4;
+      if (hdrIdx < 0 || hdrIdx + 3 >= u.byteLength) continue;
+      const hdr = u[hdrIdx];
+      if ((hdr & 0x80) === 0 && (hdr & 0x1f) === 7) {
+        const profile = u[hdrIdx + 1], compat = u[hdrIdx + 2], level = u[hdrIdx + 3];
+        if (profile > 0 && level > 0) return 'avc1.' + hex2(profile) + hex2(compat) + hex2(level);
+      }
+      i = hdrIdx - 1;
+    }
+    return '';
+  }
+
+  function pickH264Codec(spsCodec, bad) {
+    const cands = [];
+    if (spsCodec) {
+      cands.push(spsCodec);
+      const p = spsCodec.slice(5, 7), c = spsCodec.slice(7, 9);
+      cands.push('avc1.' + p + c + '29');
+      if (p === '4d') cands.push('avc1.4d002a', 'avc1.4d401f');
+      else if (p === '64') cands.push('avc1.64002a', 'avc1.64001f');
+      else if (p === '42') cands.push('avc1.42e01f', 'avc1.42001f');
+    }
+    cands.push(h264DecCodec, 'avc1.42001e', 'avc1.42e01e');
+    for (let i = 0; i < cands.length; i++) {
+      const k = cands[i];
+      if (k && (!bad || !bad.has(k))) return k;
+    }
+    return '';
+  }
+
   function ensureRemoteTile(trackId, name) {
     let tile = remoteTiles.get(trackId);
     if (!tile) {
@@ -532,7 +574,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       el.appendChild(canvas); el.appendChild(wait); el.appendChild(tag);
       $('stage').appendChild(el);
       tile = {id: trackId, el: el, canvas: canvas, ctx: canvas.getContext('2d'), av: av, wt: wt, tag: tag,
-              hasFrame: false, lastFrameAt: 0, decodingJpeg: false, decoder: null, awaitingKf: true, codec: '', rot: 0, lastKfAt: 0};
+              hasFrame: false, lastFrameAt: 0, decodingJpeg: false, decoder: null, awaitingKf: true,
+              codec: '', spsCodec: '', decodedOk: false, badCodecs: new Set(), rot: 0, lastKfAt: 0};
       remoteTiles.set(trackId, tile);
     }
     const label = name || (st && st.name) || '对方';
@@ -616,28 +659,74 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       return;
     }
     if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return;
-    const codec = f.kind === 3 ? h264DecCodec : 'hvc1.1.6.L93.B0';
-    if (!tile.decoder || tile.codec !== codec || tile.decoder.state === 'closed') {
-      if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} }
-      try {
-        const dec = new VideoDecoder({
-          output: (vf) => {
-            if (remoteTiles.get(f.trackId) === tile) {
-              drawRotated(tile, vf, vf.displayWidth || vf.codedWidth, vf.displayHeight || vf.codedHeight, tile.rot);
-            }
-            vf.close();
-          },
-          error: () => { tile.awaitingKf = true; requestKeyframe(tile); },
-        });
-        dec.configure({codec: codec, optimizeForLatency: true});
-        tile.decoder = dec; tile.codec = codec; tile.awaitingKf = true;
-      } catch (e) { tile.decoder = null; return; }
+    if (f.kind === 3 && f.keyframe) {
+      const sps = parseH264SpsCodec(f.payload);
+      if (sps && sps !== tile.spsCodec) {
+        tile.spsCodec = sps;
+        tile.badCodecs.clear();
+      }
+    }
+    if (tile.awaitingKf && !f.keyframe) { requestKeyframe(tile); return; }
+    let wantCodec = f.kind === 3 ? pickH264Codec(tile.spsCodec, tile.badCodecs) : 'hvc1.1.6.L93.B0';
+    if (f.kind === 3 && !wantCodec) {
+      tile.badCodecs.clear();
+      wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
+    }
+    if (!tile.decoder || tile.decoder.state === 'closed' || (f.keyframe && tile.codec !== wantCodec)) {
+      let configured = false;
+      for (let attempt = 0; attempt < 6 && wantCodec; attempt++) {
+        if (!tile.decoder || tile.decoder.state === 'closed') {
+          try {
+            tile.decoder = new VideoDecoder({
+              output: (vf) => {
+                tile.decodedOk = true;
+                if (remoteTiles.get(f.trackId) === tile) {
+                  drawRotated(tile, vf, vf.displayWidth || vf.codedWidth, vf.displayHeight || vf.codedHeight, tile.rot);
+                }
+                vf.close();
+              },
+              error: () => {
+                if (!tile.decodedOk && tile.codec && tile.codec.indexOf('avc1.') === 0) tile.badCodecs.add(tile.codec);
+                tile.awaitingKf = true;
+                requestKeyframe(tile);
+              },
+            });
+          } catch (e) { tile.decoder = null; break; }
+        }
+        try {
+          try {
+            tile.decoder.configure({codec: wantCodec, optimizeForLatency: true});
+          } catch (e) {
+            tile.decoder.configure({codec: wantCodec});
+          }
+          tile.codec = wantCodec;
+          tile.decodedOk = false;
+          tile.awaitingKf = true;
+          configured = true;
+          break;
+        } catch (e) {
+          if (f.kind !== 3) break;
+          tile.badCodecs.add(wantCodec);
+          wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
+        }
+      }
+      if (!configured) {
+        if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} tile.decoder = null; }
+        tile.codec = '';
+        tile.badCodecs.clear();
+        tile.awaitingKf = true;
+        return;
+      }
     }
     if (tile.awaitingKf && !f.keyframe) { requestKeyframe(tile); return; }
     if (f.keyframe) tile.awaitingKf = false;
     try {
       tile.decoder.decode(new EncodedVideoChunk({type: f.keyframe ? 'key' : 'delta', timestamp: f.ts, data: f.payload}));
-    } catch (e) { tile.awaitingKf = true; requestKeyframe(tile); }
+    } catch (e) {
+      if (!tile.decodedOk && tile.codec && tile.codec.indexOf('avc1.') === 0) tile.badCodecs.add(tile.codec);
+      tile.awaitingKf = true;
+      requestKeyframe(tile);
+    }
   }
 
   const IS_IOS_OR_SAFARI = (function () {

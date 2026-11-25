@@ -59,7 +59,7 @@ max_media_mb = 200
 # 大文件（>= 2 MB）在 Telegram 侧并发收发使用的 MTProto 连接数（环境变量 TG_TRANSFER_WORKERS）：
 #   0 = 自动（下载 4~8 连接、上传 4~6 连接，512 KiB 分片）；1 = 关闭并发，回退 Telethon 单连接；2~16 = 指定上限
 # tg_transfer_workers = 0
-# 实时转发微信语音/视频来电通知，并提供一键拒接按钮（需 agent-wechat >= 2.4.0）
+# 实时转发微信语音/视频来电通知，并提供一键拒接按钮（需 agent-wechat >= 3.0.0）
 call_notifications = true
 # 在 Telegram 里接听微信语音通话（环境变量 CALL_WEB_URL / CALL_WEB_LISTEN / CALL_WEB_APP）：
 #   call_web_url    通话页面的公网 HTTPS 地址（反向代理到 call_web_listen），留空 = 关闭接听，只保留拒接
