@@ -4,6 +4,8 @@ class BridgeIO extends AudioWorkletProcessor {
     super();
     const p = (o && o.processorOptions) || {};
     this.tx = true;
+    this.rxEnv = 0;
+    this.micGain = 1;
     this.tracks = new Map();
     this.setRate(p.net || 16000, p.frame || 320);
     this.port.onmessage = (e) => {
@@ -46,11 +48,85 @@ class BridgeIO extends AudioWorkletProcessor {
     }
   }
   process(inputs, outputs) {
+    // 1) Render far-end receive tracks first and update acoustic echo tail envelope (rxEnv)
+    const out = outputs[0], ch = out && out[0];
+    if (ch) {
+      ch.fill(0);
+      for (const t of this.tracks.values()) {
+        if (!t.on) {
+          if (t.w - t.r >= this.net * 0.04) {
+            t.on = true;
+            t.fadeFrom = t.last;
+            t.fadeLen = Math.max(8, Math.round(sampleRate * 0.002));
+            t.fadePos = 0;
+          } else if (Math.abs(t.last) > 1e-4) {
+            for (let i = 0; i < ch.length && Math.abs(t.last) > 1e-4; i++) {
+              t.last *= 0.85;
+              ch[i] += t.last;
+            }
+            if (Math.abs(t.last) <= 1e-4) t.last = 0;
+            continue;
+          } else {
+            continue;
+          }
+        }
+        const avail = t.w - t.r;
+        const playStep = avail > this.net * 0.16 ? this.step * 1.015 : this.step;
+        for (let i = 0; i < ch.length; i++) {
+          if (t.w - t.r < 2) {
+            t.on = false;
+            for (; i < ch.length && Math.abs(t.last) > 1e-4; i++) {
+              t.last *= 0.85;
+              ch[i] += t.last;
+            }
+            if (Math.abs(t.last) <= 1e-4) t.last = 0;
+            break;
+          }
+          const i0 = Math.floor(t.r), f = t.r - i0;
+          const a = t.b[i0 % t.size], b = t.b[(i0 + 1) % t.size];
+          let s = a + (b - a) * f;
+          if (t.fadePos < t.fadeLen) {
+            const alpha = t.fadePos / t.fadeLen;
+            s = t.fadeFrom + (s - t.fadeFrom) * alpha;
+            t.fadePos++;
+          }
+          t.last = s;
+          ch[i] += s;
+          t.r += playStep;
+        }
+      }
+      let rxEnergy = 0;
+      for (let i = 0; i < ch.length; i++) {
+        let v = ch[i];
+        v = v > 1 ? 1 : v < -1 ? -1 : v;
+        ch[i] = v;
+        rxEnergy += v * v;
+      }
+      for (let c = 1; c < out.length; c++) out[c].set(ch);
+      const rxRms = ch.length ? Math.sqrt(rxEnergy / ch.length) : 0;
+      const holdDecay = Math.exp(-ch.length / (sampleRate * 0.14));
+      this.rxEnv = rxRms > this.rxEnv ? (this.rxEnv + (rxRms - this.rxEnv) * 0.65) : (this.rxEnv * holdDecay);
+    }
+
+    // 2) Capture & resample near-end microphone with double-talk-aware residual echo suppression
     const inp = inputs[0] && inputs[0][0];
     if (inp && this.tx) {
+      let targetGain = 1;
+      if (this.rxEnv > 0.015 && inp.length) {
+        let txEnergy = 0;
+        for (let i = 0; i < inp.length; i++) txEnergy += inp[i] * inp[i];
+        const txRms = Math.sqrt(txEnergy / inp.length);
+        // Suppress speakerphone bleed when far-end dominates; open immediately on near-end double-talk
+        const dtThresh = Math.max(0.045, this.rxEnv * 0.55);
+        if (txRms < dtThresh) {
+          targetGain = 0.15 + 0.85 * Math.pow(txRms / dtThresh, 2);
+        }
+      }
+      const gAlpha = targetGain > this.micGain ? 0.25 : 0.08;
       if (this.step <= 1) {
         for (let i = 0; i < inp.length; i++) {
-          this.sum += inp[i]; this.cnt++; this.acc += this.step;
+          this.micGain += (targetGain - this.micGain) * gAlpha;
+          this.sum += inp[i] * this.micGain; this.cnt++; this.acc += this.step;
           if (this.acc >= 1) {
             this.acc -= 1;
             this.emitSample(this.sum / this.cnt);
@@ -60,7 +136,8 @@ class BridgeIO extends AudioWorkletProcessor {
       } else {
         const inv = 1 / this.step;
         for (let i = 0; i < inp.length; i++) {
-          const s = inp[i], p = this.prevIn;
+          this.micGain += (targetGain - this.micGain) * gAlpha;
+          const s = inp[i] * this.micGain, p = this.prevIn;
           while (this.acc < 1) {
             this.emitSample(p + (s - p) * this.acc);
             this.acc += inv;
@@ -70,57 +147,10 @@ class BridgeIO extends AudioWorkletProcessor {
         }
       }
     } else if (inp && inp.length) {
-      this.prevIn = inp[inp.length - 1];
+      this.prevIn = 0;
+      this.micGain = 1;
       this.acc = 0; this.sum = 0; this.cnt = 0; this.n = 0;
     }
-    const out = outputs[0], ch = out && out[0];
-    if (!ch) return true;
-    ch.fill(0);
-    for (const t of this.tracks.values()) {
-      if (!t.on) {
-        if (t.w - t.r >= this.net * 0.04) {
-          t.on = true;
-          t.fadeFrom = t.last;
-          t.fadeLen = Math.max(8, Math.round(sampleRate * 0.002));
-          t.fadePos = 0;
-        } else if (Math.abs(t.last) > 1e-4) {
-          for (let i = 0; i < ch.length && Math.abs(t.last) > 1e-4; i++) {
-            t.last *= 0.85;
-            ch[i] += t.last;
-          }
-          if (Math.abs(t.last) <= 1e-4) t.last = 0;
-          continue;
-        } else {
-          continue;
-        }
-      }
-      const avail = t.w - t.r;
-      const playStep = avail > this.net * 0.16 ? this.step * 1.015 : this.step;
-      for (let i = 0; i < ch.length; i++) {
-        if (t.w - t.r < 2) {
-          t.on = false;
-          for (; i < ch.length && Math.abs(t.last) > 1e-4; i++) {
-            t.last *= 0.85;
-            ch[i] += t.last;
-          }
-          if (Math.abs(t.last) <= 1e-4) t.last = 0;
-          break;
-        }
-        const i0 = Math.floor(t.r), f = t.r - i0;
-        const a = t.b[i0 % t.size], b = t.b[(i0 + 1) % t.size];
-        let s = a + (b - a) * f;
-        if (t.fadePos < t.fadeLen) {
-          const alpha = t.fadePos / t.fadeLen;
-          s = t.fadeFrom + (s - t.fadeFrom) * alpha;
-          t.fadePos++;
-        }
-        t.last = s;
-        ch[i] += s;
-        t.r += playStep;
-      }
-    }
-    for (let i = 0; i < ch.length; i++) { const v = ch[i]; ch[i] = v > 1 ? 1 : v < -1 ? -1 : v; }
-    for (let c = 1; c < out.length; c++) out[c].set(ch);
     return true;
   }
 }

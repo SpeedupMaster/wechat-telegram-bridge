@@ -638,6 +638,106 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     } catch (e) { tile.awaitingKf = true; requestKeyframe(tile); }
   }
 
+  const IS_IOS_OR_SAFARI = (function () {
+    const ua = (navigator && navigator.userAgent) || '';
+    if (/iPad|iPhone|iPod/.test(ua)) return true;
+    if (/Macintosh/.test(ua) && navigator && navigator.maxTouchPoints > 1) return true;
+    return /Safari/.test(ua) && !/Chrome|Chromium|CriOS|Edg|OPR|Android/.test(ua);
+  })();
+
+  function tuneOpusSdp(sdp) {
+    if (!sdp) return sdp;
+    const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+    if (!m) return sdp;
+    const pt = m[1];
+    const fmtpRe = new RegExp('a=fmtp:' + pt + ' ([^\\r\\n]+)');
+    if (fmtpRe.test(sdp)) {
+      return sdp.replace(fmtpRe, (line) => {
+        let out = line;
+        if (!/maxaveragebitrate=/i.test(out)) out += ';maxaveragebitrate=64000';
+        if (!/ptime=/i.test(out)) out += ';ptime=10;minptime=10';
+        if (!/usedtx=/i.test(out)) out += ';usedtx=0';
+        return out;
+      });
+    }
+    return sdp;
+  }
+
+  // Chromium Issue 687574 workaround: route WebAudio output through a local RTCPeerConnection loopback into an
+  // <audio> element so Chrome / Android WebView feeds far-end speech into WebRTC AEC3 and activates Android
+  // MODE_IN_COMMUNICATION hardware echo cancellation. Falls back to ctx.destination seamlessly if unavailable.
+  async function setupAecLoopback(ctx, sourceNode) {
+    if (IS_IOS_OR_SAFARI || typeof RTCPeerConnection !== 'function' || typeof ctx.createMediaStreamDestination !== 'function') {
+      return null;
+    }
+    let pc1 = null, pc2 = null, el = null, msd = null, closed = false, routed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      if (routed) {
+        routed = false;
+        try { sourceNode.disconnect(msd); } catch (e) {}
+        try { if (ctx.state !== 'closed') sourceNode.connect(ctx.destination); } catch (e) {}
+      }
+      if (el) {
+        try { el.pause(); el.srcObject = null; if (el.parentNode) el.parentNode.removeChild(el); } catch (e) {}
+        el = null;
+      }
+      try { pc1 && pc1.close(); } catch (e) {}
+      try { pc2 && pc2.close(); } catch (e) {}
+      pc1 = null; pc2 = null; msd = null;
+    };
+    try {
+      msd = ctx.createMediaStreamDestination();
+      sourceNode.connect(msd);
+      pc1 = new RTCPeerConnection({iceServers: []});
+      pc2 = new RTCPeerConnection({iceServers: []});
+      pc1.onicecandidate = (e) => { if (!closed && e.candidate && pc2) pc2.addIceCandidate(e.candidate).catch(() => {}); };
+      pc2.onicecandidate = (e) => { if (!closed && e.candidate && pc1) pc1.addIceCandidate(e.candidate).catch(() => {}); };
+      const trackReady = new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('aec loopback timeout')), 2500);
+        pc2.ontrack = (ev) => {
+          clearTimeout(t);
+          const stream = (ev.streams && ev.streams[0]) || (typeof MediaStream === 'function' ? new MediaStream([ev.track]) : null);
+          if (stream) resolve(stream);
+          else reject(new Error('no loopback stream'));
+        };
+      });
+      msd.stream.getAudioTracks().forEach((tr) => pc1.addTrack(tr, msd.stream));
+      const offer = await pc1.createOffer();
+      await pc1.setLocalDescription(offer);
+      await pc2.setRemoteDescription(pc1.localDescription);
+      const answer = await pc2.createAnswer();
+      const tuned = {type: answer.type, sdp: tuneOpusSdp(answer.sdp)};
+      try { await pc2.setLocalDescription(tuned); } catch (e) { await pc2.setLocalDescription(answer); }
+      await pc1.setRemoteDescription(pc2.localDescription);
+
+      const remoteStream = await trackReady;
+      if (closed || ctx.state === 'closed') { cleanup(); return null; }
+      el = document.createElement('audio');
+      el.autoplay = true;
+      el.playsInline = true;
+      if (el.setAttribute) el.setAttribute('playsinline', '');
+      el.style.display = 'none';
+      if (document.body && document.body.appendChild) document.body.appendChild(el);
+      el.srcObject = remoteStream;
+      await el.play();
+      if (closed || ctx.state === 'closed') { cleanup(); return null; }
+
+      try { sourceNode.disconnect(ctx.destination); } catch (e) {}
+      routed = true;
+      pc2.oniceconnectionstatechange = () => {
+        if (!closed && pc2 && (pc2.iceConnectionState === 'failed' || pc2.iceConnectionState === 'closed')) {
+          cleanup();
+        }
+      };
+      return {el: el, close: cleanup};
+    } catch (e) {
+      cleanup();
+      return null;
+    }
+  }
+
   // Creates the AudioContext synchronously (inside the tap) so iOS lets it play, then loads the
   // microphone and the audio worklet in parallel.
   function startAudio(rate, frame) {
@@ -665,8 +765,15 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         await mod;
         const node = new AudioWorkletNode(ctx, 'bridge-io', {numberOfInputs: 1, numberOfOutputs: 1,
           outputChannelCount: [1], processorOptions: {net: rate, frame: frame}});
+        let outBus = node;
+        if (typeof ctx.createGain === 'function') {
+          const g = ctx.createGain();
+          if (g && g.gain) g.gain.value = 1;
+          node.connect(g);
+          outBus = g;
+        }
         ctx.createMediaStreamSource(stream).connect(node);
-        node.connect(ctx.destination);
+        outBus.connect(ctx.destination);
         node.port.onmessage = (e) => {
           if (st && st.mine && st.phase === 'active' && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 128000) {
             ws.send(e.data);
@@ -674,7 +781,13 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         };
         // Never wait for resume(): on iOS the microphone starting can leave the context "interrupted" and the
         // promise pending indefinitely, which used to leave the call connected with no sound either way.
-        audio = {ctx: ctx, stream: stream, node: node, rate: rate};
+        const curAudio = {ctx: ctx, stream: stream, node: node, out: outBus, aec: null, rate: rate};
+        audio = curAudio;
+        setupAecLoopback(ctx, outBus).then((aec) => {
+          if (!aec) return;
+          if (audio === curAudio) curAudio.aec = aec;
+          else aec.close();
+        });
         lastWorkletTx = null;
         syncWorkletTx();
         micGranted = true;
@@ -728,7 +841,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       gain.gain.linearRampToValueAtTime(0.035, now + 0.025);
       gain.gain.setValueAtTime(0.035, now + 0.95);
       gain.gain.linearRampToValueAtTime(0.0001, now + 1.0);
-      osc.connect(gain); gain.connect(ctx.destination);
+      osc.connect(gain); gain.connect(audio.out || ctx.destination);
       osc.start(now); osc.stop(now + 1.02);
       const cur = {osc: osc, gain: gain};
       ringNode = cur;
@@ -750,6 +863,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   let soundHint = false, soundTimer = null;
   function checkAudio() {
     if (!audio) return;
+    if (audio.aec && audio.aec.el && audio.aec.el.paused) audio.aec.el.play().catch(() => {});
     const s = audio.ctx.state;
     if (s === 'running') {
       if (soundHint) { soundHint = false; hint(''); }
@@ -767,7 +881,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     }, 800);
   }
   ['touchend', 'click'].forEach((t) => document.addEventListener(t, () => {
-    if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') audio.ctx.resume().then(checkAudio, () => {});
+    if (!audio) return;
+    if (audio.aec && audio.aec.el && audio.aec.el.paused) audio.aec.el.play().catch(() => {});
+    if (audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') audio.ctx.resume().then(checkAudio, () => {});
   }, true));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAudio(); });
 
@@ -777,6 +893,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     clearTimeout(soundTimer);
     if (soundHint) { soundHint = false; hint(''); }
     if (!audio) return;
+    try { audio.aec && audio.aec.close(); } catch (e) {}
     try { audio.ctx.onstatechange = null; } catch (e) {}
     try { audio.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
     try { audio.ctx.close(); } catch (e) {}

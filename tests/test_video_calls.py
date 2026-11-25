@@ -18,7 +18,6 @@ from bridge.core import Bridge
 from bridge.wechat import (
     WXCM_KIND_H264,
     WXCM_KIND_JPEG,
-    WXCM_KIND_PCM_S16LE,
     decode_wxcm_frame,
 )
 from tests.fakes import FakeBot, FakeUser, _FakeCallsSocket, _button_texts, _button_urls, tg_event
@@ -908,6 +907,34 @@ p48.process([[]], [[tailBuf]]);
 if (!(tailBuf[0] > 0.35 && tailBuf[0] < 0.5 && tailBuf[20] < 0.05)) {{
   throw new Error('Expected smooth decay on underrun, got ' + tailBuf[0] + ', ' + tailBuf[20]);
 }}
+
+// 4) Residual Echo Suppression: far-end speakerphone bleed (& acoustic tail) is attenuated, while near-end double-talk opens immediately
+const pAec = new Proc48k({{processorOptions: {{net: 16000, frame: 320}}}});
+const farSpeech = new Int16Array(4800).fill(18000); // ~0.55 amplitude far-end speech (300ms @ 16kHz)
+pAec.port.onmessage({{data: {{t: 'pcm', id: 9, pcm: farSpeech}}}});
+const echoBleed = new Float32Array(128).fill(0.04); // weak speaker bleed (< dtThresh)
+for (let k = 0; k < 20; k++) pAec.process([[echoBleed]], [[new Float32Array(128)]]);
+if (pAec.emitted.length < 2) throw new Error('Expected >=2 mic frames during echo suppression, got ' + pAec.emitted.length);
+const suppressedPeak = Math.max(...Array.from(pAec.emitted[pAec.emitted.length - 1], (x) => Math.abs(x)));
+// Without suppression 0.04 * 32767 = 1310; steady-state after ~3ms click-free ramp (~0.16x) must be < 400
+if (!(suppressedPeak < 400)) throw new Error('Expected speakerphone bleed < 400, got ' + suppressedPeak);
+
+// Acoustic tail hold: right after far-end track drops, ~140ms decay envelope still suppresses room reverb bleed
+pAec.port.onmessage({{data: {{t: 'drop', id: 9}}}});
+pAec.emitted.length = 0;
+for (let k = 0; k < 10; k++) pAec.process([[echoBleed]], [[new Float32Array(128)]]);
+if (!pAec.emitted.length) throw new Error('Expected frame during acoustic tail');
+const tailBleedPeak = Math.max(...Array.from(pAec.emitted[0], (x) => Math.abs(x)));
+if (!(tailBleedPeak < 400)) throw new Error('Expected reverb tail bleed < 400, got ' + tailBleedPeak);
+
+// Now local user interrupts loudly (double-talk = 0.5 amplitude): micGain opens right back up
+pAec.emitted.length = 0;
+pAec.port.onmessage({{data: {{t: 'pcm', id: 9, pcm: farSpeech}}}});
+const doubleTalk = new Float32Array(128).fill(0.5);
+for (let k = 0; k < 20; k++) pAec.process([[doubleTalk]], [[new Float32Array(128)]]);
+const dtPeak = Math.max(...Array.from(pAec.emitted[pAec.emitted.length - 1], (x) => Math.abs(x)));
+if (!(dtPeak > 15000)) throw new Error('Expected double-talk speech preserved (>15000), got ' + dtPeak);
+
 console.log('WORKLET_OK');
 """
         res = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=15)
@@ -1005,20 +1032,58 @@ class FakeVideoFrame {{
 }}
 
 const workletMsgs = [];
+let aecAudioPlayed = 0, aecDisconnectedDest = 0, aecClosedCount = 0, lastAnswerSdp = '';
+class FakeRTCPeerConnection {{
+  constructor() {{
+    this.localDescription = null; this.remoteDescription = null;
+    this.onicecandidate = null; this.ontrack = null; this.iceConnectionState = 'connected';
+    FakeRTCPeerConnection.peers.push(this);
+  }}
+  addTrack(tr, stream) {{ this._track = tr; this._stream = stream; }}
+  addIceCandidate() {{ return Promise.resolve(); }}
+  createOffer() {{ return Promise.resolve({{type: 'offer', sdp: 'v=0\\r\\na=rtpmap:111 opus/48000/2\\r\\na=fmtp:111 minptime=10;useinbandfec=1\\r\\n'}}); }}
+  createAnswer() {{ return Promise.resolve({{type: 'answer', sdp: 'v=0\\r\\na=rtpmap:111 opus/48000/2\\r\\na=fmtp:111 useinbandfec=1\\r\\n'}}); }}
+  setLocalDescription(d) {{
+    this.localDescription = d;
+    if (d && d.type === 'answer') lastAnswerSdp = d.sdp || '';
+    return Promise.resolve();
+  }}
+  setRemoteDescription(d) {{
+    this.remoteDescription = d;
+    if (d && d.type === 'offer' && this.ontrack) {{
+      const peer1 = FakeRTCPeerConnection.peers[FakeRTCPeerConnection.peers.length - 2];
+      Promise.resolve().then(() => this.ontrack && this.ontrack({{
+        track: peer1 && peer1._track,
+        streams: [{{id: 'loopback-stream'}}],
+      }}));
+    }}
+    return Promise.resolve();
+  }}
+  close() {{ aecClosedCount++; this.iceConnectionState = 'closed'; }}
+}}
+FakeRTCPeerConnection.peers = [];
+
 class FakeAudioContext {{
   constructor() {{
-    this.state = 'running'; this.currentTime = 0; this.destination = {{}};
+    this.state = 'running'; this.currentTime = 0; this.destination = {{isDest: true}};
     this.audioWorklet = {{ addModule: () => Promise.resolve() }};
   }}
   resume() {{ this.state = 'running'; return Promise.resolve(); }}
   close() {{ this.state = 'closed'; }}
   createMediaStreamSource() {{ return {{connect() {{}}}}; }}
+  createMediaStreamDestination() {{
+    return {{stream: {{getAudioTracks: () => [{{kind: 'audio'}}]}}}};
+  }}
   createOscillator() {{
     oscCount++;
     return {{type: 'sine', frequency: {{value: 0}}, connect() {{}}, start() {{}}, stop() {{}}, disconnect() {{}}}};
   }}
   createGain() {{
-    return {{gain: {{setValueAtTime() {{}}, linearRampToValueAtTime() {{}}}}, connect() {{}}, disconnect() {{}}}};
+    return {{
+      gain: {{value: 1, setValueAtTime() {{}}, linearRampToValueAtTime() {{}}}},
+      connect() {{}},
+      disconnect(target) {{ if (target && target.isDest) aecDisconnectedDest++; }},
+    }};
   }}
 }}
 class FakeWorkletNode {{
@@ -1038,7 +1103,7 @@ const sandbox = {{
   Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
   performance: {{now: () => 100}},
   VideoEncoder: FakeVideoEncoder, VideoDecoder: {{isConfigSupported: () => Promise.resolve({{supported: true}})}},
-  VideoFrame: FakeVideoFrame, AudioWorkletNode: FakeWorkletNode,
+  VideoFrame: FakeVideoFrame, AudioWorkletNode: FakeWorkletNode, RTCPeerConnection: FakeRTCPeerConnection,
   setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
   clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
   setInterval: (fn, ms) => nextTimerId++,
@@ -1049,13 +1114,20 @@ sandbox.window = Object.assign(sandbox, {{
 }});
 sandbox.window.parent = sandbox.window;
 sandbox.document = {{
+  body: makeEl('body'),
   getElementById: (id) => els[id] || makeEl(id),
-  createElement: (tag) => makeEl(tag),
+  createElement: (tag) => {{
+    const el = makeEl(tag);
+    if (tag === 'audio') el.play = () => {{ aecAudioPlayed++; el.paused = false; return Promise.resolve(); }};
+    el.pause = () => {{ el.paused = true; }};
+    return el;
+  }},
   createTextNode: (t) => ({{textContent: t}}),
   addEventListener: () => {{}},
   hidden: false,
 }};
 sandbox.navigator = {{
+  userAgent: 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36',
   mediaDevices: {{
     getUserMedia: (c) => Promise.resolve({{
       getTracks: () => [{{stop: () => {{ if (c && c.video) camStops++; }}}}],
@@ -1170,6 +1242,18 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
   const statusText = els.status.children.map((c) => c.textContent || '').join('');
   if (statusText !== '对方已静音') throw new Error('Expected 对方已静音, got ' + statusText);
   if (camStops <= stopsBefore) throw new Error('Expected camera hardware stream to be stopped when camera=false');
+
+  // Verify Chromium RTCPeerConnection loopback AEC activated, tuned Opus SDP, detached direct ctx.destination, and cleans up on end
+  if (aecAudioPlayed < 1 || aecDisconnectedDest < 1) {{
+    throw new Error('Expected Chromium RTCPeerConnection loopback AEC to route through <audio>, got played=' + aecAudioPlayed + ', disc=' + aecDisconnectedDest);
+  }}
+  if (!lastAnswerSdp.includes('maxaveragebitrate=64000') || !lastAnswerSdp.includes('ptime=10') || !lastAnswerSdp.includes('usedtx=0')) {{
+    throw new Error('Expected Opus low-latency SDP tuning, got ' + lastAnswerSdp);
+  }}
+  ws2.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'ended', title: '微信语音通话', name: 'Alice', status: '⚪ 通话已结束', mine: false,
+  }})}});
+  if (aecClosedCount < 2) throw new Error('Expected loopback RTCPeerConnections to close on call end, got ' + aecClosedCount);
 
   console.log('CALL_HTML_OK');
 }})().catch((e) => {{ console.error(e); process.exit(1); }});
