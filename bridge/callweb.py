@@ -73,8 +73,8 @@ _DEFAULT_VIDEO_CAPS = {
 }
 # How long after the media socket attaches to check that audio is flowing both ways (logged, not enforced).
 AUDIO_CHECK_SECONDS = 8
-# Brief wait when the media socket closes while the call still looks live, in case call.state(ended) is racing in.
-MEDIA_CLOSE_GRACE_SECONDS = 0.5
+# Grace window when /media closes before /socket reports call.state(ending/ended) (e.g. remote conference teardown).
+MEDIA_CLOSE_GRACE_SECONDS = 5.0
 
 
 def encode_wxv1_frame(track_or_gen: int, kind: int, flags: int, timestamp_micros: int, payload: bytes) -> bytes:

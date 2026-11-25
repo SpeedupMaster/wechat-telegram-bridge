@@ -392,6 +392,7 @@ class CallWebV3Tests(unittest.IsolatedAsyncioTestCase):
     async def test_media_close_racing_before_call_ended_does_not_report_disconnect(self):
         import bridge.callweb as callweb
 
+        self.assertGreaterEqual(callweb.MEDIA_CLOSE_GRACE_SECONDS, 5.0)
         ws = await self._answer_voice_call("race-call-1")
         try:
             before_sent = len(self.b.bot.sent)

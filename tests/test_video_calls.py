@@ -656,8 +656,11 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
             "$('pip').onclick = flipCamera",
             'wsOpen',
             'main.video-live .hint{position:fixed',
+            '.pip video{width:100%;height:100%;object-fit:contain',
+            'syncPipLayout',
         ):
             self.assertIn(marker, body)
+        self.assertNotIn('.pip video{width:100%;height:100%;object-fit:cover', body)
         # Disconnected WS must not duplicate status+hint text
         self.assertNotIn("hint('连接已断开，正在重连…'", body)
         # iOS Safari requires startAudio() (AudioContext creation) synchronously before awaiting videoCapsReady
