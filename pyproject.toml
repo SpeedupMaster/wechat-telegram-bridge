@@ -1,6 +1,6 @@
 [project]
 name = "wechat-telegram-bridge"
-version = "0.1.0"
+version = "1.0.0"
 description = "Bidirectional WeChat (agent-wechat) <-> Telegram (Telethon MTProto) bridge"
 readme = "README.md"
 requires-python = ">=3.11"
