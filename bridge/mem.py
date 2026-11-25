@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 _TRIM_LOCK = threading.Lock()
-_LAST_TRIM = 0.0
+_LAST_TRIM: float | None = None
 _MALLOC_TRIM: Any = None
 _LIBC_CHECKED = False
 
@@ -48,7 +48,7 @@ def maybe_trim_memory(*, min_interval: float = 15.0, collect: bool = True) -> bo
     global _LAST_TRIM
     now = time.monotonic()
     with _TRIM_LOCK:
-        if min_interval > 0 and now - _LAST_TRIM < min_interval:
+        if _LAST_TRIM is not None and min_interval > 0 and now - _LAST_TRIM < min_interval:
             return False
         _LAST_TRIM = now
     return trim_memory(collect=collect)

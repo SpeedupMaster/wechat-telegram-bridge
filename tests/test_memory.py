@@ -437,7 +437,8 @@ class StickerAndMemTests(unittest.TestCase):
     def test_mem_trim_rate_limiting(self):
         calls: list[int] = []
         with mock.patch.object(mem, "_get_malloc_trim", return_value=lambda pad: (calls.append(pad) or 1)), \
-             mock.patch.object(mem, "_LAST_TRIM", 0.0):
+             mock.patch.object(mem, "_LAST_TRIM", None), \
+             mock.patch.object(mem.time, "monotonic", side_effect=[12.0, 20.0]):
             self.assertTrue(mem.maybe_trim_memory(min_interval=60.0, collect=False))
             self.assertFalse(mem.maybe_trim_memory(min_interval=60.0, collect=False))
             self.assertEqual(calls, [0])
