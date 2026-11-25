@@ -100,7 +100,7 @@
 
 ## 快速开始（Docker Compose）
 
-本方案将 `agent-wechat` 守护进程与 `telegram-bridge` 部署在同一台 Linux VPS 上（支持 `x86_64` 与 `ARM64`）。容器采用 Host 网络模式，`agent-wechat` 仅监听本机回环地址 `127.0.0.1:6174`，不向公网暴露任何端口。
+本方案将 `agent-wechat` 守护进程与 `telegram-bridge` 部署在同一台 Linux VPS 上（仅提供 `x86_64` / `linux/amd64` 预构建镜像）。容器采用 Host 网络模式，`agent-wechat` 仅监听本机回环地址 `127.0.0.1:6174`，不向公网暴露任何端口。
 
 ### 第一步：准备 Telegram 凭证
 
