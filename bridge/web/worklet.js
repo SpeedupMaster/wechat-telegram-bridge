@@ -5,6 +5,10 @@ class BridgeIO extends AudioWorkletProcessor {
     const p = (o && o.processorOptions) || {};
     this.tx = true;
     this.speaker = false;
+    this.stat = !!p.stat;
+    this.ticks = 0;
+    this.txFrames = 0;
+    this.rxFrames = 0;
     this.rxEnv = 0;
     this.micGain = 1;
     this.tracks = new Map();
@@ -30,11 +34,13 @@ class BridgeIO extends AudioWorkletProcessor {
     v = v < -1 ? -1 : v > 1 ? 1 : v;
     this.buf[this.n++] = v < 0 ? v * 32768 : v * 32767;
     if (this.n === this.frame) {
+      this.txFrames++;
       const out = this.buf; this.buf = new Int16Array(this.frame); this.n = 0;
       this.port.postMessage(out.buffer, [out.buffer]);
     }
   }
   push(id, pcm) {
+    this.rxFrames++;
     let t = this.tracks.get(id);
     if (!t) {
       const size = this.net * 2;
@@ -155,6 +161,10 @@ class BridgeIO extends AudioWorkletProcessor {
       this.prevIn = 0;
       this.micGain = 1;
       this.acc = 0; this.sum = 0; this.cnt = 0; this.n = 0;
+    }
+    this.ticks++;
+    if (this.stat && (this.ticks === 1 || (this.ticks & 255) === 0)) {
+      this.port.postMessage({t: 'stat', ticks: this.ticks, tx: this.txFrames, rx: this.rxFrames, hasIn: !!(inp && inp.length)});
     }
     return true;
   }

@@ -1475,3 +1475,84 @@ class CallConcurrencyAndCrashHardeningTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.assertIn("call.hangup", [c["type"] for c in self.sock.commands])
         self.assertTrue(any("媒体中转异常中断" in m.text for m in self.b.bot.sent))
+
+    async def test_same_origin_worklet_csp_and_page_audio_diag_logged_on_no_mic(self):
+        import bridge.callweb as callweb
+        from tests.fakes import _FakeMediaSocket, _button_urls, _init_data
+
+        async with self.http.get(self.base + "/worklet.js") as rw:
+            self.assertEqual(rw.status, 200)
+            self.assertIn("javascript", rw.headers.get("Content-Type", ""))
+            wbody = await rw.text()
+        self.assertIn("registerProcessor('bridge-io'", wbody)
+
+        async with self.http.get(self.base + "/call/sometoken") as rp:
+            self.assertEqual(rp.status, 200)
+            csp = rp.headers.get("Content-Security-Policy", "")
+        self.assertIn("worker-src 'self' blob:", csp)
+        self.assertIn("media-src 'self' blob: mediastream:", csp)
+
+        self.daemon.add_thread("wxid_alice", "Alice")
+        media = _FakeMediaSocket()
+
+        async def call_media(call_id, client_id, owner_token, timeout=10.0):
+            return media, {
+                "type": "media.ready",
+                "protocolVersion": 3,
+                "sendTracks": [{"media": "audio", "id": 1, "generation": 1, "direction": "send",
+                                "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
+                "receiveTracks": [{"media": "audio", "id": 2, "generation": 1, "direction": "receive",
+                                   "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
+            }
+
+        self.b.wx.call_media = call_media
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.answer":
+                async def connected():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "ios-diag-1", "revision": 3, "kind": "direct", "callType": "voice",
+                        "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+                asyncio.create_task(connected())
+                return {"type": "command.result", "status": "accepted", "callId": "ios-diag-1", "ownerToken": "own-d"}
+            return {"type": "command.result", "status": "accepted"}
+
+        self.sock.on_command = on_cmd
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "ios-diag-1", "revision": 2, "kind": "direct", "callType": "voice", "callerId": "wxid_alice"}})
+        token = _button_urls(self.b.bot.sent[-1])[0].rsplit("/", 1)[1]
+
+        ws = await self.http.ws_connect(self.base + "/ws")
+        callweb.AUDIO_CHECK_SECONDS, saved_chk = 0.05, callweb.AUDIO_CHECK_SECONDS
+        try:
+            await ws.send_json({"type": "auth", "token": token, "initData": _init_data("123:abc", 999)})
+            await asyncio.wait_for(ws.receive(), timeout=2.0)
+            with self.assertLogs("bridge.callweb", level="INFO") as cm:
+                await ws.send_json({"type": "answer"})
+                await ws.send_json({
+                    "type": "diag",
+                    "engine": "worklet",
+                    "ctxState": "interrupted",
+                    "sampleRate": 48000,
+                    "currentTime": 0.0,
+                    "ticks": 0,
+                    "trackState": "live",
+                    "trackMuted": False,
+                })
+                media.queue.put_nowait({
+                    "type": "audio.chunk", "trackId": 2, "generation": 1, "sequence": 1,
+                    "timestampMicros": 0, "pcm": b"\x10\x00" * 320,
+                })
+                await asyncio.sleep(0.12)
+                await self.b.handle_call_event({"type": "call.state", "call": {
+                    "callId": "ios-diag-1", "revision": 4, "kind": "direct", "callType": "voice",
+                    "direction": "incoming", "state": "ended", "ownedByThisClient": True}})
+            joined_logs = "\n".join(cm.output)
+            self.assertIn("no microphone audio from the call page", joined_logs)
+            self.assertIn("ctxState=interrupted", joined_logs)
+            self.assertIn("engine=worklet", joined_logs)
+        finally:
+            callweb.AUDIO_CHECK_SECONDS = saved_chk
+            await ws.close()
+

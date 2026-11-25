@@ -232,6 +232,35 @@ def _err_text(code: str | None, default: str) -> str:
     return CALL_ERRORS.get(code or "", f"{default}（{code or 'error'}）")
 
 
+_DIAG_KEYS = (
+    "engine", "ctxState", "sampleRate", "currentTime", "ticks", "hasIn",
+    "txFrames", "rxFrames", "stalled", "trackState", "trackMuted", "err",
+)
+
+
+def _sanitize_page_diag(raw: dict) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for k in _DIAG_KEYS:
+        if k not in raw or raw[k] is None:
+            continue
+        v = raw[k]
+        if isinstance(v, bool):
+            out[k] = v
+        elif isinstance(v, int):
+            out[k] = v
+        elif isinstance(v, float):
+            out[k] = round(v, 3)
+        elif isinstance(v, str):
+            clean = re.sub(r"[\r\n\t]+", " ", v).strip()[:120]
+            if clean:
+                out[k] = clean
+    return out
+
+
+def _format_page_diag(diag: dict[str, object]) -> str:
+    return ", ".join(f"{k}={diag[k]}" for k in _DIAG_KEYS if k in diag)
+
+
 def _find_audio_send_track(ready: dict) -> dict:
     """Extract the audio send track from v3 media.ready sendTracks[]."""
     tracks = ready.get("sendTracks")
@@ -293,6 +322,7 @@ class CallSession:
         self.tx_chunks = 0
         self.rx_video_frames = 0
         self.tx_video_frames = 0
+        self.page_diag: dict[str, object] = {}
         self.watch_task: asyncio.Task | None = None
 
     @property
@@ -490,9 +520,11 @@ class CallSession:
         elif not self.rx_to_page:
             log.warning("Call %s: WeChat audio is arriving but no call page is attached to play it", self.call_id)
         if not self.tx_chunks:
+            diag_str = _format_page_diag(self.page_diag)
+            extra = f", {diag_str}" if diag_str else ""
             log.warning("Call %s: no microphone audio from the call page %ds after the media socket attached "
-                        "(page attached: %s, muted: %s)", self.call_id, AUDIO_CHECK_SECONDS,
-                        self.active_ws is not None, self.muted)
+                        "(page attached: %s, muted: %s%s)", self.call_id, AUDIO_CHECK_SECONDS,
+                        self.active_ws is not None, self.muted, extra)
 
     async def _start_send(self) -> None:
         if self.media is not None and self.send_track is not None and self.send_gen is not None:
@@ -731,8 +763,12 @@ class CallSession:
         if self.watch_task and not self.watch_task.done():
             self.watch_task.cancel()
         if self.media is not None:
-            log.info("Call %s audio: %d chunks from WeChat (%d relayed to the page), %d mic chunks from the page",
-                     self.call_id, self.rx_chunks, self.rx_to_page, self.tx_chunks)
+            diag_str = _format_page_diag(self.page_diag)
+            extra = (f" ({diag_str})"
+                     if diag_str and (not self.tx_chunks or not self.rx_to_page or self.page_diag.get("err"))
+                     else "")
+            log.info("Call %s audio: %d chunks from WeChat (%d relayed to the page), %d mic chunks from the page%s",
+                     self.call_id, self.rx_chunks, self.rx_to_page, self.tx_chunks, extra)
         if self.grace_task and not self.grace_task.done() and self.grace_task is not asyncio.current_task():
             self.grace_task.cancel()
         if self.media is not None:
@@ -760,6 +796,7 @@ class CallWeb:
         self.tokens: dict[str, tuple[str, str]] = {}
         self.clients: dict[str, set[web.WebSocketResponse]] = {}  # web token -> open pages
         self.sessions: dict[str, CallSession] = {}  # call_id -> session
+        self.page_diags: dict[str, dict[str, object]] = {}  # web token -> latest client audio diag
         self._ready_holds: int = 0
         self._tasks: set[asyncio.Task] = set()
         self._runner: web.AppRunner | None = None
@@ -824,6 +861,7 @@ class CallWeb:
                     else self.bridge._conf_invites.get(ref))
             if live is None and token not in self.clients:
                 self.tokens.pop(token, None)
+                self.page_diags.pop(token, None)
 
     def token_for_call(self, entry: dict) -> str:
         if not entry.get("web_token"):
@@ -1178,6 +1216,9 @@ class CallWeb:
     def _start_session(self, entry: dict, owner_token: str, readied: bool, ws, *,
                        camera_enabled: bool = False) -> CallSession:
         sess = CallSession(self, entry, owner_token, readied, camera_enabled=camera_enabled)
+        if tok := entry.get("web_token"):
+            if cached_diag := self.page_diags.get(tok):
+                sess.page_diag.update(cached_diag)
         if ws is not None:
             sess.attach(ws)
         self.sessions[entry["call_id"]] = sess
@@ -1371,6 +1412,7 @@ class CallWeb:
         if p:
             app.router.add_get(p, self._page)
         app.router.add_get(p + "/call/{token}", self._page)
+        app.router.add_get(p + "/worklet.js", self._worklet)
         app.router.add_get(p + "/read/{aid}", self._read)
         app.router.add_get(p + "/ws", self._ws)
         app.router.add_get(p + "/healthz", self._health)
@@ -1403,6 +1445,18 @@ class CallWeb:
     async def _health(self, request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
+    async def _worklet(self, request: web.Request) -> web.Response:
+        return web.Response(
+            text=WORKLET_JS,
+            content_type="application/javascript",
+            charset="utf-8",
+            headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     async def _page(self, request: web.Request) -> web.Response:
         start = request.query.get("tgWebAppStartParam", "")
         if start.startswith(READER_PREFIX):  # reader links share the Mini App's single URL
@@ -1424,12 +1478,12 @@ class CallWeb:
                 "Permissions-Policy": "microphone=(self), camera=(self), speaker-selection=(self)",
                 "Content-Security-Policy": (
                     "default-src 'none'; "
-                    f"script-src 'nonce-{nonce}' blob:; "
+                    f"script-src 'nonce-{nonce}' blob: 'self'; "
                     "style-src 'unsafe-inline'; "
                     "connect-src 'self' ws: wss:; "
                     "img-src 'self' blob: data:; "
                     "media-src 'self' blob: mediastream:; "
-                    "worker-src blob:; "
+                    "worker-src 'self' blob:; "
                     "base-uri 'none'; "
                     "form-action 'none'"
                 ),
@@ -1613,6 +1667,16 @@ class CallWeb:
     async def _action(self, token: str, ws: web.WebSocketResponse, cmd: dict,
                       client_video_caps: dict | None = None) -> None:
         action = cmd.get("type")
+        if action == "diag":
+            clean_diag = _sanitize_page_diag(cmd)
+            if clean_diag:
+                self.page_diags.setdefault(token, {}).update(clean_diag)
+                sess = self._session_for(token)
+                if sess is not None and (sess.active_ws is ws or sess.active_ws is None):
+                    sess.page_diag.update(clean_diag)
+                if clean_diag.get("err"):
+                    log.warning("Call page (%s) reported audio issue: %s", token[:8], _format_page_diag(clean_diag))
+            return
         kind, ref = self.tokens.get(token, ("", ""))
         vcaps = cmd.get("videoCaps") if isinstance(cmd.get("videoCaps"), dict) else client_video_caps
         cam_opt = bool(cmd["cameraEnabled"]) if "cameraEnabled" in cmd else None

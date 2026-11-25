@@ -840,63 +840,454 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     }
   }
 
-  // Creates the AudioContext synchronously (inside the tap) so iOS lets it play, then loads the
-  // microphone and the audio worklet in parallel.
+  let silentWavUrl = '';
+  function primeIosAudio() {
+    if (!IS_IOS_OR_SAFARI || !document.createElement) return;
+    try {
+      if (!silentWavUrl) {
+        const wav = new Uint8Array([
+          82, 73, 70, 70, 38, 0, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32,
+          16, 0, 0, 0, 1, 0, 1, 0, 64, 31, 0, 0, 128, 62, 0, 0,
+          2, 0, 16, 0, 100, 97, 116, 97, 2, 0, 0, 0, 0, 0,
+        ]);
+        silentWavUrl = URL.createObjectURL(new Blob([wav], {type: 'audio/wav'}));
+      }
+      const el = document.createElement('audio');
+      el.playsInline = true;
+      if (el.setAttribute) el.setAttribute('playsinline', '');
+      el.src = silentWavUrl;
+      const p = el.play();
+      if (p && p.then) p.then(() => { try { el.pause(); el.removeAttribute && el.removeAttribute('src'); } catch (_) {} }, () => {});
+    } catch (e) {}
+  }
+
+  function withTimeout(p, ms) {
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const t = setTimeout(() => { if (!done) { done = true; reject(new Error('worklet load timeout')); } }, ms);
+      p.then((v) => { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+             (e) => { if (!done) { done = true; clearTimeout(t); reject(e); } });
+    });
+  }
+
+  async function loadWorkletModule(ctx) {
+    if (!ctx || !ctx.audioWorklet || typeof ctx.audioWorklet.addModule !== 'function' || typeof AudioWorkletNode !== 'function') {
+      return false;
+    }
+    const urls = [CFG.base + '/worklet.js', workletUrl];
+    for (let i = 0; i < urls.length; i++) {
+      if (!urls[i]) continue;
+      try {
+        await withTimeout(ctx.audioWorklet.addModule(urls[i]), 1500);
+        return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+
+  // Main-thread ScriptProcessorNode fallback matching BridgeIO's exact MessagePort protocol for iOS WKWebViews
+  // whose AudioWorklet GPUProcess fails to load or stalls after VoiceProcessingIO activation.
+  function createScriptBridgeNode(ctx, initNet, initFrame) {
+    const sr = ctx.sampleRate || 48000;
+    const sp = ctx.createScriptProcessor(1024, 1, 1);
+    let tx = true, speaker = false, rxEnv = 0, micGain = 1;
+    let net = initNet || 16000, frame = initFrame || 320, step = net / sr;
+    let acc = 0, sum = 0, cnt = 0, prevIn = 0, buf = new Int16Array(frame), n = 0;
+    let tracks = new Map(), ticks = 0, txFrames = 0, rxFrames = 0;
+    const port = {onmessage: null, postMessage: null};
+    function setRate(nextNet, nextFrame) {
+      const changed = net !== nextNet;
+      net = nextNet; frame = nextFrame; step = net / sr;
+      acc = 0; sum = 0; cnt = 0; prevIn = 0; buf = new Int16Array(frame); n = 0;
+      if (changed) tracks = new Map();
+    }
+    function emit(v) {
+      if (!tx) return;
+      v = v < -1 ? -1 : v > 1 ? 1 : v;
+      buf[n++] = v < 0 ? v * 32768 : v * 32767;
+      if (n === frame) {
+        txFrames++;
+        const out = buf; buf = new Int16Array(frame); n = 0;
+        if (port.onmessage) port.onmessage({data: out.buffer});
+      }
+    }
+    function push(id, pcm) {
+      rxFrames++;
+      let t = tracks.get(id);
+      if (!t) {
+        const size = net * 2;
+        t = {b: new Float32Array(size), size: size, w: 0, r: 0, on: false, last: 0, fadeFrom: 0, fadePos: 0, fadeLen: 0};
+        tracks.set(id, t);
+      }
+      for (let i = 0; i < pcm.length; i++) { t.b[t.w % t.size] = pcm[i] / 32768; t.w++; }
+      if (t.w - t.r > net * 0.4) {
+        t.fadeFrom = t.last;
+        t.fadeLen = Math.max(16, Math.round(sr * 0.004));
+        t.fadePos = 0;
+        t.r = t.w - Math.round(net * 0.1);
+      }
+    }
+    port.postMessage = (d) => {
+      if (!d) return;
+      if (d.t === 'pcm') push(d.id, d.pcm);
+      else if (d.t === 'drop') tracks.delete(d.id);
+      else if (d.t === 'rate') setRate(d.net, d.frame);
+      else if (d.t === 'tx') tx = !!d.on;
+      else if (d.t === 'speaker') speaker = !!d.on;
+    };
+    sp.onaudioprocess = (ev) => {
+      const ob = ev.outputBuffer, ch = ob && ob.numberOfChannels > 0 ? ob.getChannelData(0) : null;
+      if (ch) {
+        ch.fill(0);
+        for (const t of tracks.values()) {
+          if (!t.on) {
+            if (t.w - t.r >= net * 0.04) {
+              t.on = true; t.fadeFrom = t.last; t.fadeLen = Math.max(8, Math.round(sr * 0.002)); t.fadePos = 0;
+            } else if (Math.abs(t.last) > 1e-4) {
+              for (let i = 0; i < ch.length && Math.abs(t.last) > 1e-4; i++) { t.last *= 0.85; ch[i] += t.last; }
+              if (Math.abs(t.last) <= 1e-4) t.last = 0;
+              continue;
+            } else continue;
+          }
+          const playStep = (t.w - t.r) > net * 0.16 ? step * 1.015 : step;
+          for (let i = 0; i < ch.length; i++) {
+            if (t.w - t.r < 2) {
+              t.on = false;
+              for (; i < ch.length && Math.abs(t.last) > 1e-4; i++) { t.last *= 0.85; ch[i] += t.last; }
+              if (Math.abs(t.last) <= 1e-4) t.last = 0;
+              break;
+            }
+            const i0 = Math.floor(t.r), f = t.r - i0;
+            let s = t.b[i0 % t.size] + (t.b[(i0 + 1) % t.size] - t.b[i0 % t.size]) * f;
+            if (t.fadePos < t.fadeLen) { s = t.fadeFrom + (s - t.fadeFrom) * (t.fadePos / t.fadeLen); t.fadePos++; }
+            t.last = s; ch[i] += s; t.r += playStep;
+          }
+        }
+        let rxEnergy = 0;
+        for (let i = 0; i < ch.length; i++) {
+          const v = ch[i] > 1 ? 1 : ch[i] < -1 ? -1 : ch[i];
+          ch[i] = v; rxEnergy += v * v;
+        }
+        for (let c = 1; ob && c < ob.numberOfChannels; c++) ob.getChannelData(c).set(ch);
+        const rxRms = ch.length ? Math.sqrt(rxEnergy / ch.length) : 0;
+        const holdDecay = Math.exp(-ch.length / (sr * (speaker ? 0.18 : 0.14)));
+        rxEnv = rxRms > rxEnv ? (rxEnv + (rxRms - rxEnv) * 0.65) : (rxEnv * holdDecay);
+      }
+      const ib = ev.inputBuffer, inp = ib && ib.numberOfChannels > 0 ? ib.getChannelData(0) : null;
+      if (inp && tx) {
+        let targetGain = 1;
+        const refEnv = speaker ? rxEnv * 1.35 : rxEnv;
+        if (refEnv > 0.015 && inp.length) {
+          let txEnergy = 0;
+          for (let i = 0; i < inp.length; i++) txEnergy += inp[i] * inp[i];
+          const txRms = Math.sqrt(txEnergy / inp.length);
+          const dtThresh = Math.max(speaker ? 0.055 : 0.045, refEnv * (speaker ? 0.65 : 0.55));
+          if (txRms < dtThresh) {
+            const floor = speaker ? 0.10 : 0.15;
+            targetGain = floor + (1 - floor) * Math.pow(txRms / dtThresh, 2);
+          }
+        }
+        const gAlpha = targetGain > micGain ? 0.25 : 0.08;
+        if (step <= 1) {
+          for (let i = 0; i < inp.length; i++) {
+            micGain += (targetGain - micGain) * gAlpha;
+            sum += inp[i] * micGain; cnt++; acc += step;
+            if (acc >= 1) { acc -= 1; emit(sum / cnt); sum = 0; cnt = 0; }
+          }
+        } else {
+          const inv = 1 / step;
+          for (let i = 0; i < inp.length; i++) {
+            micGain += (targetGain - micGain) * gAlpha;
+            const s = inp[i] * micGain, p = prevIn;
+            while (acc < 1) { emit(p + (s - p) * acc); acc += inv; }
+            acc -= 1; prevIn = s;
+          }
+        }
+      } else if (inp && inp.length) {
+        prevIn = 0; micGain = 1; acc = 0; sum = 0; cnt = 0; n = 0;
+      }
+      ticks++;
+      if (port.onmessage && (ticks === 1 || (ticks & 31) === 0)) {
+        port.onmessage({data: {t: 'stat', ticks: ticks, tx: txFrames, rx: rxFrames, hasIn: !!(inp && inp.length)}});
+      }
+    };
+    sp.port = port;
+    return sp;
+  }
+
+  function primaryMicTrack(stream) {
+    if (!stream) return null;
+    const list = typeof stream.getAudioTracks === 'function' ? stream.getAudioTracks()
+      : (typeof stream.getTracks === 'function' ? stream.getTracks() : []);
+    return (list && list[0]) || null;
+  }
+
+  function sendDiag(curAudio, errText) {
+    const tr = curAudio ? primaryMicTrack(curAudio.stream) : null;
+    const payload = {type: 'diag'};
+    if (curAudio) {
+      payload.engine = curAudio.engine || '';
+      payload.ctxState = (curAudio.ctx && curAudio.ctx.state) || '';
+      if (curAudio.ctx && curAudio.ctx.sampleRate) payload.sampleRate = curAudio.ctx.sampleRate;
+      if (curAudio.ctx && typeof curAudio.ctx.currentTime === 'number') payload.currentTime = curAudio.ctx.currentTime;
+      payload.ticks = curAudio.ticks || 0;
+      payload.hasIn = !!curAudio.hasIn;
+      payload.txFrames = curAudio.txFrames || 0;
+      payload.rxFrames = curAudio.rxFrames || 0;
+      if (curAudio.stalled) payload.stalled = true;
+    }
+    if (tr) {
+      if (tr.readyState) payload.trackState = String(tr.readyState);
+      if (typeof tr.muted === 'boolean') payload.trackMuted = tr.muted;
+    }
+    if (errText) payload.err = String(errText);
+    send(payload);
+  }
+
+  function bindNodePort(curAudio, node) {
+    node.port.onmessage = (e) => {
+      if (audio !== curAudio) return;
+      const d = e && e.data;
+      if (d && typeof d === 'object' && d.t === 'stat') {
+        curAudio.ticks = d.ticks || (curAudio.ticks + 1);
+        curAudio.hasIn = !!d.hasIn;
+        curAudio.rxFrames = d.rx || curAudio.rxFrames;
+        return;
+      }
+      curAudio.ticks++;
+      curAudio.txFrames++;
+      if (st && st.mine && st.phase === 'active' && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 128000) {
+        ws.send(d);
+      }
+    };
+  }
+
+  function swapToScriptProcessor(curAudio) {
+    if (!curAudio || curAudio.engine === 'scriptProcessor' || typeof curAudio.ctx.createScriptProcessor !== 'function') return false;
+    try {
+      const sp = createScriptBridgeNode(curAudio.ctx, curAudio.rate, curAudio.frame);
+      bindNodePort(curAudio, sp);
+      try { curAudio.source && curAudio.source.disconnect(curAudio.node); } catch (e) {}
+      try { curAudio.node && curAudio.node.disconnect && curAudio.node.disconnect(); } catch (e) {}
+      const downstream = curAudio.voiceGain || curAudio.limiter || (curAudio.aec ? null : curAudio.ctx.destination);
+      if (curAudio.source) curAudio.source.connect(sp);
+      if (downstream) sp.connect(downstream);
+      curAudio.node = sp;
+      curAudio.engine = 'scriptProcessor';
+      lastWorkletTx = null;
+      lastWorkletSpeaker = null;
+      syncWorkletTx();
+      syncWorkletSpeaker();
+      for (const [tid, chunks] of curAudio.recentPcm.entries()) {
+        for (let i = 0; i < chunks.length; i++) sp.port.postMessage({t: 'pcm', id: tid, pcm: chunks[i]});
+      }
+      sendDiag(curAudio);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  let audioWatchTimer = null;
+  function scheduleAudioWatch(curAudio, delayMs) {
+    clearTimeout(audioWatchTimer);
+    audioWatchTimer = setTimeout(() => {
+      if (audio !== curAudio || ended || !curAudio.ctx || curAudio.ctx.state === 'closed') return;
+      if (!document.hidden) {
+        const ctx = curAudio.ctx;
+        if (ctx.state === 'running') {
+          const curT = typeof ctx.currentTime === 'number' ? ctx.currentTime : 0;
+          if (curT > curAudio.lastTime) {
+            curAudio.lastTime = curT;
+            curAudio.frozenCount = 0;
+            curAudio.stalled = false;
+            if (soundHint) { soundHint = false; hint(''); }
+            if (curAudio.engine === 'worklet' && curAudio.ticks === 0 && typeof ctx.createScriptProcessor === 'function') {
+              swapToScriptProcessor(curAudio);
+            } else if (!curAudio.diagSent) {
+              curAudio.diagSent = true;
+              sendDiag(curAudio);
+            }
+          } else if (curAudio.ticks === curAudio.lastTicks) {
+            curAudio.frozenCount++;
+            if (curAudio.frozenCount === 1) {
+              try { if (typeof ctx.suspend === 'function') ctx.suspend().then(() => ctx.resume()).catch(() => {}); } catch (e) {}
+              ctx.resume().catch(() => {});
+            } else if (curAudio.frozenCount >= 2) {
+              curAudio.stalled = true;
+              soundHint = true;
+              hint(SOUND_HINT, true);
+              sendDiag(curAudio);
+            }
+          } else {
+            curAudio.frozenCount = 0;
+            curAudio.stalled = false;
+          }
+          curAudio.lastTicks = curAudio.ticks;
+        } else {
+          checkAudio();
+          sendDiag(curAudio);
+        }
+      }
+      scheduleAudioWatch(curAudio, 1500);
+    }, delayMs || 900);
+  }
+
+  function wireContextGraph(ctx, stream, node, engine, rate, frame, recentPcm) {
+    let voiceGain = null, lim = null, outBus = node;
+    if (typeof ctx.createGain === 'function') {
+      voiceGain = ctx.createGain();
+      if (voiceGain && voiceGain.gain) voiceGain.gain.value = 1;
+      node.connect(voiceGain);
+      outBus = voiceGain;
+    }
+    if (typeof ctx.createDynamicsCompressor === 'function') {
+      try {
+        lim = ctx.createDynamicsCompressor();
+        if (lim.threshold) lim.threshold.value = -2;
+        if (lim.knee) lim.knee.value = 6;
+        if (lim.ratio) lim.ratio.value = 12;
+        if (lim.attack) lim.attack.value = 0.002;
+        if (lim.release) lim.release.value = 0.08;
+        outBus.connect(lim);
+        outBus = lim;
+      } catch (e) { lim = null; }
+    }
+    // Keep a strong reference to MediaStreamAudioSourceNode so WebKit JSC GC never collects it mid-call.
+    const source = ctx.createMediaStreamSource(stream);
+    source.connect(node);
+    outBus.connect(ctx.destination);
+    const initT = typeof ctx.currentTime === 'number' ? ctx.currentTime : 0;
+    return {
+      ctx: ctx, stream: stream, source: source, node: node, voiceGain: voiceGain, limiter: lim, out: outBus,
+      engine: engine, aec: null, aecPending: false, bypassAec: false, sinkId: '', routeKey: '',
+      rate: rate, frame: frame, ticks: 0, lastTicks: 0, txFrames: 0, rxFrames: 0, hasIn: false,
+      lastTime: initT, frozenCount: 0, stalled: false, diagSent: false, recentPcm: recentPcm || new Map(),
+    };
+  }
+
+  async function createProcessorNode(ctx, rate, frame, preferScript) {
+    if (!preferScript && await loadWorkletModule(ctx)) {
+      try {
+        const wn = new AudioWorkletNode(ctx, 'bridge-io', {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+          processorOptions: {net: rate, frame: frame, stat: true},
+        });
+        return {node: wn, engine: 'worklet'};
+      } catch (e) {}
+    }
+    if (typeof ctx.createScriptProcessor === 'function') {
+      return {node: createScriptBridgeNode(ctx, rate, frame), engine: 'scriptProcessor'};
+    }
+    throw new Error('当前浏览器不支持通话音频处理（AudioWorklet）');
+  }
+
+  function rebuildAudioContext(curAudio) {
+    if (!curAudio || audio !== curAudio || ended || curAudio.rebuilding) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC || !curAudio.stream) return;
+    curAudio.rebuilding = true;
+    try { if (IS_IOS_OR_SAFARI && navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+    const stream = curAudio.stream, rate = curAudio.rate, frame = curAudio.frame;
+    const preferScript = curAudio.engine === 'scriptProcessor';
+    const recentPcm = curAudio.recentPcm;
+    try { curAudio.aec && curAudio.aec.close(); } catch (e) {}
+    try { curAudio.ctx.onstatechange = null; } catch (e) {}
+    try { curAudio.source && curAudio.source.disconnect(); } catch (e) {}
+    try { curAudio.ctx.close(); } catch (e) {}
+    const newCtx = new AC({latencyHint: 'interactive'});
+    newCtx.resume().catch(() => {});
+    createProcessorNode(newCtx, rate, frame, preferScript).then((built) => {
+      if (audio !== curAudio || ended) { try { newCtx.close(); } catch (_) {} return; }
+      const next = wireContextGraph(newCtx, stream, built.node, built.engine, rate, frame, recentPcm);
+      bindNodePort(next, built.node);
+      audio = next;
+      lastWorkletTx = null;
+      lastWorkletSpeaker = null;
+      syncWorkletTx();
+      syncAudioRoute(true);
+      newCtx.onstatechange = checkAudio;
+      if (soundHint && newCtx.state === 'running') { soundHint = false; hint(''); }
+      checkAudio();
+      for (const [tid, chunks] of recentPcm.entries()) {
+        for (let i = 0; i < chunks.length; i++) built.node.port.postMessage({t: 'pcm', id: tid, pcm: chunks[i]});
+      }
+      scheduleAudioWatch(next, 900);
+      sendDiag(next);
+    }, () => {
+      try { newCtx.close(); } catch (_) {}
+      curAudio.rebuilding = false;
+    });
+  }
+
+  // Starts microphone capture synchronously inside the user tap. On iOS/Safari, instantiating AudioContext
+  // BEFORE getUserMedia resolves causes VoiceProcessingIO startup / permission sheets to interrupt or freeze
+  // the context (0 mic chunks + silent output), whereas creating AudioContext right AFTER getUserMedia resolves
+  // inherits the active VoiceProcessingIO sample rate and starts unblocked under WebKit's capturing exemption.
   function startAudio(rate, frame) {
     if (audio) {
-      if (audio.rate !== rate) { audio.node.port.postMessage({t: 'rate', net: rate, frame: frame}); audio.rate = rate; }
+      if (audio.rate !== rate || audio.frame !== frame) {
+        audio.node.port.postMessage({t: 'rate', net: rate, frame: frame});
+        audio.rate = rate;
+        audio.frame = frame;
+      }
       return Promise.resolve(audio);
     }
     if (audioStarting) return audioStarting;
     if (!window.isSecureContext) return Promise.reject(new Error('页面必须通过 HTTPS 打开才能使用麦克风'));
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.reject(new Error('当前环境不支持麦克风'));
-    // iOS: a two-way call needs the play-and-record session, or Web Audio follows the silent switch / gets
-    // interrupted once the microphone starts.
-    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
     const AC = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AC({latencyHint: 'interactive'});
-    ctx.resume().catch(() => {});
-    if (!ctx.audioWorklet) { ctx.close(); return Promise.reject(new Error('当前浏览器不支持 AudioWorklet')); }
+    if (!AC) return Promise.reject(new Error('当前环境不支持 WebAudio'));
+    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+    primeIosAudio();
+    let earlyCtx = null, earlyMod = null;
+    if (!IS_IOS_OR_SAFARI) {
+      earlyCtx = new AC({latencyHint: 'interactive'});
+      earlyCtx.resume().catch(() => {});
+      earlyMod = loadWorkletModule(earlyCtx);
+    }
     const gum = navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
       autoGainControl: true, channelCount: 1}, video: false});
-    const mod = ctx.audioWorklet.addModule(workletUrl);
     audioStarting = (async () => {
-      let stream = null;
+      let ctx = earlyCtx, stream = null;
       try {
         stream = await gum;
-        await mod;
-        const node = new AudioWorkletNode(ctx, 'bridge-io', {numberOfInputs: 1, numberOfOutputs: 1,
-          outputChannelCount: [1], processorOptions: {net: rate, frame: frame}});
-        let voiceGain = null, outBus = node;
-        if (typeof ctx.createGain === 'function') {
-          voiceGain = ctx.createGain();
-          if (voiceGain && voiceGain.gain) voiceGain.gain.value = 1;
-          node.connect(voiceGain);
-          outBus = voiceGain;
+        if (ended) {
+          stream.getTracks().forEach((t) => t.stop());
+          if (ctx) try { ctx.close(); } catch (_) {}
+          throw new Error('通话已结束');
         }
-        if (typeof ctx.createDynamicsCompressor === 'function') {
+        try { stream.getTracks().forEach((t) => { if ('enabled' in t) t.enabled = true; }); } catch (e) {}
+        if (!ctx) {
+          try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+          ctx = new AC({latencyHint: 'interactive'});
+          ctx.resume().catch(() => {});
+        }
+        let node = null, engine = 'worklet';
+        const modOk = earlyMod ? await earlyMod : await loadWorkletModule(ctx);
+        if (modOk) {
           try {
-            const lim = ctx.createDynamicsCompressor();
-            if (lim.threshold) lim.threshold.value = -2;
-            if (lim.knee) lim.knee.value = 6;
-            if (lim.ratio) lim.ratio.value = 12;
-            if (lim.attack) lim.attack.value = 0.002;
-            if (lim.release) lim.release.value = 0.08;
-            outBus.connect(lim);
-            outBus = lim;
-          } catch (e) {}
+            node = new AudioWorkletNode(ctx, 'bridge-io', {
+              numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+              processorOptions: {net: rate, frame: frame, stat: true},
+            });
+          } catch (e) { node = null; }
         }
-        ctx.createMediaStreamSource(stream).connect(node);
-        outBus.connect(ctx.destination);
-        node.port.onmessage = (e) => {
-          if (st && st.mine && st.phase === 'active' && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 128000) {
-            ws.send(e.data);
+        if (!node) {
+          if (typeof ctx.createScriptProcessor !== 'function') {
+            throw new Error('当前浏览器不支持 AudioWorklet');
           }
-        };
-        // Never wait for resume(): on iOS the microphone starting can leave the context "interrupted" and the
-        // promise pending indefinitely, which used to leave the call connected with no sound either way.
-        const curAudio = {ctx: ctx, stream: stream, node: node, voiceGain: voiceGain, out: outBus,
-                          aec: null, aecPending: false, bypassAec: false, sinkId: '', routeKey: '', rate: rate};
+          node = createScriptBridgeNode(ctx, rate, frame);
+          engine = 'scriptProcessor';
+        }
+        const curAudio = wireContextGraph(ctx, stream, node, engine, rate, frame);
+        bindNodePort(curAudio, node);
+        const tr = primaryMicTrack(stream);
+        if (tr && typeof tr.addEventListener === 'function') {
+          tr.addEventListener('mute', () => { if (audio === curAudio) sendDiag(curAudio); });
+          tr.addEventListener('unmute', () => { if (audio === curAudio) { checkAudio(); sendDiag(curAudio); } });
+          tr.addEventListener('ended', () => { if (audio === curAudio) sendDiag(curAudio, 'mic_track_ended'); });
+        }
         audio = curAudio;
         lastWorkletTx = null;
         lastWorkletSpeaker = null;
@@ -905,6 +1296,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         micGranted = true;
         ctx.onstatechange = checkAudio;
         checkAudio();
+        scheduleAudioWatch(curAudio, 900);
         try {
           if (navigator.wakeLock) {
             navigator.wakeLock.request('screen').then((l) => {
@@ -914,8 +1306,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         } catch (e) {}
         return audio;
       } catch (e) {
+        sendDiag(null, (e && (e.name ? e.name + ': ' + (e.message || '') : e.message)) || String(e));
         gum.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
-        try { ctx.close(); } catch (_) {}
+        if (ctx) try { ctx.close(); } catch (_) {}
         throw e;
       } finally {
         audioStarting = null;
@@ -1127,7 +1520,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     if (audio.aec && audio.aec.el && audio.aec.el.paused) audio.aec.el.play().catch(() => {});
     const s = audio.ctx.state;
     if (s === 'running') {
-      if (soundHint) { soundHint = false; hint(''); }
+      if (!audio.stalled && soundHint) { soundHint = false; hint(''); }
       syncRingback();
       return;
     }
@@ -1143,8 +1536,22 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   }
   ['touchend', 'click'].forEach((t) => document.addEventListener(t, () => {
     if (!audio) return;
+    if (IS_IOS_OR_SAFARI) {
+      try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+      primeIosAudio();
+    }
     if (audio.aec && audio.aec.el && audio.aec.el.paused) audio.aec.el.play().catch(() => {});
-    if (audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') audio.ctx.resume().then(checkAudio, () => {});
+    if (audio.stalled) {
+      rebuildAudioContext(audio);
+      return;
+    }
+    if (audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') {
+      const cur = audio;
+      cur.ctx.resume().then(checkAudio, () => {});
+      setTimeout(() => {
+        if (audio === cur && cur.ctx.state !== 'running' && cur.ctx.state !== 'closed') rebuildAudioContext(cur);
+      }, 350);
+    }
   }, true));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAudio(); });
 
@@ -1153,10 +1560,14 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     lastWorkletTx = null;
     lastWorkletSpeaker = null;
     clearTimeout(soundTimer);
+    clearTimeout(audioWatchTimer);
+    audioWatchTimer = null;
     if (soundHint) { soundHint = false; hint(''); }
     if (!audio) return;
     try { audio.aec && audio.aec.close(); } catch (e) {}
     try { audio.ctx.onstatechange = null; } catch (e) {}
+    try { audio.source && audio.source.disconnect(); } catch (e) {}
+    try { audio.node && audio.node.disconnect && audio.node.disconnect(); } catch (e) {}
     try { audio.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
     try { audio.ctx.close(); } catch (e) {}
     try { if (IS_IOS_OR_SAFARI && navigator.audioSession) navigator.audioSession.type = 'auto'; } catch (e) {}
@@ -1201,9 +1612,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
 
   async function withMedia(action, wantVideo) {
     if (!st || !begin(action)) return;
-    const early = !wantVideo && (!!audio || micGranted);
-    // Start audio (and camera when requested) synchronously inside the user tap gesture so iOS Safari unlocks
-    // AudioContext and grants camera permission without losing transient user activation.
+    const early = !wantVideo && !!audio;
+    // Start audio (and camera when requested) synchronously inside the user tap gesture so iOS Safari/WKWebView
+    // grants microphone/camera permissions without losing transient user activation.
     const audioP = startAudio(st.rate || 16000, st.frame || 320);
     const camP = wantVideo ? startCamera(camFacing).catch(() => null) : null;
     const caps = await videoCapsReady;
@@ -1549,6 +1960,12 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         if (!audio || e.data.byteLength < 6) return;
         const id = new DataView(e.data).getUint32(0, true);
         const pcm = new Int16Array(e.data.slice(4));
+        if (audio.engine === 'worklet' && audio.ticks === 0 && audio.recentPcm) {
+          let q = audio.recentPcm.get(id);
+          if (!q) { q = []; audio.recentPcm.set(id, q); }
+          q.push(new Int16Array(pcm));
+          if (q.length > 4) q.shift();
+        }
         audio.node.port.postMessage({t: 'pcm', id: id, pcm: pcm}, [pcm.buffer]);
         return;
       }

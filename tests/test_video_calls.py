@@ -1561,4 +1561,354 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         self.assertIn("DESKTOP_SPEAKER_OK", res.stdout)
 
+    def test_ios_telegram_post_gum_audiocontext_worklet_fallback_and_frozen_time_recovery(self):
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+
+        web_dir = Path(__file__).resolve().parent.parent / "bridge" / "web"
+        html = (web_dir / "call.html").read_text(encoding="utf-8")
+        worklet = (web_dir / "worklet.js").read_text(encoding="utf-8")
+        rendered = (
+            html.replace("__NONCE__", "testnonce")
+            .replace("__CFG__", json.dumps({"base": "/wxcall"}))
+            .replace("__WORKLET__", json.dumps(worklet))
+        )
+        main_js = re.findall(r'<script nonce="testnonce">([\s\S]*?)</script>', rendered)[1]
+
+        harness = f"""
+const vm = require('vm');
+const timers = [];
+let nextTimerId = 1;
+const docListeners = {{}};
+function makeEl(id) {{
+  return {{
+    id: id || '', className: '', textContent: '', _html: '', hidden: false, disabled: false,
+    get innerHTML() {{ return this._html; }},
+    set innerHTML(v) {{ this._html = v; if (!v) this.children = []; }},
+    style: {{}}, children: [], listeners: {{}},
+    classList: {{
+      _set: new Set(),
+      add(c) {{ this._set.add(c); }},
+      remove(c) {{ this._set.delete(c); }},
+      toggle(c, on) {{ if (on === undefined ? !this._set.has(c) : on) this._set.add(c); else this._set.delete(c); }},
+      contains(c) {{ return this._set.has(c); }},
+    }},
+    appendChild(ch) {{ ch.parentNode = this; this.children.push(ch); return ch; }},
+    removeChild(ch) {{ this.children = this.children.filter((x) => x !== ch); }},
+    addEventListener(ev, fn) {{ (this.listeners[ev] = this.listeners[ev] || []).push(fn); }},
+    setAttribute() {{}},
+    play() {{ return Promise.resolve(); }},
+    pause() {{}},
+    getBoundingClientRect() {{ return {{left: 0, top: 0, width: 100, height: 100}}; }},
+    getContext() {{ return {{}}; }},
+  }};
+}}
+const els = {{}};
+['stage', 'pip', 'selfVideo', 'main', 'avatar', 'title', 'name', 'status', 'timer', 'peers', 'hint', 'actions'].forEach((id) => {{
+  els[id] = makeEl(id);
+}});
+els.stage.hidden = true; els.pip.hidden = true; els.peers.hidden = true;
+
+const sockets = [];
+class FakeWS {{
+  constructor(url) {{
+    this.url = url; this.readyState = 0; this.bufferedAmount = 0; this.sent = [];
+    sockets.push(this);
+  }}
+  send(d) {{ this.sent.push(d); }}
+  close() {{ this.readyState = 3; if (this.onclose) this.onclose(); }}
+}}
+
+// Mirrors iOS WebKit WKWebView behavior:
+// 1) Any AudioContext created BEFORE getUserMedia resolves is interrupted when VoiceProcessingIO starts
+//    and its resume() outside a fresh tap hangs forever.
+// 2) An AudioContext created AFTER getUserMedia resolves (while capturingAudio=true) starts 'running' cleanly.
+let capturingAudio = false;
+let releaseGum = null;
+let freezeNextCtxTime = false;
+const contexts = [];
+const weakSources = [];
+const scriptProcessors = [];
+
+class FakeAudioContext {{
+  constructor() {{
+    this.sampleRate = 48000;
+    this.createdWhileCapturing = capturingAudio;
+    this.state = capturingAudio ? 'running' : 'suspended';
+    this.currentTime = 0;
+    this.frozen = freezeNextCtxTime;
+    freezeNextCtxTime = false;
+    this.destination = {{isDest: true}};
+    this.onstatechange = null;
+    this.audioWorklet = {{
+      addModule: (url) => {{
+        this.workletLoadedUrl = url;
+        return Promise.resolve();
+      }},
+    }};
+    contexts.push(this);
+  }}
+  resume() {{
+    if (!this.createdWhileCapturing) {{
+      // Interrupted by getUserMedia on iOS: resume() hangs indefinitely!
+      return new Promise(() => {{}});
+    }}
+    if (this.frozen) {{
+      return Promise.resolve();
+    }}
+    this.state = 'running';
+    return Promise.resolve();
+  }}
+  suspend() {{ return Promise.resolve(); }}
+  close() {{ this.state = 'closed'; return Promise.resolve(); }}
+  createMediaStreamSource(stream) {{
+    const src = {{
+      stream,
+      connectedTo: [],
+      connect(n) {{ this.connectedTo.push(n); return n; }},
+      disconnect(n) {{
+        if (!n) this.connectedTo = [];
+        else this.connectedTo = this.connectedTo.filter((x) => x !== n);
+      }},
+    }};
+    weakSources.push(new WeakRef(src));
+    return src;
+  }}
+  createGain() {{
+    return {{
+      gain: {{ value: 1, setValueAtTime(v) {{ this.value = v; }}, linearRampToValueAtTime(v) {{ this.value = v; }}, setTargetAtTime(v) {{ this.value = v; }} }},
+      connect(n) {{ return n; }},
+      disconnect() {{}},
+    }};
+  }}
+  createDynamicsCompressor() {{
+    return {{
+      threshold: {{value: 0}}, knee: {{value: 0}}, ratio: {{value: 1}}, attack: {{value: 0}}, release: {{value: 0}},
+      connect(n) {{ return n; }},
+      disconnect() {{}},
+    }};
+  }}
+  createScriptProcessor(bufSize, inCh, outCh) {{
+    const sp = {{
+      bufferSize: bufSize,
+      onaudioprocess: null,
+      connect(n) {{ this.dest = n; return n; }},
+      disconnect() {{ this.dest = null; }},
+    }};
+    scriptProcessors.push(sp);
+    return sp;
+  }}
+}}
+
+// Stalled WKWebView AudioWorkletNode: receives messages on port, never runs process() in GPUProcess!
+class StalledWorkletNode {{
+  constructor() {{
+    this.port = {{ onmessage: null, postMessage() {{}} }};
+  }}
+  connect(n) {{ return n; }}
+  disconnect() {{}}
+}}
+
+const audioSessionLog = [];
+const sandbox = {{
+  window: null, document: null, navigator: null,
+  location: {{
+    protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com',
+    pathname: '/wxcall/call/tok123456', search: '', hash: '',
+  }},
+  URL: {{ createObjectURL: () => 'blob:worklet', revokeObjectURL: () => {{}} }},
+  Blob: class {{}}, WebSocket: FakeWS, DataView, Uint8Array, Int16Array, Float32Array, ArrayBuffer, Math, JSON, Date, Number, String,
+  Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
+  performance: {{now: () => 100}},
+  AudioWorkletNode: StalledWorkletNode,
+  setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
+  clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+  setInterval: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms, interval: true}}); return id; }},
+  clearInterval: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+}};
+sandbox.window = Object.assign(sandbox, {{
+  isSecureContext: true, innerWidth: 390, innerHeight: 844, webkitAudioContext: FakeAudioContext,
+}});
+sandbox.window.parent = sandbox.window;
+sandbox.document = {{
+  body: makeEl('body'),
+  getElementById: (id) => els[id] || makeEl(id),
+  createElement: (tag) => makeEl(tag),
+  createTextNode: (t) => ({{textContent: t}}),
+  addEventListener: (ev, fn) => {{ (docListeners[ev] = docListeners[ev] || []).push(fn); }},
+  hidden: false,
+}};
+sandbox.navigator = {{
+  userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Telegram-iOS',
+  audioSession: {{
+    _type: 'auto',
+    get type() {{ return this._type; }},
+    set type(v) {{ this._type = v; audioSessionLog.push(v); }},
+  }},
+  permissions: {{
+    query: () => Promise.resolve({{state: 'granted', onchange: null}}),
+  }},
+  mediaDevices: {{
+    getUserMedia: () => new Promise((resolve) => {{
+      // Interrupt any AudioContext that was prematurely created before getUserMedia resolved!
+      contexts.forEach((c) => {{ c.state = 'interrupted'; }});
+      releaseGum = () => {{
+        capturingAudio = true;
+        resolve({{
+          getTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{ capturingAudio = false; }}}}],
+          getAudioTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{ capturingAudio = false; }}}}],
+        }});
+      }};
+    }}),
+  }},
+}};
+
+vm.runInNewContext({json.dumps(main_js)}, sandbox);
+
+(async () => {{
+  const ws = sockets[0];
+  ws.readyState = 1;
+  await ws.onopen();
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'ringing', title: '微信语音来电', name: 'Android Caller', status: '🔔 响铃中…',
+    mine: false, muted: false, camera: false, answerable: true, videoCall: false, rate: 16000, frame: 320,
+  }})}});
+
+  // User taps "接听" while micGranted is already 'granted'
+  const ansBtn = els.actions.children[1];
+  ansBtn.onclick();
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+  // 1) Must NOT have sent 'answer' before getUserMedia + AudioContext initialization actually succeeded,
+  //    and must NOT have created an AudioContext before getUserMedia resolved on iOS!
+  if (ws.sent.some((s) => typeof s === 'string' && JSON.parse(s).type === 'answer')) {{
+    throw new Error('Sent answer prematurely before startAudio finished!');
+  }}
+  if (contexts.length !== 0) {{
+    throw new Error('Created AudioContext before getUserMedia resolved on iOS (' + contexts.length + ')!');
+  }}
+
+  // Now iOS finishes starting VoiceProcessingIO and resolves getUserMedia
+  releaseGum();
+  for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r));
+
+  if (contexts.length !== 1 || contexts[0].state !== 'running') {{
+    throw new Error('Expected 1 running post-getUserMedia AudioContext, got ' + JSON.stringify(contexts.map((c) => c.state)));
+  }}
+  if (typeof global.gc === 'function') global.gc();
+  if (!weakSources.length || !weakSources[weakSources.length - 1].deref()) {{
+    throw new Error('MediaStreamAudioSourceNode was garbage-collected instead of held strongly!');
+  }}
+  if (contexts[0].workletLoadedUrl !== '/wxcall/worklet.js') {{
+    throw new Error('Expected same-origin /wxcall/worklet.js first, got ' + contexts[0].workletLoadedUrl);
+  }}
+  if (!ws.sent.some((s) => typeof s === 'string' && JSON.parse(s).type === 'answer')) {{
+    throw new Error('Expected answer to be sent once startAudio succeeded');
+  }}
+
+  // Server transitions call to active and starts relaying WeChat PCM chunks
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'active', title: '微信语音通话', name: 'Android Caller', status: '🟢 通话中',
+    mine: true, muted: false, camera: false, elapsed: 1, videoCall: false, rate: 16000, frame: 320,
+  }})}});
+
+  function sendWeChatPcm(trackId, samples16) {{
+    const buf = new ArrayBuffer(4 + samples16.length * 2);
+    new DataView(buf).setUint32(0, trackId, true);
+    new Int16Array(buf, 4).set(samples16);
+    ws.onmessage({{data: buf}});
+  }}
+  // Push 200ms of far-end WeChat speech (10 chunks * 320 samples @ 16kHz)
+  for (let c = 0; c < 10; c++) {{
+    sendWeChatPcm(2, new Int16Array(320).fill(12000));
+  }}
+
+  // 2) Advance AudioContext hardware clock, but StalledWorkletNode has 0 ticks -> watchdog hot-swaps to ScriptProcessorNode!
+  contexts[0].currentTime = 1.2;
+  const watchTimers = timers.filter((t) => t.ms >= 500 && t.ms <= 1500);
+  for (const wt of watchTimers) {{
+    const idx = timers.indexOf(wt);
+    if (idx >= 0 && !wt.interval) timers.splice(idx, 1);
+    wt.fn();
+  }}
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+  if (scriptProcessors.length !== 1 || typeof scriptProcessors[0].onaudioprocess !== 'function') {{
+    throw new Error('Expected automatic ScriptProcessorNode fallback when WKWebView AudioWorklet stalled, got ' + scriptProcessors.length);
+  }}
+
+  // Push fresh WeChat speech after fallback (and/or preserved jitter buffer) & run ScriptProcessor callbacks
+  for (let c = 0; c < 6; c++) {{
+    sendWeChatPcm(2, new Int16Array(320).fill(12000));
+  }}
+  const sp = scriptProcessors[0];
+  let maxOutSample = 0;
+  const binBefore = ws.sent.filter((x) => typeof x !== 'string').length;
+  for (let k = 0; k < 6; k++) {{
+    const inCh = new Float32Array(1024).fill(0.25);
+    const outCh = new Float32Array(1024);
+    sp.onaudioprocess({{
+      inputBuffer: {{ numberOfChannels: 1, getChannelData: () => inCh }},
+      outputBuffer: {{ numberOfChannels: 1, getChannelData: () => outCh }},
+    }});
+    for (let i = 0; i < outCh.length; i++) {{
+      if (Math.abs(outCh[i]) > maxOutSample) maxOutSample = Math.abs(outCh[i]);
+    }}
+  }}
+  const binSent = ws.sent.filter((x) => typeof x !== 'string');
+  if (!(maxOutSample > 0.2)) {{
+    throw new Error('Expected audible far-end WeChat speech in ScriptProcessor output, maxOutSample=' + maxOutSample);
+  }}
+  if (binSent.length <= binBefore || binSent[binSent.length - 1].byteLength !== 640) {{
+    throw new Error('Expected 640-byte (320 Int16) mic PCM frames sent to bridge, got count=' + (binSent.length - binBefore));
+  }}
+  const diags = ws.sent.filter((s) => typeof s === 'string').map((s) => JSON.parse(s)).filter((m) => m.type === 'diag');
+  if (!diags.some((d) => d.engine === 'scriptProcessor')) {{
+    throw new Error('Expected diag telemetry reporting scriptProcessor fallback, got ' + JSON.stringify(diags));
+  }}
+
+  // 3) Simulate WebKit Bug #263627: AudioContext reports state='running' while currentTime freezes!
+  //    Watchdog detects stalled currentTime -> shows SOUND_HINT -> user tap rebuilds a fresh running AudioContext!
+  const frozenTime = contexts[0].currentTime;
+  contexts[0].frozen = true;
+  for (let round = 0; round < 3; round++) {{
+    const activeTimers = timers.filter((t) => t.ms >= 500 && t.ms <= 2500);
+    for (const t of activeTimers) {{
+      if (!t.interval) {{
+        const idx = timers.indexOf(t);
+        if (idx >= 0) timers.splice(idx, 1);
+      }}
+      t.fn();
+    }}
+    await new Promise((r) => setImmediate(r));
+  }}
+  if (contexts[0].currentTime !== frozenTime) throw new Error('Test setup bug: time moved');
+  if (!els.hint.textContent.includes('轻点屏幕')) {{
+    throw new Error('Expected SOUND_HINT when ctx.currentTime is frozen while state=running, got: ' + els.hint.textContent);
+  }}
+
+  // User taps screen -> rebuilds deadlocked AudioContext on the live mic stream!
+  for (const fn of (docListeners.touchend || [])) fn();
+  for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r));
+  if (contexts.length < 2 || contexts[contexts.length - 1].state !== 'running') {{
+    throw new Error('Expected user tap to rebuild frozen AudioContext into running state, got ' + contexts.length);
+  }}
+
+  console.log('IOS_TELEGRAM_AUDIO_OK');
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+        res = subprocess.run(
+            [node, "--expose-gc", "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("IOS_TELEGRAM_AUDIO_OK", res.stdout)
+
+
 
