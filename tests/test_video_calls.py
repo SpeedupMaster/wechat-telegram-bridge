@@ -667,3 +667,515 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
         wm = body[body.index("async function withMedia"):body.index("async function toggleCamera")]
         self.assertLess(wm.index("startAudio("), wm.index("await videoCapsReady"))
 
+    async def test_video_backpressure_drops_pframes_and_recovers_on_keyframe(self):
+        from bridge.callweb import VIDEO_WS_MAX_BUFFER, decode_wxv1_frame, encode_wxv1_frame
+
+        self.daemon.add_thread("wxid_alice", "Alice")
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.answer":
+                async def connected():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "vid-bp", "revision": 3, "kind": "direct", "callType": "video",
+                        "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+                asyncio.create_task(connected())
+                return {"type": "command.result", "status": "accepted", "callId": "vid-bp", "ownerToken": "own-bp"}
+            return None
+
+        self.sock.on_command = on_cmd
+        self.ready_payload["receiveTracks"][1]["format"]["codec"] = "h264"
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "vid-bp", "revision": 2, "kind": "direct", "callType": "video", "callerId": "wxid_alice"}})
+        token = _button_urls(self.b.bot.sent[-1])[0].rsplit("/", 1)[1]
+        ws = await self._page(token)
+        try:
+            await self._next_json(ws)
+            await ws.send_json({"type": "answer", "cameraEnabled": True,
+                                "videoCaps": {"sendCodecs": ["h264", "jpeg"], "receiveCodecs": ["h264", "jpeg"]}})
+            await self._next_json(ws, pred=lambda m: m.get("phase") == "active")
+            sess = self.b.call_web.sessions["vid-bp"]
+            assert sess.active_ws is not None
+
+            # Simulate browser socket write buffer congestion (> VIDEO_WS_MAX_BUFFER)
+            fake_buf = VIDEO_WS_MAX_BUFFER + 1024
+            orig_req = sess.active_ws._req
+            sess.active_ws._req = SimpleNamespace(
+                transport=SimpleNamespace(get_write_buffer_size=lambda: fake_buf)
+            )
+            try:
+                # Congested H.264 frame is dropped AND triggers video.request_keyframe
+                self.media.queue.put_nowait({
+                    "type": "video.frame", "kind": WXCM_KIND_H264, "flags": 0x04,  # P-frame
+                    "trackId": 65538, "generation": 1, "sequence": 1, "timestampMicros": 20_000,
+                    "payload": b"\x00\x00\x00\x01\x41drop",
+                })
+                await self._until(lambda: any(m.get("type") == "video.request_keyframe" for m in self.media.sent_json))
+
+                # Buffer drains, but delta P-frame is STILL dropped until an IDR keyframe arrives
+                fake_buf = 0
+                self.media.queue.put_nowait({
+                    "type": "video.frame", "kind": WXCM_KIND_H264, "flags": 0x04,  # delta P-frame
+                    "trackId": 65538, "generation": 1, "sequence": 2, "timestampMicros": 40_000,
+                    "payload": b"\x00\x00\x00\x01\x41stale_p",
+                })
+                self.media.queue.put_nowait({
+                    "type": "video.frame", "kind": WXCM_KIND_H264, "flags": 0x05,  # IDR keyframe + rot 90
+                    "trackId": 65538, "generation": 1, "sequence": 3, "timestampMicros": 60_000,
+                    "payload": b"\x00\x00\x00\x01\x65clean_idr",
+                })
+                rx = decode_wxv1_frame(await self._next_bin(ws))
+                assert rx is not None
+                self.assertEqual(rx["payload"], b"\x00\x00\x00\x01\x65clean_idr")
+            finally:
+                sess.active_ws._req = orig_req
+
+            # Uplink daemon media socket backpressure drops video frame and pushes keyframe_requested to browser
+            self.media.write_buffer_size = lambda: VIDEO_WS_MAX_BUFFER * 3
+            tx_before = len(self.media.sent_bytes)
+            await ws.send_bytes(encode_wxv1_frame(1, WXCM_KIND_H264, 0x04, 100_000, b"\x00\x00\x00\x01\x41up"))
+            kf_msg = await self._next_json(ws, mtype="keyframe_requested")
+            self.assertEqual(kf_msg["trackId"], 65537)
+            self.assertEqual(len(self.media.sent_bytes), tx_before)
+        finally:
+            await ws.close()
+
+    async def test_remote_muted_late_participant_name_refresh_and_video_invite_titles(self):
+        room = "joinroom@chatroom"
+        self.daemon.add_group(room, "JoinTeam")
+        self.daemon.group_members[room] = [
+            {"id": "wxid_a", "displayName": "Alice"},
+            {"id": "wxid_b", "displayName": "Bob"},
+        ]
+        self.daemon.add_contact("wxid_b", "Bob", remark="老鲍", nickname="Bob")
+        self.b._self_wxid = "wxid_me"
+
+        # 1) Video conference invitation uses video invite title; unspecified v3 invite uses generic group call title
+        await self.b.handle_call_event({"type": "conference.invitations", "invitations": [
+            {"invitationId": "inv-vid", "revision": 1, "groupId": room, "callerId": "wxid_a", "callType": "video"},
+        ]})
+        inv_card = self.b.bot.sent[-1]
+        self.assertIn("📹 <b>微信群视频通话邀请</b>", inv_card.text)
+
+        self.ready_payload = {
+            "type": "media.ready",
+            "protocolVersion": 3,
+            "sendTracks": [
+                {"media": "audio", "id": 1, "generation": 1, "direction": "send",
+                 "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}},
+            ],
+            "receiveTracks": [
+                # Arrives with opaque participantId "p-b" BEFORE call.state / participant.updated maps p-b -> wxid_b!
+                {"media": "video", "id": 65540, "generation": 1, "direction": "receive",
+                 "participantId": "p-b", "active": True,
+                 "format": {"codec": "h264", "mode": "passthrough", "maxWidth": 640, "maxHeight": 480, "maxFps": 15}},
+            ],
+        }
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.join":
+                async def delayed_state():
+                    await asyncio.sleep(0.02)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "conf-late", "revision": 2, "kind": "conference", "callType": "video",
+                        "direction": "outgoing", "state": "connected", "ownedByThisClient": True,
+                        "groupId": room, "participants": [
+                            {"participantId": "p-me", "contactId": "wxid_me", "membership": "joined"},
+                            {"participantId": "p-b", "contactId": "wxid_b", "membership": "joined",
+                             "cameraEnabled": True, "microphoneEnabled": True},
+                        ]}})
+                asyncio.create_task(delayed_state())
+                return {"type": "command.result", "status": "accepted", "callId": "conf-late", "ownerToken": "own-l"}
+            return None
+
+        self.sock.on_command = on_cmd
+        token = _button_urls(inv_card)[0].rsplit("/", 1)[1]
+        ws = await self._page(token)
+        try:
+            await self._next_json(ws)
+            await ws.send_json({"type": "join", "cameraEnabled": False})
+            # Once call.state arrives, both videoTracks[0].name and participants resolve p-b -> wxid_b -> remark "老鲍"
+            st = await self._next_json(
+                ws,
+                pred=lambda m: m.get("phase") == "active"
+                and any(t.get("name") == "老鲍" for t in m.get("videoTracks") or []),
+            )
+            bob_part = next(p for p in st["participants"] if p["contactId"] == "wxid_b")
+            me_part = next(p for p in st["participants"] if p["contactId"] == "wxid_me")
+            self.assertEqual(bob_part["name"], "老鲍")
+            self.assertFalse(bob_part["self"])
+            self.assertTrue(me_part["self"])
+
+            # Self microphone control is ignored for remoteMuted; remote participant mute updates remoteMuted & participant
+            await self.b.handle_call_event({
+                "type": "call.control", "callId": "conf-late", "participantId": "wxid_me",
+                "control": {"kind": "microphone", "muted": True},
+            })
+            self.assertIsNone(self.b._active_calls["conf-late"].get("remote_muted"))
+
+            await self.b.handle_call_event({
+                "type": "call.control", "callId": "conf-late", "participantId": "p-b",
+                "control": {"kind": "microphone", "muted": True},
+            })
+            st_m = await self._next_json(ws, pred=lambda m: m.get("remoteMuted") is True)
+            bob_after = next(p for p in st_m["participants"] if p["contactId"] == "wxid_b")
+            self.assertIs(bob_after["muted"], True)
+
+            # Attaching a second browser socket requests an IDR keyframe for the active H.264 receive track
+            self.media.sent_json.clear()
+            ws2 = await self._page(token)
+            try:
+                await self._next_json(ws2)
+                await ws2.send_json({"type": "attach"})
+                await self._next_json(ws2, pred=lambda m: m.get("mine") is True)
+                self.assertIn({"type": "video.request_keyframe", "trackId": 65540}, self.media.sent_json)
+            finally:
+                await ws2.close()
+        finally:
+            await ws.close()
+
+
+class BrowserAudioAndVideoJsTests(unittest.TestCase):
+    def test_worklet_upsampling_downsampling_tx_gate_and_smooth_jitter_buffer(self):
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+
+        worklet_path = (Path(__file__).resolve().parent.parent / "bridge" / "web" / "worklet.js").as_posix()
+        script = f"""
+const fs = require('fs');
+const code = fs.readFileSync({json.dumps(worklet_path)}, 'utf8');
+
+function makeEnv(sr) {{
+  let Cls = null;
+  const fn = new Function('sampleRate', 'AudioWorkletProcessor', 'registerProcessor', code);
+  class BaseProc {{
+    constructor() {{
+      this.emitted = [];
+      this.port = {{
+        onmessage: null,
+        postMessage: (buf) => this.emitted.push(new Int16Array(buf)),
+      }};
+    }}
+  }}
+  fn(sr, BaseProc, (name, c) => {{ Cls = c; }});
+  return Cls;
+}}
+
+// 1) 8 kHz Bluetooth HFP -> 16 kHz upsampling emits exact 2x sample count with linear interpolation and no NaN
+const Proc8k = makeEnv(8000);
+const p8 = new Proc8k({{processorOptions: {{net: 16000, frame: 320}}}});
+const outCh8 = new Float32Array(128);
+for (let block = 0; block < 10; block++) {{
+  const inp = new Float32Array(80);
+  for (let i = 0; i < 80; i++) inp[i] = ((block * 80 + i) / 800) * 0.8;
+  p8.process([[inp]], [[outCh8]]);
+}}
+if (p8.emitted.length !== 5) throw new Error('Expected 5 frames (1600 samples), got ' + p8.emitted.length);
+for (const fr of p8.emitted) {{
+  for (let i = 0; i < fr.length; i++) {{
+    if (Number.isNaN(fr[i])) throw new Error('NaN in upsampled frame');
+  }}
+}}
+if (!(p8.emitted[4][319] > 20000)) throw new Error('Unexpected tail sample: ' + p8.emitted[4][319]);
+
+// 2) tx=false gate suppresses mic frame allocations/messages while muted or before active
+const Proc48k = makeEnv(48000);
+const p48 = new Proc48k({{processorOptions: {{net: 16000, frame: 320}}}});
+p48.port.onmessage({{data: {{t: 'tx', on: false}}}});
+for (let k = 0; k < 20; k++) p48.process([[new Float32Array(128).fill(0.5)]], [[new Float32Array(128)]]);
+if (p48.emitted.length !== 0) throw new Error('Expected 0 frames while tx=false');
+
+// 3) Jitter buffer: >160ms drifts down smoothly, and underrun decays smoothly without hard jump to 0
+const rxPcm = new Int16Array(4800).fill(16384); // 300ms @ 16kHz (> 160ms soft threshold)
+p48.port.onmessage({{data: {{t: 'pcm', id: 2, pcm: rxPcm}}}});
+const playBuf = new Float32Array(128);
+p48.process([[]], [[playBuf]]);
+const tr = p48.tracks.get(2);
+const expectedNominalR = 128 * (16000 / 48000);
+if (!(tr.r > expectedNominalR * 1.01)) throw new Error('Expected drift catch-up > 1.01x, got ' + tr.r);
+
+// Drain until underrun and verify smooth exponential release (non-zero decay sample instead of hard 0 step)
+while (tr.w - tr.r >= 2) p48.process([[]], [[playBuf]]);
+const tailBuf = new Float32Array(128);
+tr.last = 0.5;
+tr.on = true;
+tr.r = tr.w; // force immediate underrun at sample 0
+p48.process([[]], [[tailBuf]]);
+if (!(tailBuf[0] > 0.35 && tailBuf[0] < 0.5 && tailBuf[20] < 0.05)) {{
+  throw new Error('Expected smooth decay on underrun, got ' + tailBuf[0] + ', ' + tailBuf[20]);
+}}
+console.log('WORKLET_OK');
+"""
+        res = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("WORKLET_OK", res.stdout)
+
+    def test_call_html_reconnect_reattach_portrait_h264_and_ui_states_in_node(self):
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+
+        web_dir = Path(__file__).resolve().parent.parent / "bridge" / "web"
+        html = (web_dir / "call.html").read_text(encoding="utf-8")
+        worklet = (web_dir / "worklet.js").read_text(encoding="utf-8")
+        rendered = (
+            html.replace("__NONCE__", "testnonce")
+            .replace("__CFG__", json.dumps({"base": "/wxcall"}))
+            .replace("__WORKLET__", json.dumps(worklet))
+        )
+        scripts = re.findall(r'<script nonce="testnonce">([\s\S]*?)</script>', rendered)
+        self.assertEqual(len(scripts), 2)
+        main_js = scripts[1]
+
+        harness = f"""
+const vm = require('vm');
+const timers = [];
+let nextTimerId = 1;
+function makeEl(id) {{
+  return {{
+    id: id || '', className: '', textContent: '', _html: '', hidden: false, disabled: false,
+    get innerHTML() {{ return this._html; }},
+    set innerHTML(v) {{ this._html = v; if (!v) this.children = []; }},
+    style: {{}}, children: [], listeners: {{}},
+    videoWidth: 480, videoHeight: 640, readyState: 4, srcObject: null,
+    classList: {{
+      _set: new Set(),
+      add(c) {{ this._set.add(c); }},
+      remove(c) {{ this._set.delete(c); }},
+      toggle(c, on) {{ if (on === undefined ? !this._set.has(c) : on) this._set.add(c); else this._set.delete(c); }},
+      contains(c) {{ return this._set.has(c); }},
+    }},
+    appendChild(ch) {{ ch.parentNode = this; this.children.push(ch); return ch; }},
+    removeChild(ch) {{ this.children = this.children.filter((x) => x !== ch); }},
+    addEventListener(ev, fn) {{ (this.listeners[ev] = this.listeners[ev] || []).push(fn); }},
+    play() {{ return Promise.resolve(); }},
+    getBoundingClientRect() {{ return {{left: 200, top: 70, width: 100, height: 133}}; }},
+    getContext() {{
+      return {{
+        save() {{}}, restore() {{}}, setTransform() {{}}, translate() {{}}, rotate() {{}}, drawImage() {{}},
+      }};
+    }},
+  }};
+}}
+const els = {{}};
+['stage', 'pip', 'selfVideo', 'main', 'avatar', 'title', 'name', 'status', 'timer', 'peers', 'hint', 'actions'].forEach((id) => {{
+  els[id] = makeEl(id);
+}});
+els.stage.hidden = true; els.pip.hidden = true; els.peers.hidden = true;
+
+const sockets = [];
+class FakeWS {{
+  constructor(url) {{
+    this.url = url; this.readyState = 0; this.bufferedAmount = 0; this.sent = [];
+    sockets.push(this);
+  }}
+  send(d) {{ this.sent.push(d); }}
+  close() {{ this.readyState = 3; if (this.onclose) this.onclose(); }}
+}}
+
+let camStops = 0, oscCount = 0;
+const encoderConfigs = [], encodedKeyFlags = [];
+class FakeVideoEncoder {{
+  static isConfigSupported(cfg) {{ return Promise.resolve({{supported: cfg.codec === 'avc1.42001e'}}); }}
+  constructor(init) {{ this._out = init.output; this.state = 'unconfigured'; this.encodeQueueSize = 0; }}
+  configure(cfg) {{ encoderConfigs.push(cfg); this.state = 'configured'; }}
+  encode(vf, opts) {{
+    encodedKeyFlags.push(!!(opts && opts.keyFrame));
+    const payload = new Uint8Array([0, 0, 0, 1, opts && opts.keyFrame ? 0x65 : 0x41]);
+    this._out({{
+      type: opts && opts.keyFrame ? 'key' : 'delta',
+      timestamp: vf.timestamp || 1000,
+      byteLength: payload.byteLength,
+      copyTo: (dst) => dst.set(payload),
+    }});
+  }}
+  close() {{ this.state = 'closed'; }}
+}}
+class FakeVideoFrame {{
+  constructor(src, opts) {{ this.timestamp = (opts && opts.timestamp) || 0; }}
+  close() {{}}
+}}
+
+const workletMsgs = [];
+class FakeAudioContext {{
+  constructor() {{
+    this.state = 'running'; this.currentTime = 0; this.destination = {{}};
+    this.audioWorklet = {{ addModule: () => Promise.resolve() }};
+  }}
+  resume() {{ this.state = 'running'; return Promise.resolve(); }}
+  close() {{ this.state = 'closed'; }}
+  createMediaStreamSource() {{ return {{connect() {{}}}}; }}
+  createOscillator() {{
+    oscCount++;
+    return {{type: 'sine', frequency: {{value: 0}}, connect() {{}}, start() {{}}, stop() {{}}, disconnect() {{}}}};
+  }}
+  createGain() {{
+    return {{gain: {{setValueAtTime() {{}}, linearRampToValueAtTime() {{}}}}, connect() {{}}, disconnect() {{}}}};
+  }}
+}}
+class FakeWorkletNode {{
+  constructor() {{
+    this.port = {{ onmessage: null, postMessage: (m) => workletMsgs.push(m) }};
+  }}
+  connect() {{}}
+}}
+
+const sandbox = {{
+  window: null, document: null, navigator: null, location: {{
+    protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com',
+    pathname: '/wxcall/call/tok123456', search: '', hash: '',
+  }},
+  URL: {{ createObjectURL: () => 'blob:worklet', revokeObjectURL: () => {{}} }},
+  Blob: class {{}}, WebSocket: FakeWS, DataView, Uint8Array, Int16Array, ArrayBuffer, Math, JSON, Date, Number, String,
+  Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
+  performance: {{now: () => 100}},
+  VideoEncoder: FakeVideoEncoder, VideoDecoder: {{isConfigSupported: () => Promise.resolve({{supported: true}})}},
+  VideoFrame: FakeVideoFrame, AudioWorkletNode: FakeWorkletNode,
+  setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
+  clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+  setInterval: (fn, ms) => nextTimerId++,
+  clearInterval: () => {{}},
+}};
+sandbox.window = Object.assign(sandbox, {{
+  isSecureContext: true, innerWidth: 390, innerHeight: 844, AudioContext: FakeAudioContext,
+}});
+sandbox.window.parent = sandbox.window;
+sandbox.document = {{
+  getElementById: (id) => els[id] || makeEl(id),
+  createElement: (tag) => makeEl(tag),
+  createTextNode: (t) => ({{textContent: t}}),
+  addEventListener: () => {{}},
+  hidden: false,
+}};
+sandbox.navigator = {{
+  mediaDevices: {{
+    getUserMedia: (c) => Promise.resolve({{
+      getTracks: () => [{{stop: () => {{ if (c && c.video) camStops++; }}}}],
+    }}),
+  }},
+}};
+
+vm.runInNewContext({json.dumps(main_js)}, sandbox);
+
+(async () => {{
+  const ws1 = sockets[0];
+  ws1.readyState = 1;
+  await ws1.onopen();
+  await new Promise((r) => setImmediate(r));
+
+  // Initial ringing video call state
+  ws1.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'ringing', title: '微信视频来电', name: 'Alice', status: '🔔 响铃中…',
+    mine: false, muted: false, camera: false, answerable: true, videoCall: true, videoEnabled: true,
+    rate: 16000, frame: 320, videoTracks: [], participants: [],
+  }})}});
+
+  // Click "视频接听" -> starts both mic & camera in parallel and sends answer
+  const ansBtn = els.actions.children[1];
+  ansBtn.onclick();
+  for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  const ansPayload = JSON.parse(ws1.sent[ws1.sent.length - 1]);
+  if (ansPayload.type !== 'answer' || ansPayload.cameraEnabled !== true) {{
+    throw new Error('Expected answer with cameraEnabled=true, got ' + JSON.stringify(ansPayload));
+  }}
+
+  // Active video call with H.264 send track -> portrait 480x640 encodes as 640x480 with latencyMode='realtime'
+  ws1.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'active', title: '微信视频通话', name: 'Alice', status: '🟢 通话中',
+    mine: true, muted: false, camera: true, elapsed: 1, videoCall: true, videoEnabled: true,
+    rate: 16000, frame: 320,
+    videoSend: {{id: 65537, generation: 1, codec: 'h264', maxWidth: 640, maxHeight: 480, maxFps: 5, bitrateKbps: 600, active: true}},
+    videoTracks: [], participants: [],
+  }})}});
+
+  // Run 12 capture ticks (at 5 fps, periodic keyframe must fire at frame 0 and frame 10 = fps * 2)
+  for (let step = 0; step < 12; step++) {{
+    const t = timers.find((x) => x.ms <= 250);
+    if (!t) break;
+    timers.splice(timers.indexOf(t), 1);
+    t.fn();
+  }}
+  if (!encoderConfigs.length || encoderConfigs[0].width !== 640 || encoderConfigs[0].height !== 480) {{
+    throw new Error('Expected portrait 480x640 rotated H.264 encoder to be 640x480, got ' + JSON.stringify(encoderConfigs[0]));
+  }}
+  if (encoderConfigs[0].latencyMode !== 'realtime') {{
+    throw new Error('Expected latencyMode=realtime, got ' + JSON.stringify(encoderConfigs[0]));
+  }}
+  if (!encodedKeyFlags[0] || !encodedKeyFlags[10]) {{
+    throw new Error('Expected periodic IDR keyframe at frame 0 and 10, got ' + JSON.stringify(encodedKeyFlags));
+  }}
+
+  // Uplink congestion > 48KB drops video & marks forceKeyframe so next clear frame is keyframe
+  ws1.bufferedAmount = 60000;
+  const tDrop = timers.find((x) => x.ms <= 250);
+  timers.splice(timers.indexOf(tDrop), 1);
+  tDrop.fn();
+  ws1.bufferedAmount = 0;
+  const tRec = timers.find((x) => x.ms <= 250);
+  timers.splice(timers.indexOf(tRec), 1);
+  tRec.fn();
+  if (!encodedKeyFlags[encodedKeyFlags.length - 1]) {{
+    throw new Error('Expected forced IDR keyframe immediately after uplink buffer drop');
+  }}
+
+  // Simulate WS drop + reconnect: camera must NOT stop, and attach must be sent automatically!
+  const stopsBefore = camStops;
+  ws1.close();
+  if (camStops !== stopsBefore) throw new Error('Camera was erroneously stopped during WS reconnect!');
+  const reconnTimer = timers.find((x) => x.ms === 300);
+  timers.splice(timers.indexOf(reconnTimer), 1);
+  reconnTimer.fn();
+  const ws2 = sockets[1];
+  ws2.readyState = 1;
+  await ws2.onopen();
+  await new Promise((r) => setImmediate(r));
+  // Server sends initial post-reconnect state with mine=false
+  ws2.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'active', title: '微信视频通话', name: 'Alice', status: '🟢 通话中',
+    mine: false, muted: false, camera: true, elapsed: 3, videoCall: true, videoEnabled: true,
+    rate: 16000, frame: 320, videoSend: null, videoTracks: [], participants: [],
+  }})}});
+  if (camStops !== stopsBefore) throw new Error('Camera was stopped before attach completed!');
+  const attachMsg = JSON.parse(ws2.sent[ws2.sent.length - 1]);
+  if (attachMsg.type !== 'attach' || attachMsg.cameraEnabled !== true) {{
+    throw new Error('Expected automatic attach with cameraEnabled=true on reconnect, got ' + JSON.stringify(attachMsg));
+  }}
+
+  // Outgoing calling state shows PiP self-preview and triggers 450Hz ringback oscillator
+  ws2.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'calling', title: '微信视频通话', name: 'Alice', status: '🔔 对方响铃中…',
+    mine: true, muted: false, camera: true, videoCall: true, videoEnabled: true, rate: 16000, frame: 320,
+  }})}});
+  if (els.pip.hidden) throw new Error('Expected self-preview PiP to be visible during outgoing video calling');
+  if (oscCount < 1) throw new Error('Expected ringback tone oscillator during outgoing calling');
+
+  // 1-on-1 pure voice call on v3 daemon hides camera button and displays remoteMuted status
+  ws2.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'active', title: '微信语音通话', name: 'Alice', status: '🟢 通话中',
+    mine: true, muted: false, camera: false, elapsed: 5, group: false,
+    videoCall: false, videoEnabled: true, videoSend: null, remoteMuted: true, videoTracks: [], participants: [],
+  }})}});
+  const btnLabels = els.actions.children.map((b) => b.children.map((c) => c.textContent || '').join(''));
+  if (btnLabels.some((l) => l.includes('摄像头'))) {{
+    throw new Error('Pure 1:1 voice call should not show camera button, got ' + JSON.stringify(btnLabels));
+  }}
+  const statusText = els.status.children.map((c) => c.textContent || '').join('');
+  if (statusText !== '对方已静音') throw new Error('Expected 对方已静音, got ' + statusText);
+  if (camStops <= stopsBefore) throw new Error('Expected camera hardware stream to be stopped when camera=false');
+
+  console.log('CALL_HTML_OK');
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+        res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("CALL_HTML_OK", res.stdout)
+
+

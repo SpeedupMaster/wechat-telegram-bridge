@@ -60,7 +60,7 @@ font-size:12px;color:#f4f5f7;white-space:nowrap;overflow:hidden;text-overflow:el
 .stage:not(.grid-2):not(.grid-many) .tile .tag{display:none}
 .pip{position:fixed;top:max(68px,calc(env(safe-area-inset-top) + 52px));right:14px;z-index:3;
 width:clamp(92px,24vw,128px);max-height:220px;aspect-ratio:3/4;border-radius:14px;overflow:hidden;background:#11141a;
-border:1px solid rgba(255,255,255,.18);box-shadow:0 10px 28px rgba(0,0,0,.48);cursor:pointer}
+border:1px solid rgba(255,255,255,.18);box-shadow:0 10px 28px rgba(0,0,0,.48);cursor:pointer;touch-action:none}
 .pip.landscape{width:clamp(116px,32vw,168px)}
 .pip[hidden]{display:none}
 .pip video{width:100%;height:100%;object-fit:contain;display:block}
@@ -105,6 +105,12 @@ text-align:left}
 .tone-err .dot{background:var(--red)}
 @keyframes blink{50%{opacity:.25}}
 .timer{font-size:20px;font-variant-numeric:tabular-nums;color:var(--fg);min-height:26px;letter-spacing:1px}
+.peers{display:flex;flex-wrap:wrap;justify-content:center;gap:6px;max-width:340px;max-height:84px;overflow:auto}
+.peers[hidden],main.video-live .peers{display:none}
+.peer{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:12px;
+background:rgba(255,255,255,.07);font-size:12px;color:#d6d9df;max-width:160px;white-space:nowrap;
+overflow:hidden;text-overflow:ellipsis}
+.peer.wait{opacity:.55}
 .hint{font-size:13px;color:var(--hint);max-width:320px;line-height:1.55;min-height:20px}
 .hint.err{color:#ff7b7d}
 .hint a{color:#5eb5f7;text-decoration:none;font-weight:500}
@@ -151,6 +157,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     <div class="name" id="name">正在连接…</div>
     <div class="status" id="status"></div>
     <div class="timer" id="timer"></div>
+    <div class="peers" id="peers" hidden></div>
     <div class="hint" id="hint"></div>
   </section>
   <section class="actions" id="actions"></section>
@@ -245,23 +252,28 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   let closingConfirm = null;
 
   // Video state (WebCodecs H.264 Annex-B preferred when supported, Canvas JPEG universal fallback)
+  let h264EncCodec = 'avc1.42001e', h264DecCodec = 'avc1.42001e';
   let videoCaps = {sendCodecs: ['jpeg'], receiveCodecs: ['jpeg'], maxWidth: 640, maxHeight: 480, maxFps: 15};
   const videoCapsReady = (async () => {
     let enc = false, dec = false;
-    try {
-      if (typeof VideoEncoder === 'function' && VideoEncoder.isConfigSupported) {
-        const s = await VideoEncoder.isConfigSupported({
-          codec: 'avc1.42001e', width: 640, height: 480, avc: {format: 'annexb'},
-        });
-        enc = !!(s && s.supported);
+    if (typeof VideoEncoder === 'function' && VideoEncoder.isConfigSupported) {
+      for (const c of ['avc1.42001e', 'avc1.42e01e']) {
+        try {
+          const s = await VideoEncoder.isConfigSupported({
+            codec: c, width: 640, height: 480, avc: {format: 'annexb'},
+          });
+          if (s && s.supported) { h264EncCodec = c; enc = true; break; }
+        } catch (e) {}
       }
-    } catch (e) {}
-    try {
-      if (typeof VideoDecoder === 'function' && VideoDecoder.isConfigSupported) {
-        const s = await VideoDecoder.isConfigSupported({codec: 'avc1.42001e'});
-        dec = !!(s && s.supported);
+    }
+    if (typeof VideoDecoder === 'function' && VideoDecoder.isConfigSupported) {
+      for (const c of ['avc1.42001e', 'avc1.42e01e']) {
+        try {
+          const s = await VideoDecoder.isConfigSupported({codec: c});
+          if (s && s.supported) { h264DecCodec = c; dec = true; break; }
+        } catch (e) {}
       }
-    } catch (e) {}
+    }
     videoCaps = {
       sendCodecs: enc ? ['h264', 'jpeg'] : ['jpeg'],
       receiveCodecs: dec ? ['h264', 'jpeg'] : ['jpeg'],
@@ -271,7 +283,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   })();
 
   let camStream = null, camStarting = null, camFacing = 'user', camGen = 0;
-  let videoEncoder = null, encDims = null, encRotated = false, forceKeyframe = true, lastSendGen = null;
+  let videoEncoder = null, encDims = null, encRotated = false, forceKeyframe = true, framesSinceKf = 0, lastSendGen = null;
   let captureTimer = null, captureBusy = false;
   const capCanvas = document.createElement('canvas');
   const capCtx = capCanvas.getContext('2d');
@@ -335,14 +347,19 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   }
 
   function sendVideoBinary(gen, kind, flags, tsMicros, payload) {
-    if (!ws || ws.readyState !== 1 || ws.bufferedAmount > 256000) return;
-    if (!st || !st.mine || !isCameraOn() || !st.videoSend || !st.videoSend.active) return;
+    if (!payload || payload.byteLength > 524288) return false;
+    if (!ws || ws.readyState !== 1 || ws.bufferedAmount > 48000) {
+      if (kind === 3) forceKeyframe = true;
+      return false;
+    }
+    if (!st || !st.mine || !isCameraOn() || !st.videoSend || !st.videoSend.active) return false;
     ws.send(packWxv1(gen, kind, flags, tsMicros, payload));
+    return true;
   }
 
   function closeEncoder() {
     if (videoEncoder) { try { videoEncoder.close(); } catch (e) {} videoEncoder = null; }
-    encDims = null; encRotated = false;
+    encDims = null; encRotated = false; framesSinceKf = 0;
   }
 
   function ensureH264Encoder(w, h, fps, bitrateKbps, rotated) {
@@ -362,12 +379,17 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         },
         error: () => { closeEncoder(); },
       });
-      encoder.configure({
-        codec: 'avc1.42001e', width: w, height: h,
+      const baseCfg = {
+        codec: h264EncCodec, width: w, height: h,
         bitrate: Math.max(200, bitrateKbps || 600) * 1000,
         framerate: fps, avc: {format: 'annexb'},
-      });
-      videoEncoder = encoder; encDims = {w: w, h: h}; encRotated = rotated; forceKeyframe = true;
+      };
+      try {
+        encoder.configure(Object.assign({latencyMode: 'realtime'}, baseCfg));
+      } catch (e) {
+        encoder.configure(baseCfg);
+      }
+      videoEncoder = encoder; encDims = {w: w, h: h}; encRotated = rotated; forceKeyframe = true; framesSinceKf = 0;
       return true;
     } catch (e) { closeEncoder(); return false; }
   }
@@ -445,11 +467,15 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       const vid = $('selfVideo');
       if (st && st.mine && st.phase === 'active' && isCameraOn() && vs && vs.active && vid && vid.readyState >= 2 && vid.videoWidth > 0 && !captureBusy) {
         const vw = vid.videoWidth, vh = vid.videoHeight;
-        const maxW = Math.min(vs.maxWidth || 640, 640), maxH = Math.min(vs.maxHeight || 480, 480);
-        const scale = Math.min(1, maxW / vw, maxH / vh);
+        const limW = Math.min(vs.maxWidth || 640, 640), limH = Math.min(vs.maxHeight || 480, 480);
+        const useH264 = vs.codec === 'h264' && typeof VideoEncoder === 'function' && typeof VideoFrame === 'function' && capCtx;
+        // Portrait mobile camera (e.g. 480x640) rotated 90 deg CCW becomes 640x480, fitting maxWidth x maxHeight at full resolution.
+        const boxW = (useH264 && vw < vh) ? Math.min(limW, limH) : limW;
+        const boxH = (useH264 && vw < vh) ? Math.max(limW, limH) : limH;
+        const scale = Math.min(1, boxW / vw, boxH / vh);
         const w = Math.max(16, Math.round((vw * scale) / 2) * 2);
         const h = Math.max(16, Math.round((vh * scale) / 2) * 2);
-        if (vs.codec === 'h264' && typeof VideoEncoder === 'function' && typeof VideoFrame === 'function' && capCtx) {
+        if (useH264) {
           // Pre-rotate outgoing H.264 90 deg CCW and signal FLAG_ROTATE_90 (+90 deg CW) per agent-wechat #661
           const encW = h, encH = w;
           if (ensureH264Encoder(encW, encH, fps, vs.bitrateKbps || 600, true) && videoEncoder.encodeQueueSize <= 2) {
@@ -463,7 +489,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
               capCtx.drawImage(vid, 0, 0, w, h);
               capCtx.restore();
               vf = new VideoFrame(capCanvas, {timestamp: Math.round(performance.now() * 1000)});
-              const kf = forceKeyframe; forceKeyframe = false;
+              const kf = forceKeyframe || framesSinceKf >= fps * 2;
+              forceKeyframe = false;
+              framesSinceKf = kf ? 1 : (framesSinceKf + 1);
               videoEncoder.encode(vf, {keyFrame: kf});
             } catch (e) {} finally { if (vf) vf.close(); }
           }
@@ -586,7 +614,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       return;
     }
     if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return;
-    const codec = f.kind === 3 ? 'avc1.42001e' : 'hvc1.1.6.L93.B0';
+    const codec = f.kind === 3 ? h264DecCodec : 'hvc1.1.6.L93.B0';
     if (!tile.decoder || tile.codec !== codec || tile.decoder.state === 'closed') {
       if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} }
       try {
@@ -640,11 +668,15 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         ctx.createMediaStreamSource(stream).connect(node);
         node.connect(ctx.destination);
         node.port.onmessage = (e) => {
-          if (st && st.mine && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 64000) ws.send(e.data);
+          if (st && st.mine && st.phase === 'active' && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 128000) {
+            ws.send(e.data);
+          }
         };
         // Never wait for resume(): on iOS the microphone starting can leave the context "interrupted" and the
         // promise pending indefinitely, which used to leave the call connected with no sound either way.
         audio = {ctx: ctx, stream: stream, node: node, rate: rate};
+        lastWorkletTx = null;
+        syncWorkletTx();
         micGranted = true;
         ctx.onstatechange = checkAudio;
         checkAudio();
@@ -667,6 +699,51 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     return audioStarting;
   }
 
+  let lastWorkletTx = null;
+  function syncWorkletTx() {
+    if (!audio || !audio.node) { lastWorkletTx = null; return; }
+    const on = !!(st && st.mine && st.phase === 'active' && !isMuted() && wsOpen);
+    if (on !== lastWorkletTx) {
+      lastWorkletTx = on;
+      audio.node.port.postMessage({t: 'tx', on: on});
+    }
+  }
+
+  let ringTimer = null, ringNode = null;
+  function stopRingback() {
+    if (ringTimer) { clearInterval(ringTimer); ringTimer = null; }
+    if (ringNode) {
+      try { ringNode.osc.stop(); } catch (e) {}
+      try { ringNode.osc.disconnect(); ringNode.gain.disconnect(); } catch (e) {}
+      ringNode = null;
+    }
+  }
+  function pulseRingback() {
+    if (!audio || !audio.ctx || audio.ctx.state !== 'running' || !st || st.phase !== 'calling' || !st.mine) return;
+    try {
+      const ctx = audio.ctx, now = ctx.currentTime;
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.type = 'sine'; osc.frequency.value = 450;
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.035, now + 0.025);
+      gain.gain.setValueAtTime(0.035, now + 0.95);
+      gain.gain.linearRampToValueAtTime(0.0001, now + 1.0);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(now); osc.stop(now + 1.02);
+      const cur = {osc: osc, gain: gain};
+      ringNode = cur;
+      osc.onended = () => { if (ringNode === cur) ringNode = null; };
+    } catch (e) {}
+  }
+  function syncRingback() {
+    const want = !!(st && st.phase === 'calling' && st.mine && wsOpen && audio);
+    if (!want) { stopRingback(); return; }
+    if (!ringTimer) {
+      pulseRingback();
+      ringTimer = setInterval(pulseRingback, 4000);
+    }
+  }
+
   // Keeps the AudioContext running: the system can suspend or interrupt it (iOS when the mic starts, another
   // app takes audio, the page is backgrounded). Resume quietly, and ask for a tap if that is not allowed.
   const SOUND_HINT = '声音被系统暂停了，轻点屏幕任意位置恢复';
@@ -676,6 +753,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const s = audio.ctx.state;
     if (s === 'running') {
       if (soundHint) { soundHint = false; hint(''); }
+      syncRingback();
       return;
     }
     if (s === 'closed') return;
@@ -694,6 +772,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   document.addEventListener('visibilitychange', () => { if (!document.hidden) checkAudio(); });
 
   function stopAudio() {
+    stopRingback();
+    lastWorkletTx = null;
     clearTimeout(soundTimer);
     if (soundHint) { soundHint = false; hint(''); }
     if (!audio) return;
@@ -742,8 +822,10 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   async function withMedia(action, wantVideo) {
     if (!st || !begin(action)) return;
     const early = !wantVideo && (!!audio || micGranted);
-    // Start audio synchronously inside the user tap gesture before any await so iOS Safari unlocks AudioContext.
+    // Start audio (and camera when requested) synchronously inside the user tap gesture so iOS Safari unlocks
+    // AudioContext and grants camera permission without losing transient user activation.
     const audioP = startAudio(st.rate || 16000, st.frame || 320);
+    const camP = wantVideo ? startCamera(camFacing).catch(() => null) : null;
     const caps = await videoCapsReady;
     let camOk = false;
     if (early) {
@@ -754,24 +836,22 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     try {
       await audioP;
     } catch (e) {
+      if (camP) stopCamera();
       const name = e && e.name;
       let msg = (e && e.message) || String(e);
       if (name === 'NotAllowedError' || name === 'SecurityError') msg = '没有麦克风权限，请允许 Telegram / 浏览器使用麦克风';
       else if (name === 'NotFoundError') msg = '没有找到麦克风';
-      if (!early) pending = null;
+      pending = null;
+      if (early && st && LIVE[st.phase]) send({type: 'hangup'});
       render();
       hint(msg, true);
       browserFallback();
       return;
     }
     if (wantVideo) {
-      try {
-        await startCamera(camFacing);
-        camOk = !!camStream;
-      } catch (e) {
-        camOk = false;
-        hint('未能开启摄像头，将以仅语音方式接入', false);
-      }
+      await camP;
+      camOk = !!camStream;
+      if (!camOk) hint('未能开启摄像头，将以仅语音方式接入', false);
     }
     if (!early) {
       const payload = {type: action, videoCaps: caps};
@@ -804,6 +884,32 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       hint('当前设备不支持切换前后摄像头', false);
     }
   }
+  let pipDrag = null, pipMoved = false;
+  const pipEl = $('pip');
+  pipEl.addEventListener('pointerdown', (e) => {
+    if (e.button && e.button !== 0) return;
+    const r = pipEl.getBoundingClientRect();
+    pipDrag = {id: e.pointerId, sx: e.clientX, sy: e.clientY, sl: r.left, st: r.top, w: r.width, h: r.height};
+    pipMoved = false;
+    try { pipEl.setPointerCapture(e.pointerId); } catch (_) {}
+  });
+  pipEl.addEventListener('pointermove', (e) => {
+    if (!pipDrag || e.pointerId !== pipDrag.id) return;
+    const dx = e.clientX - pipDrag.sx, dy = e.clientY - pipDrag.sy;
+    if (!pipMoved && Math.hypot(dx, dy) < 6) return;
+    pipMoved = true;
+    const x = Math.max(8, Math.min(window.innerWidth - pipDrag.w - 8, pipDrag.sl + dx));
+    const y = Math.max(12, Math.min(window.innerHeight - pipDrag.h - 12, pipDrag.st + dy));
+    pipEl.style.right = 'auto';
+    pipEl.style.left = Math.round(x) + 'px';
+    pipEl.style.top = Math.round(y) + 'px';
+  });
+  ['pointerup', 'pointercancel'].forEach((ev) => pipEl.addEventListener(ev, (e) => {
+    if (pipDrag && e.pointerId === pipDrag.id) pipDrag = null;
+  }));
+  pipEl.addEventListener('click', (e) => {
+    if (pipMoved) { pipMoved = false; e.stopImmediatePropagation(); e.preventDefault(); }
+  }, true);
   $('pip').onclick = flipCamera;
 
   function button(cls, icon, label, onClick, action) {
@@ -842,16 +948,25 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     tg.post('web_app_setup_closing_behavior', {need_confirmation: on});
   }
 
+  function findParticipant(t) {
+    const parts = (st && st.participants) || [];
+    if (!parts.length || !t) return null;
+    return parts.find((p) => (t.participantId && (p.id === t.participantId || p.contactId === t.participantId))
+      || (t.name && p.name === t.name)) || null;
+  }
+
   function syncRemoteTiles() {
     const wanted = new Set();
     const tracks = (st && st.videoTracks) || [];
     const now = Date.now();
-    const remoteOff = !!(st && !st.group && st.remoteCamera === false);
     for (let i = 0; i < tracks.length; i++) {
       const t = tracks[i];
       wanted.add(t.id);
-      const tile = ensureRemoteTile(t.id, t.name);
-      tile.wt.textContent = remoteOff ? '对方已关闭摄像头' : '等待对方画面…';
+      const part = findParticipant(t);
+      const remoteOff = st && st.group ? !!(part && part.camera === false) : !!(st && st.remoteCamera === false);
+      const baseName = t.name || (part && part.name) || (st && st.name) || '对方';
+      const tile = ensureRemoteTile(t.id, baseName + (part && part.muted ? ' 🔇' : ''));
+      tile.wt.textContent = remoteOff ? (st && st.group ? '已关闭摄像头' : '对方已关闭摄像头') : '等待对方画面…';
       if (remoteOff && tile.hasFrame) { tile.hasFrame = false; tile.el.classList.remove('has-frame'); }
     }
     for (const [tid, tile] of Array.from(remoteTiles.entries())) {
@@ -860,6 +975,30 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       }
     }
     updateStageLayout();
+  }
+
+  function renderPeers(show) {
+    const box = $('peers');
+    box.innerHTML = '';
+    const list = show && st && Array.isArray(st.participants)
+      ? st.participants.filter((p) => p && !p.self && (p.name || p.id))
+      : [];
+    if (!list.length) { box.hidden = true; return; }
+    for (let i = 0; i < list.length; i++) {
+      const pt = list[i];
+      const pill = document.createElement('span');
+      pill.className = 'peer' + (pt.joined ? '' : ' wait');
+      let label = pt.name || pt.id;
+      if (pt.joined) {
+        if (pt.muted) label += ' 🔇';
+        if (pt.camera) label += ' 📹';
+      } else {
+        label += ' · 呼叫中';
+      }
+      pill.textContent = label;
+      box.appendChild(pill);
+    }
+    box.hidden = false;
   }
 
   function render() {
@@ -879,16 +1018,19 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     else av.textContent = first.toUpperCase();
 
     if (p === 'active') syncRemoteTiles();
-    if (!st.mine && !pending && camStream && !camStarting) stopCamera();
+    if ((!st.mine || !isCameraOn()) && !pending && !reattach && wsOpen && camStream && !camStarting) stopCamera();
     if (st.videoSend && st.videoSend.generation != null && st.videoSend.generation !== lastSendGen) {
       lastSendGen = st.videoSend.generation;
       forceKeyframe = true;
     }
     const showStage = p === 'active' && remoteTiles.size > 0;
-    const showPip = p === 'active' && !!st.mine && isCameraOn() && !!camStream;
+    const showPip = (p === 'calling' || p === 'connecting' || p === 'active') && !!st.mine && isCameraOn() && !!camStream;
     $('stage').hidden = !showStage;
     $('pip').hidden = !showPip;
-    if (showPip && st.videoSend && st.videoSend.active) scheduleCapture();
+    if (showPip && p === 'active' && st.videoSend && st.videoSend.active) scheduleCapture();
+    renderPeers(!!(st.group && (p === 'active' || p === 'connecting' || p === 'calling') && !showStage));
+    syncWorkletTx();
+    syncRingback();
 
     const mainCls = [];
     if (p === 'ringing' || p === 'invite' || p === 'calling') mainCls.push('ringing');
@@ -903,7 +1045,14 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     else if (p === 'dial' && st.dialable) tone = 'live';
     $('timer').hidden = p === 'dial';
     if (p === 'invite' && st.caller) text = '发起人：' + st.caller + ' · ' + text;
-    if (p === 'active' && st.videoCall && !st.group && st.remoteCamera === false) text = '对方已关闭摄像头';
+    if (p === 'active' && !st.group) {
+      if (st.videoCall && st.remoteCamera === false && st.remoteMuted) text = '对方已关闭摄像头并静音';
+      else if (st.videoCall && st.remoteCamera === false) text = '对方已关闭摄像头';
+      else if (st.remoteMuted) text = '对方已静音';
+    } else if (p === 'active' && st.group && showStage && Array.isArray(st.participants) && st.participants.length) {
+      const joinedCnt = st.participants.filter((pt) => pt && pt.joined && !pt.self).length;
+      if (joinedCnt > 0) text = text + ' · ' + joinedCnt + ' 人在会';
+    }
     if (pending && PENDING_TEXT[pending.action]) {
       text = pending.action === 'hangup' && p === 'calling' ? '正在取消…' : PENDING_TEXT[pending.action];
       tone = 'wait';
@@ -950,14 +1099,18 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       }
       if (!$('hint').classList.contains('err')) hint(st.note || '');
     } else if (p === 'calling') {
-      if (!st.mine) addBtn(button('green', ICON.headset, '切换到此设备', () => withMedia('attach', !!st.camera), 'attach'));
+      if (!st.mine) {
+        addBtn(button('green', ICON.headset, '切换到此设备', () => withMedia('attach', !!st.camera), 'attach'));
+      } else if (isCameraOn() && camStream) {
+        addBtn(button('glass', ICON.flip, '翻转镜头', flipCamera, 'flip'));
+      }
       addBtn(button('red', ICON.hangup, '取消', () => act('hangup'), 'hangup'));
     } else if (p === 'connecting' || p === 'active') {
       if (st.mine) {
         const muted = isMuted();
         addBtn(button('glass' + (muted ? ' on' : ''), muted ? ICON.micOff : ICON.mic,
           muted ? '已静音' : '麦克风已开', () => act('mute', {muted: !muted}), 'mute'));
-        if (st.videoCall || st.videoEnabled) {
+        if (st.videoCall || st.videoSend || (st.group && st.videoEnabled)) {
           const camOn = isCameraOn();
           addBtn(button('glass' + (camOn ? ' on' : ''), camOn ? ICON.cam : ICON.camOff,
             camOn ? '摄像头已开' : '摄像头已关', toggleCamera, 'camera'));
@@ -1013,10 +1166,21 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         if (m.handoff) browserHandoff = m.handoff;
         const wasMine = st && st.mine;
         if (m.mine && !wasMine) forceKeyframe = true;
-        st = m; settle(); render();
-        if (!m.mine && !wasMine && audio && LIVE[m.phase] && reattach) {
-          reattach = false; send({type: 'attach'});
+        const wantReattach = !m.mine && audio && LIVE[m.phase] && reattach;
+        if (!LIVE[m.phase] || m.mine) reattach = false;
+        st = m;
+        if (wantReattach) {
+          reattach = false;
+          pending = {action: 'attach', phase: m.phase, at: Date.now()};
+          const mine = pending;
+          setTimeout(() => { if (pending === mine) { pending = null; render(); } }, PENDING_MS);
+          const payload = {type: 'attach', videoCaps: videoCaps};
+          if (m.videoCall || m.videoEnabled || camStream) payload.cameraEnabled = !!camStream;
+          send(payload);
+        } else {
+          settle();
         }
+        render();
       } else if (m.type === 'error') {
         pending = null; render();
         hint(m.message, true);
@@ -1036,8 +1200,10 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     };
     ws.onclose = () => {
       wsOpen = false;
+      stopRingback();
       if (fatal || ended) return;
-      if (audio) reattach = true;
+      if (audio && (reattach || (st && st.mine))) reattach = true;
+      if (st) st.mine = false;
       pending = null;
       if (st) render();
       else setStatus('连接中断，正在重连…', 'wait');

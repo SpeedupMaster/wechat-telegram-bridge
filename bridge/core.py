@@ -85,6 +85,7 @@ from .formatting import (
     quote_inline_text,
     quote_msg_summary,
     wav_to_ogg,
+    wav_voice_meta,
 )
 from .groups import GROUP_COMMANDS, GroupsMixin
 from .login import LoginMixin
@@ -220,6 +221,7 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
         self._calls_caps: dict = {}
         self._calls_video_caps: dict = {}
         self._orphan_call_states: dict[str, dict] = {}
+        self._reject_ready_holds: int = 0
         b = cfg.bridge
         self.call_web: CallWeb | None = (
             _callweb().CallWeb(self, b.call_web_url, b.call_web_listen, b.call_web_app)
@@ -1161,6 +1163,7 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
         reply_to, prefix = await self._resolve_quote(chat, msg)
 
         media: Media | str | None = None
+        voice_meta: tuple[int, bytes] | None = None
         channels_video_err = ""
         wx_dl_s = 0.0
         t = msg.get("type")
@@ -1178,6 +1181,7 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             if isinstance(media, str):
                 log.info("Could not download the attachment of WeChat message %s (type %s): %s", msg["id"], t, media)
             if isinstance(media, Media) and t == VOICE and media.mime == "audio/wav":
+                voice_meta = wav_voice_meta(media.data, path=media.path)
                 if ogg := await (wav_to_ogg(path=media.path) if media.path is not None else wav_to_ogg(media.data)):
                     media.close()
                     media = Media(ogg, "audio/ogg", "voice.ogg")
@@ -1222,6 +1226,7 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             sent = await self._send_tg(
                 chat, thread, header, prefix, msg, media, reply_to, silent,
                 channels_video_err=channels_video_err,
+                voice_meta=voice_meta,
             )
         finally:
             if isinstance(media, Media):
@@ -1348,7 +1353,8 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
         return self._user_to_bot_msg.get(key)
 
     async def _send_tg(self, chat, thread, header, prefix, msg, media, reply_to, silent,
-                       *, channels_video_err: str = "") -> list:
+                       *, channels_video_err: str = "",
+                       voice_meta: tuple[int, bytes] | None = None) -> list:
         async def go(chat_id: int) -> list:
             out = []
             extra_media: list[Media] = []
@@ -1487,6 +1493,11 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
                         force_document=(t == APP and msg.get("appMessageType") == APP_FILE) or (
                             t == VOICE and not send_media.mime.startswith("audio/")),
                     )
+                    if is_voice and voice_meta is not None:
+                        vdur, vwave = voice_meta
+                        kwargs["attributes"] = [
+                            types.DocumentAttributeAudio(duration=vdur, voice=True, waveform=vwave)
+                        ]
                     if is_video:
                         if send_media.mime.startswith("video/"):
                             kwargs["mime_type"] = send_media.mime

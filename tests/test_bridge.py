@@ -606,6 +606,75 @@ class BridgeTests(BridgeTestMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual((s6.file.read(), s6.kwargs["voice_note"], s6.kwargs["force_document"]),
                          (wav_bytes, False, False))
 
+    async def test_voice_note_attaches_duration_and_5bit_waveform_metadata(self):
+        import io
+        import math
+        import struct
+        import wave
+        from unittest.mock import patch
+        from telethon import utils as tg_utils
+        from bridge.formatting import wav_voice_meta
+
+        # Build a 2.6s 16kHz 16-bit mono WAV with loud speech in the middle and silence at the edges
+        rate = 16000
+        nframes = int(rate * 2.6)
+        samples = [
+            int(22000 * math.sin(2 * math.pi * 440 * i / rate)) if (rate * 0.5 <= i < rate * 2.0) else 0
+            for i in range(nframes)
+        ]
+        pcm = struct.pack(f"<{nframes}h", *samples)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(pcm)
+        speech_wav = buf.getvalue()
+
+        meta_mem = wav_voice_meta(speech_wav, bars=63)
+        self.assertIsNotNone(meta_mem)
+        assert meta_mem is not None
+        dur, wf_bytes = meta_mem
+        self.assertEqual(dur, 3)
+        decoded = tg_utils.decode_waveform(wf_bytes)
+        self.assertGreaterEqual(len(decoded), 63)
+        self.assertEqual(decoded[0], 0)
+        self.assertEqual(max(decoded), 31)
+
+        # File-backed WAV produces identical metadata without loading full file via data
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            wav_path = Path(tmp) / "voice.wav"
+            wav_path.write_bytes(speech_wav)
+            self.assertEqual(wav_voice_meta(path=str(wav_path), bars=63), meta_mem)
+
+        # Malformed WAV returns None cleanly
+        self.assertIsNone(wav_voice_meta(b"not-a-wav"))
+
+        # Forwarding a WeChat voice message attaches DocumentAttributeAudio(voice=True, duration, waveform)
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -1001, "Bob")
+        self.daemon.add_message("vo_meta", "wxid_bob", "[Voice]", type_=34)
+        self.daemon.media["vo_meta"] = [
+            {"id": "vom-1", "kind": "voice", "variant": "normal", "actualVariant": "normal",
+             "state": "available", "contentType": "audio/wav", "byteLength": len(speech_wav)},
+        ]
+        self.daemon.media_bytes["vom-1"] = (speech_wav, "audio/wav")
+
+        async def fake_wav_to_ogg(data=b"", *, path=None, timeout=60.0):
+            return b"OggS-fake-opus"
+
+        with patch("bridge.core.wav_to_ogg", side_effect=fake_wav_to_ogg):
+            await self.event("vo_meta", "wxid_bob")
+
+        sent = self.b.bot.sent[-1]
+        self.assertTrue(sent.kwargs["voice_note"])
+        attrs = sent.kwargs.get("attributes")
+        self.assertEqual(len(attrs), 1)
+        self.assertIsInstance(attrs[0], types.DocumentAttributeAudio)
+        self.assertTrue(attrs[0].voice)
+        self.assertEqual(attrs[0].duration, 3)
+        self.assertEqual(attrs[0].waveform, wf_bytes)
+
     async def test_large_video_streamed_to_temp_file_and_removed_after_forward(self):
         import os
         from unittest.mock import patch

@@ -75,6 +75,9 @@ _DEFAULT_VIDEO_CAPS = {
 AUDIO_CHECK_SECONDS = 8
 # Grace window when /media closes before /socket reports call.state(ending/ended) (e.g. remote conference teardown).
 MEDIA_CLOSE_GRACE_SECONDS = 5.0
+# Max queued socket bytes before dropping video frames so real-time audio never stalls behind video.
+VIDEO_WS_MAX_BUFFER = 64 * 1024
+KEYFRAME_REQ_COOLDOWN = 2.0
 
 
 def encode_wxv1_frame(track_or_gen: int, kind: int, flags: int, timestamp_micros: int, payload: bytes) -> bytes:
@@ -278,6 +281,9 @@ class CallSession:
         self._video_started_key: tuple[int, int] | None = None
         self._vtx_seq = 0
         self.video_rx_tracks: dict[int, dict] = {}  # trackId -> track metadata for UI
+        self._rx_need_kf: set[int] = set()
+        self._rx_last_kf_req: dict[int, float] = {}
+        self._tx_last_kf_req: float = 0.0
         self.active_ws: web.WebSocketResponse | None = None
         self.muted = False
         self.changed = asyncio.Event()
@@ -299,24 +305,47 @@ class CallSession:
     async def _participant_name(self, participant_id: str | None) -> str:
         if not participant_id:
             return self.entry.get("caller_name") or ""
-        contact_id = participant_id
+        contact_id = ""
+        part_display = ""
         for p in self.entry.get("participants") or []:
-            if isinstance(p, dict) and p.get("participantId") == participant_id and p.get("contactId"):
-                contact_id = str(p["contactId"])
+            if isinstance(p, dict) and participant_id in (p.get("participantId"), p.get("contactId")):
+                contact_id = str(p.get("contactId") or "")
+                part_display = str(p.get("displayName") or p.get("nickname") or "").strip()
                 break
-        if invitees := self.entry.get("invitees"):
-            if contact_id in invitees:
-                return str(invitees[contact_id])
+        cid = contact_id or participant_id
+        for mapping in (self.entry.get("invitees"), self.entry.get("participant_names")):
+            if isinstance(mapping, dict) and cid in mapping and mapping[cid]:
+                return str(mapping[cid])
+        if remark := self.web.bridge._known_remark(cid):
+            return remark
+        thread_id = self.entry.get("thread_id") or ""
+        if cached := self.web.bridge.names.get((thread_id, cid)):
+            return cached
+        if part_display:
+            return part_display
         if self.entry.get("kind") != "conference":
-            return self.entry.get("caller_name") or contact_id
+            return self.entry.get("caller_name") or cid
+        if cid == self.entry.get("caller_id") and self.entry.get("caller_name"):
+            return str(self.entry["caller_name"])
         try:
             name = await self.web.bridge._sender_name({
-                "threadId": self.entry.get("thread_id") or "",
-                "senderId": contact_id,
+                "threadId": thread_id,
+                "senderId": cid,
             })
-            return name or contact_id
+            if not contact_id and name == cid:
+                # Avoid caching an unresolved opaque participantId before call.state maps it to contactId.
+                self.web.bridge.names.pop((thread_id, cid), None)
+            return name or cid
         except Exception:
-            return contact_id
+            return cid
+
+    async def refresh_participant_names(self) -> None:
+        for meta in list(self.video_rx_tracks.values()):
+            pid = meta.get("participantId")
+            if pid:
+                name = await self._participant_name(pid)
+                if name and name != meta.get("name"):
+                    meta["name"] = name
 
     async def _register_video_rx_track(self, track: dict) -> None:
         tid = track.get("id")
@@ -448,6 +477,9 @@ class CallSession:
                 await self.web.hangup(self.entry, quiet=True)
         except Exception:
             log.exception("Call %s media relay crashed", self.call_id)
+            if not self.entry["terminal"]:
+                await self.web.report(self.entry, "通话媒体中转异常中断")
+                await self.web.hangup(self.entry, quiet=True)
         finally:
             await self.close()
 
@@ -492,6 +524,8 @@ class CallSession:
     async def _on_track_removed(self, track_id) -> None:
         if isinstance(track_id, int) and track_id in self.video_rx_tracks:
             self.video_rx_tracks.pop(track_id, None)
+            self._rx_need_kf.discard(track_id)
+            self._rx_last_kf_req.pop(track_id, None)
             await self._send_page_json({"type": "video_drop", "trackId": track_id})
             await self.web.push_state(self.entry)
             return
@@ -560,24 +594,46 @@ class CallSession:
         except (ConnectionError, RuntimeError):
             pass
 
+    async def _maybe_request_keyframe(self, track_id: int) -> None:
+        if track_id <= 0:
+            return
+        now = time.monotonic()
+        if now - self._rx_last_kf_req.get(track_id, 0.0) < KEYFRAME_REQ_COOLDOWN:
+            return
+        self._rx_last_kf_req[track_id] = now
+        await self.request_keyframe(track_id)
+
     async def _video_to_page(self, ev: dict) -> None:
         self.rx_video_frames += 1
         ws = self.active_ws
         if ws is None or ws.closed:
             return
-        # Drop video frames if the browser socket write buffer is backed up so audio stays crisp.
-        transport = getattr(ws, "_req", None)
-        tr = getattr(transport, "transport", None) if transport is not None else None
-        if tr is not None and getattr(tr, "get_write_buffer_size", lambda: 0)() > 1024 * 1024:
-            return
         payload = ev.get("payload")
         if not isinstance(payload, (bytes, bytearray)) or not payload:
             return
+        track_id = int(ev.get("trackId") or 0)
+        kind = int(ev.get("kind") or WXCM_KIND_JPEG)
+        flags = int(ev.get("flags") or 0)
+        inter_coded = kind in (WXCM_KIND_H264, WXCM_KIND_H265)
+        is_keyframe = bool(flags & 0x01)
+        # Drop video frames early if the browser socket write buffer is backed up so audio stays crisp.
+        transport = getattr(ws, "_req", None)
+        tr = getattr(transport, "transport", None) if transport is not None else None
+        if tr is not None and getattr(tr, "get_write_buffer_size", lambda: 0)() > VIDEO_WS_MAX_BUFFER:
+            if inter_coded:
+                self._rx_need_kf.add(track_id)
+                await self._maybe_request_keyframe(track_id)
+            return
+        if inter_coded and track_id in self._rx_need_kf:
+            if not is_keyframe:
+                await self._maybe_request_keyframe(track_id)
+                return
+            self._rx_need_kf.discard(track_id)
         try:
             frame = encode_wxv1_frame(
-                int(ev.get("trackId") or 0),
-                int(ev.get("kind") or WXCM_KIND_JPEG),
-                int(ev.get("flags") or 0),
+                track_id,
+                kind,
+                flags,
                 int(ev.get("timestampMicros") or 0),
                 bytes(payload),
             )
@@ -634,6 +690,17 @@ class CallSession:
             return
         if parsed["id"] and parsed["id"] != self.video_send_gen:
             return  # drop frame encoded for an older generation
+        if getattr(self.media, "write_buffer_size", lambda: 0)() > VIDEO_WS_MAX_BUFFER * 2:
+            if parsed["kind"] in (WXCM_KIND_H264, WXCM_KIND_H265):
+                now = time.monotonic()
+                if now - self._tx_last_kf_req >= KEYFRAME_REQ_COOLDOWN:
+                    self._tx_last_kf_req = now
+                    await self._send_page_json({
+                        "type": "keyframe_requested",
+                        "trackId": self.video_send_track,
+                        "generation": self.video_send_gen,
+                    })
+            return
         self._vtx_seq += 1
         self.tx_video_frames += 1
         try:
@@ -714,6 +781,7 @@ class CallWeb:
         self.tokens: dict[str, tuple[str, str]] = {}
         self.clients: dict[str, set[web.WebSocketResponse]] = {}  # web token -> open pages
         self.sessions: dict[str, CallSession] = {}  # call_id -> session
+        self._ready_holds: int = 0
         self._tasks: set[asyncio.Task] = set()
         self._runner: web.AppRunner | None = None
         self.bound_port = self.port
@@ -860,6 +928,8 @@ class CallWeb:
             if entry["terminal"] and not sess.closed:
                 await sess.close()
                 return  # close() pushes the final state
+            if not sess.closed and sess.video_rx_tracks:
+                await sess.refresh_participant_names()
         await self.push_state(entry)
 
     async def on_track_event(self, event: dict) -> None:
@@ -906,6 +976,8 @@ class CallWeb:
         return await self._command(cmd)
 
     async def withdraw_readiness(self) -> None:
+        if self._ready_holds > 0 or getattr(self.bridge, "_reject_ready_holds", 0) > 0:
+            return
         if any(s.readied and not s.closed for s in self.sessions.values()):
             return  # another live call still needs it
         sock = self.bridge._calls_sock
@@ -928,6 +1000,7 @@ class CallWeb:
         want_cam = bool(is_video if camera_enabled is None else camera_enabled) if is_video else False
         ready_video = _sanitize_video_caps(video_caps) if (is_video and self.can_video(False)) else None
         entry["answering"] = True
+        self._ready_holds += 1
         readied = False
         claimed = False
         try:
@@ -992,6 +1065,7 @@ class CallWeb:
             self._start_session(entry, owner_token, readied, ws, camera_enabled=want_cam)
         finally:
             entry["answering"] = False
+            self._ready_holds = max(0, self._ready_holds - 1)
             if readied and not claimed:
                 await self.withdraw_readiness()
         await self.bridge._sync_call_msg(entry)
@@ -1006,6 +1080,7 @@ class CallWeb:
         want_cam = bool(camera_enabled) if want_video else False
         ready_video = _sanitize_video_caps(video_caps) if want_video else None
         inv["joining"] = True
+        self._ready_holds += 1
         readied = False
         claimed = False
         try:
@@ -1041,6 +1116,7 @@ class CallWeb:
             await self.bridge._replay_orphan_call_state(call_id)
         finally:
             inv["joining"] = False
+            self._ready_holds = max(0, self._ready_holds - 1)
             if readied and not claimed:
                 await self.withdraw_readiness()
         await self.bridge._sync_call_msg(entry)
@@ -1074,6 +1150,7 @@ class CallWeb:
         want_cam = bool(True if camera_enabled is None else camera_enabled) if is_video else False
         ready_video = _sanitize_video_caps(video_caps) if (is_video or (conf and self.can_video(True))) else None
         req["dialing"] = True
+        self._ready_holds += 1
         readied = False
         claimed = False
         entry = None
@@ -1116,6 +1193,7 @@ class CallWeb:
             await self.bridge._replay_orphan_call_state(call_id)
         finally:
             req["dialing"] = False
+            self._ready_holds = max(0, self._ready_holds - 1)
             if readied and not claimed:
                 await self.withdraw_readiness()
         await self.bridge._sync_call_msg(entry)
@@ -1184,6 +1262,25 @@ class CallWeb:
         await self.push_state(sess.entry)
 
     # ------------------------------------------------------------------ page state
+    def _sync_participant_name(self, entry: dict, p: dict) -> str:
+        cid = str(p.get("contactId") or "").strip()
+        pid = str(p.get("participantId") or "").strip()
+        key = cid or pid
+        for mapping in (entry.get("invitees"), entry.get("participant_names")):
+            if isinstance(mapping, dict) and key in mapping and mapping[key]:
+                return str(mapping[key])
+        if cid and (remark := self.bridge._known_remark(cid)):
+            return remark
+        thread_id = entry.get("thread_id") or ""
+        if cid and (cached := self.bridge.names.get((thread_id, cid))):
+            return cached
+        for field in ("displayName", "nickname"):
+            if val := str(p.get(field) or "").strip():
+                return val
+        if cid and cid == entry.get("caller_id") and entry.get("caller_name"):
+            return str(entry["caller_name"])
+        return key
+
     def _state(self, token: str, ws: web.WebSocketResponse | None) -> dict:
         kind, ref = self.tokens.get(token, ("", ""))
         st: dict = {
@@ -1191,7 +1288,7 @@ class CallWeb:
             "mine": False, "muted": False, "camera": False, "elapsed": None, "rate": 16000, "frame": 320,
             "answerable": False, "joinable": False, "dialable": False, "group": False,
             "videoCall": False, "videoEnabled": False, "videoSend": None, "videoTracks": [],
-            "remoteCamera": None, "participants": [],
+            "remoteCamera": None, "remoteMuted": None, "participants": [],
         }
         if kind in ("dial", "vdial"):
             req = self.bridge._dial_requests.get(ref)
@@ -1248,17 +1345,19 @@ class CallWeb:
         st.update(
             title=title, name=entry.get("caller_name") or "", status=entry.get("status_text") or "",
             group=conf, videoCall=is_video, videoEnabled=self.can_video(conf),
-            remoteCamera=entry.get("remote_camera"),
+            remoteCamera=entry.get("remote_camera"), remoteMuted=entry.get("remote_muted"),
         )
         if conf and entry.get("participants"):
-            invitees = entry.get("invitees") or {}
+            self_wxid = getattr(self.bridge, "_self_wxid", "") or ""
             st["participants"] = [
                 {
                     "id": p.get("participantId") or p.get("contactId") or "",
-                    "name": invitees.get(p.get("contactId")) or p.get("contactId") or "",
+                    "contactId": p.get("contactId") or "",
+                    "name": self._sync_participant_name(entry, p),
                     "joined": p.get("membership") == "joined",
                     "muted": (not p["microphoneEnabled"]) if "microphoneEnabled" in p else None,
                     "camera": p.get("cameraEnabled"),
+                    "self": bool(self_wxid and p.get("contactId") == self_wxid),
                 }
                 for p in entry["participants"] if isinstance(p, dict)
             ]
@@ -1576,6 +1675,10 @@ class CallWeb:
                 sess.attach(ws)
                 if prev is not None and prev is not ws:
                     await _safe_send(prev, self._state(token, prev))
+                if prev is not ws:
+                    for tid, meta in list(sess.video_rx_tracks.items()):
+                        if meta.get("active", True) and meta.get("codec") in ("h264", "h265"):
+                            await sess._maybe_request_keyframe(tid)
                 if (cam_opt is not None and cam_opt != sess.camera_enabled
                         and self.bridge._calls_protocol_version >= 3
                         and (entry.get("call_type") == "video" or sess.video_send_track is not None)):

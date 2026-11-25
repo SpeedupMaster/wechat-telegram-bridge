@@ -1236,3 +1236,228 @@ class CallMediaSocketTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await wx.close()
             await runner.cleanup()
+
+    async def test_calls_socket_active_ping_keepalive_and_dead_peer_timeout(self):
+        import base64
+        import hashlib
+        import struct
+        from bridge.wechat import CallsSocket
+
+        client_pings = 0
+        answer_pings = True
+
+        def ws_frame(opcode: int, payload: bytes) -> bytes:
+            return bytes([0x80 | opcode, len(payload)]) + payload
+
+        async def read_client_frame(reader: asyncio.StreamReader):
+            try:
+                hdr = await reader.readexactly(2)
+            except asyncio.IncompleteReadError:
+                return None
+            opcode = hdr[0] & 0x0F
+            masked = (hdr[1] & 0x80) != 0
+            length = hdr[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", await reader.readexactly(2))[0]
+            mask = await reader.readexactly(4) if masked else b""
+            data = await reader.readexactly(length) if length else b""
+            if masked and data:
+                data = bytes(b ^ mask[i & 3] for i, b in enumerate(data))
+            return opcode, data
+
+        async def handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+            nonlocal client_pings
+            try:
+                req = await reader.readuntil(b"\r\n\r\n")
+                lines = req.decode("latin-1").split("\r\n")
+                hdrs = {k.strip().lower(): v.strip() for ln in lines[1:] if ":" in ln for k, _, v in [ln.partition(":")]}
+                accept = base64.b64encode(
+                    hashlib.sha1((hdrs["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+                ).decode()
+                writer.write((
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode())
+                await writer.drain()
+                op, _ = await read_client_frame(reader)
+                self.assertEqual(op, 0x1)
+                writer.write(ws_frame(0x1, json.dumps({"type": "hello", "protocolVersion": 3, "clientId": "kp"}).encode()))
+                await writer.drain()
+
+                while (frame := await read_client_frame(reader)) is not None:
+                    fop, fdata = frame
+                    if fop == 0x8:
+                        break
+                    if fop == 0x9:
+                        client_pings += 1
+                        if answer_pings:
+                            writer.write(ws_frame(0xA, fdata))
+                            if client_pings == 2:
+                                writer.write(ws_frame(0x1, json.dumps({"type": "call.pending", "offer": None}).encode()))
+                            await writer.drain()
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        server = await asyncio.start_server(handle_conn, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            # 1) Quiet server that answers Pings stays connected across multiple idle intervals and delivers events
+            sock = await CallsSocket.connect(f"http://127.0.0.1:{port}/v1/accounts/acc1/calls/socket", "tok")
+            sock.idle_ping_seconds = 0.04
+            sock.pong_timeout_seconds = 0.08
+            await sock.handshake()
+            it = sock.events()
+            ev = await asyncio.wait_for(anext(it), timeout=1.0)
+            self.assertEqual(ev["type"], "call.pending")
+            self.assertGreaterEqual(client_pings, 2)
+            await sock.close()
+
+            # 2) Half-open dead server that stops answering Pings raises TimeoutError cleanly
+            answer_pings = False
+            sock2 = await CallsSocket.connect(f"http://127.0.0.1:{port}/v1/accounts/acc1/calls/socket", "tok")
+            sock2.idle_ping_seconds = 0.04
+            sock2.pong_timeout_seconds = 0.04
+            await sock2.handshake()
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(anext(sock2.events()), timeout=1.0)
+            await sock2.close()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
+class CallConcurrencyAndCrashHardeningTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import aiohttp
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cfg = Config(
+            WeChatConfig(token="secret-token"),
+            TelegramConfig(api_id=1, api_hash="x", bot_token="123:abc"),
+            BridgeConfig(
+                create_interval_seconds=0, sync_avatar=False,
+                call_web_url="http://127.0.0.1/wxcall", call_web_listen="127.0.0.1:0",
+            ),
+            Path(self.tmp.name) / "config.toml",
+        )
+        self.daemon = FakeDaemon()
+        self.b = Bridge(cfg, user_client=FakeUser(), bot_client=FakeBot())
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(self.daemon.handler),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        self.b.bot_input = object()
+        self.b.bot_me = SimpleNamespace(username="mybot")
+        self.b.tg_ready.set()
+        self.b.wx_ready = True
+        self.b.owner_id = 999
+        await self.b.wx.resolve_account()
+        self.sock = _FakeCallsSocket()
+        self.b._calls_sock = self.sock
+        await self.b.call_web.start()
+        self.http = aiohttp.ClientSession()
+        self.base = f"http://127.0.0.1:{self.b.call_web.bound_port}/wxcall"
+        await self.b.handle_call_event({
+            "type": "hello", "protocolVersion": 3, "clientId": "ctl-race", "conferenceInvitations": [],
+            "capabilities": {"directAudio": True, "directVideo": True},
+            "audioFormat": {"sampleRate": 16000, "channels": 1, "frameMs": 20},
+        })
+
+    async def asyncTearDown(self):
+        await self.http.close()
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+
+    async def test_withdraw_readiness_does_not_revoke_inflight_answer_or_reject(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.daemon.add_thread("wxid_bob", "Bob")
+
+        # Call A is pending (will be rejected) while Call B is simultaneously mid-answer awaiting call.offered
+        await self.b.handle_call_event({"type": "call.pending", "offer": {
+            "callId": "call-a", "revision": 1, "kind": "direct", "callType": "voice", "callerId": "wxid_alice"}})
+        await self.b.handle_call_event({"type": "call.pending", "offer": {
+            "callId": "call-b", "revision": 1, "kind": "direct", "callType": "voice", "callerId": "wxid_bob"}})
+
+        b_ready_sent = asyncio.Event()
+        release_b_offer = asyncio.Event()
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.ready" and cmd.get("ready"):
+                cid = (cmd.get("scope") or {}).get("callId")
+                if cid == "call-a":
+                    await self.b.handle_call_event({"type": "call.offered", "offer": {
+                        "callId": "call-a", "revision": 2, "kind": "direct", "callType": "voice",
+                        "callerId": "wxid_alice"}})
+                elif cid == "call-b":
+                    b_ready_sent.set()
+                    async def deliver_b():
+                        await release_b_offer.wait()
+                        await self.b.handle_call_event({"type": "call.offered", "offer": {
+                            "callId": "call-b", "revision": 2, "kind": "direct", "callType": "voice",
+                            "callerId": "wxid_bob"}})
+                    asyncio.create_task(deliver_b())
+                return {"type": "command.result", "status": "accepted"}
+            if cmd["type"] == "call.answer":
+                return {"type": "command.result", "status": "accepted", "callId": "call-b", "ownerToken": "own-b"}
+            return {"type": "command.result", "status": "accepted"}
+
+        self.sock.on_command = on_cmd
+        entry_a = self.b._active_calls["call-a"]
+        entry_b = self.b._active_calls["call-b"]
+
+        ans_task = asyncio.create_task(self.b.call_web.answer(entry_b, None))
+        await asyncio.wait_for(b_ready_sent.wait(), timeout=2.0)
+
+        # Reject Call A while Call B is still awaiting offered_event (before Call B enters sessions)
+        await self.b._reject_call(entry_a)
+        ready_false_mid = [c for c in self.sock.commands if c["type"] == "call.ready" and not c.get("ready")]
+        self.assertEqual(ready_false_mid, [], "must not revoke call.ready while Call B is mid-answer")
+
+        # Now let Call B finish answering and then end -> readiness is cleanly withdrawn at the end
+        release_b_offer.set()
+        await asyncio.wait_for(ans_task, timeout=2.0)
+        self.assertTrue(self.b.call_web.has_session("call-b"))
+        await self.b.handle_call_event({"type": "call.state", "call": {
+            "callId": "call-b", "revision": 3, "kind": "direct", "callType": "voice",
+            "direction": "incoming", "state": "ended", "ownedByThisClient": True}})
+        ready_false_end = [c for c in self.sock.commands if c["type"] == "call.ready" and not c.get("ready")]
+        self.assertEqual(len(ready_false_end), 1)
+
+    async def test_unexpected_media_crash_reports_and_hangs_up_call(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+
+        async def broken_call_media(call_id, client_id, owner_token, timeout=10.0):
+            raise RuntimeError("unexpected codec explosion")
+
+        self.b.wx.call_media = broken_call_media
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.answer":
+                async def connected():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "crash-1", "revision": 3, "kind": "direct", "callType": "voice",
+                        "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+                asyncio.create_task(connected())
+                return {"type": "command.result", "status": "accepted", "callId": "crash-1", "ownerToken": "own-cr"}
+            return {"type": "command.result", "status": "accepted"}
+
+        self.sock.on_command = on_cmd
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "crash-1", "revision": 2, "kind": "direct", "callType": "voice", "callerId": "wxid_alice"}})
+        entry = self.b._active_calls["crash-1"]
+        await self.b.call_web.answer(entry, None)
+
+        for _ in range(100):
+            if any(c["type"] == "call.hangup" for c in self.sock.commands):
+                break
+            await asyncio.sleep(0.01)
+        self.assertIn("call.hangup", [c["type"] for c in self.sock.commands])
+        self.assertTrue(any("媒体中转异常中断" in m.text for m in self.b.bot.sent))

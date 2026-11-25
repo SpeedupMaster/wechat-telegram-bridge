@@ -254,20 +254,55 @@ class CallsMixin:
         return "\n<blockquote expandable>" + "\n".join(out) + "</blockquote>"
 
     @staticmethod
-    def _apply_call_control(entry: dict, ctrl: dict) -> None:
+    def _apply_call_control(entry: dict, ctrl: dict, *, participant_id: str = "", self_wxid: str = "") -> None:
         if not isinstance(ctrl, dict):
+            return
+        if participant_id and self_wxid and participant_id == self_wxid:
             return
         kind = ctrl.get("kind")
         if kind == "camera" and "enabled" in ctrl:
-            entry["remote_camera"] = bool(ctrl["enabled"])
+            val = bool(ctrl["enabled"])
+            entry["remote_camera"] = val
+            if participant_id and entry.get("participants"):
+                for p in entry["participants"]:
+                    if isinstance(p, dict) and participant_id in (p.get("participantId"), p.get("contactId")):
+                        p["cameraEnabled"] = val
         elif kind == "microphone" and "muted" in ctrl:
-            entry["remote_muted"] = bool(ctrl["muted"])
+            muted = bool(ctrl["muted"])
+            entry["remote_muted"] = muted
+            if participant_id and entry.get("participants"):
+                for p in entry["participants"]:
+                    if isinstance(p, dict) and participant_id in (p.get("participantId"), p.get("contactId")):
+                        p["microphoneEnabled"] = not muted
+
+    async def _warm_participant_names(self, entry: dict) -> None:
+        if entry.get("kind") != "conference" or not entry.get("participants"):
+            return
+        invitees = entry.get("invitees") or {}
+        pnames = entry.setdefault("participant_names", {})
+        thread_id = entry.get("thread_id") or ""
+        for p in entry["participants"]:
+            if not isinstance(p, dict):
+                continue
+            cid = str(p.get("contactId") or "").strip()
+            if not cid or cid == self._self_wxid or cid in invitees or cid in pnames:
+                continue
+            try:
+                name = await self._sender_name({"threadId": thread_id, "senderId": cid})
+                if name:
+                    pnames[cid] = name
+            except Exception:
+                pass
 
     async def _on_call_control(self, event: dict) -> None:
         entry = self._active_calls.get(event.get("callId") or "")
         if entry is None:
             return
-        self._apply_call_control(entry, event.get("control") or {})
+        self._apply_call_control(
+            entry, event.get("control") or {},
+            participant_id=str(event.get("participantId") or ""),
+            self_wxid=self._self_wxid,
+        )
         if self.call_web is not None:
             await self.call_web.push_state(entry)
 
@@ -289,6 +324,7 @@ class CallsMixin:
         if not replaced:
             parts.append(part)
         entry["participants"] = parts
+        await self._warm_participant_names(entry)
         await self._sync_call_msg(entry)
 
     async def _on_invitation_result(self, event: dict) -> None:
@@ -464,7 +500,7 @@ class CallsMixin:
                 "callType": call.get("callType") or "voice",
                 "callerId": caller_id,
                 "groupId": call.get("groupId"),
-            }, stage=state if state == "offered" else state)
+            }, stage=state)
             entry = self._active_calls.get(call_id)
             if entry is None:
                 return
@@ -480,9 +516,14 @@ class CallsMixin:
             entry["call_type"] = call["callType"]
         if conf and isinstance(call.get("participants"), list):
             entry["participants"] = call["participants"]
+            await self._warm_participant_names(entry)
         for item in call.get("controls") or []:
             if isinstance(item, dict):
-                self._apply_call_control(entry, item.get("control") or {})
+                self._apply_call_control(
+                    entry, item.get("control") or {},
+                    participant_id=str(item.get("participantId") or ""),
+                    self_wxid=self._self_wxid,
+                )
         if state == "offered":
             entry["stage"] = "offered"
             entry["status_text"] = "🔔 响铃中…"
@@ -525,10 +566,16 @@ class CallsMixin:
         await self._sync_call_msg(entry)
 
     def _render_invite(self, inv: dict) -> tuple[str, list | None]:
-        text = _card("📞 <b>微信群语音通话邀请</b>",
+        web = self.call_web
+        if inv.get("call_type") == "video":
+            title = "📹 <b>微信群视频通话邀请</b>"
+        elif web is not None and web.can_video(True):
+            title = "📞 <b>微信群通话邀请</b>"
+        else:
+            title = "📞 <b>微信群语音通话邀请</b>"
+        text = _card(title,
                      [f"发起人：<b>{_esc(inv['caller_name'])}</b>",
                       f"状态：{inv['status_text']}"])
-        web = self.call_web
         if web is not None and inv.get("live") and web.can_join():
             return text, [[Button.url("📞 加入", web.link(web.token_for_invite(inv)))]]
         return text, None
@@ -559,6 +606,8 @@ class CallsMixin:
             caller_id = inv.get("callerId") or ""
             if known := self._conf_invites.get(inv_id):
                 known["revision"] = inv.get("revision", known.get("revision", 0))
+                if inv.get("callType") in ("voice", "video"):
+                    known["call_type"] = inv["callType"]
                 continue
             if not group_id:
                 continue
@@ -568,6 +617,7 @@ class CallsMixin:
             entry = {
                 "invitation_id": inv_id,
                 "revision": inv.get("revision", 0),
+                "call_type": inv.get("callType") or "",
                 "group_id": group_id,
                 "group_name": thread.get("displayName") or group_id,
                 "caller_id": caller_id,
@@ -632,8 +682,11 @@ class CallsMixin:
         call_id = entry["call_id"]
         entry["rejecting"] = True
         readied = False
+        held = False
         try:
             if entry["stage"] == "pending":
+                self._reject_ready_holds = getattr(self, "_reject_ready_holds", 0) + 1
+                held = True
                 entry["offered_event"].clear()
                 res = await sock.command({
                     "type": "call.ready",
@@ -691,10 +744,12 @@ class CallsMixin:
             await self._report_call_reject_failure(entry, f"拒接请求失败：{e}")
         finally:
             entry["rejecting"] = False
+            if held:
+                self._reject_ready_holds = max(0, getattr(self, "_reject_ready_holds", 1) - 1)
             if readied and not sock.closed:
                 if self.call_web is not None:
                     await self.call_web.withdraw_readiness()
-                else:
+                elif getattr(self, "_reject_ready_holds", 0) == 0:
                     try:
                         await sock.command({
                             "type": "call.ready",

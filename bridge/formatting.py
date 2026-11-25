@@ -1,15 +1,18 @@
 """Message formatting, help texts, bot command menus, media helpers, and @mention matching."""
 from __future__ import annotations
 
+import array
 import asyncio
 import html
 import io
 import logging
 import os
 import re
+import sys
 import time
+import wave
 
-from telethon import Button, errors, types
+from telethon import Button, errors, types, utils
 
 from . import cards, stickers, tghtml
 from .emojis import replace_wx_emojis, unicode_to_wx_emojis
@@ -82,6 +85,66 @@ def _is_official_account(thread: dict | str | None) -> bool:
     if cls.get("category") == "business":
         return True
     return str(thread.get("id") or "").startswith("gh_")
+
+
+def wav_voice_meta(data: bytes = b"", *, path: str | None = None, bars: int = 63) -> tuple[int, bytes] | None:
+    """Extract (duration_seconds, 5-bit Telegram waveform) from a PCM WAV without third-party dependencies."""
+    if path is None and not data:
+        return None
+    try:
+        src = path if path is not None else io.BytesIO(data)
+        with wave.open(src, "rb") as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            if framerate <= 0 or nframes <= 0 or nchannels <= 0 or sampwidth not in (1, 2, 3, 4):
+                return None
+            duration = max(1, round(nframes / framerate))
+            num_bars = max(16, min(int(bars), 100))
+            peaks: list[int] = []
+            frame_bytes = nchannels * sampwidth
+            for i in range(num_bars):
+                start = i * nframes // num_bars
+                end = max(start + 1, (i + 1) * nframes // num_bars)
+                wf.setpos(min(start, nframes - 1))
+                raw = wf.readframes(min(end - start, 1024))
+                if not raw:
+                    peaks.append(0)
+                    continue
+                if sampwidth == 2:
+                    usable = len(raw) - (len(raw) % 2)
+                    arr = array.array("h")
+                    arr.frombytes(raw[:usable])
+                    if sys.byteorder != "little":
+                        arr.byteswap()
+                    peak = max((abs(v) for v in arr), default=0)
+                elif sampwidth == 1:
+                    peak = max((abs(b - 128) for b in raw), default=0)
+                elif sampwidth == 4:
+                    usable = len(raw) - (len(raw) % 4)
+                    arr4 = array.array("i")
+                    arr4.frombytes(raw[:usable])
+                    if sys.byteorder != "little":
+                        arr4.byteswap()
+                    peak = max((abs(v) for v in arr4), default=0)
+                else:
+                    usable = len(raw) - (len(raw) % 3)
+                    peak = max(
+                        (abs(int.from_bytes(raw[j:j + 3], "little", signed=True)) for j in range(0, usable, 3)),
+                        default=0,
+                    )
+                if len(raw) < frame_bytes:
+                    peak = 0
+                peaks.append(peak)
+        top = max(peaks, default=0)
+        if top <= 0:
+            levels = bytes(num_bars)
+        else:
+            levels = bytes(min(31, max(0, round(31 * ((p / top) ** 0.7)))) for p in peaks)
+        return duration, utils.encode_waveform(levels)
+    except Exception:
+        return None
 
 
 async def wav_to_ogg(data: bytes = b"", *, path: str | None = None, timeout: float = 60.0) -> bytes | None:

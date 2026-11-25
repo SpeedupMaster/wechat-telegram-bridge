@@ -25,6 +25,8 @@ log = logging.getLogger("wechat")
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_WS_FRAME = 4 * 1024 * 1024
+_WS_IDLE_PING_SECONDS = 45.0
+_WS_PONG_TIMEOUT_SECONDS = 15.0
 
 # Calls Protocol v3 (agent-wechat >= 3.0) with v2 fallback (agent-wechat <= 2.9).
 CALL_PROTOCOL_VERSIONS = (3, 2)
@@ -1115,9 +1117,13 @@ def _ws_mask(payload: bytes, mask: bytes) -> bytes:
 class CallsSocket:
     """Minimal RFC 6455 WebSocket client for the calls control socket and a call's media socket."""
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *,
+                 idle_ping_seconds: float = _WS_IDLE_PING_SECONDS,
+                 pong_timeout_seconds: float = _WS_PONG_TIMEOUT_SECONDS):
         self.reader = reader
         self.writer = writer
+        self.idle_ping_seconds = idle_ping_seconds
+        self.pong_timeout_seconds = pong_timeout_seconds
         self._write_lock = asyncio.Lock()
         self._pending_cmds: dict[str, asyncio.Future[dict]] = {}
         self._queue: asyncio.Queue[dict | Exception | None] = asyncio.Queue()
@@ -1131,6 +1137,12 @@ class CallsSocket:
     @property
     def closed(self) -> bool:
         return self._closed or self._closing
+
+    def write_buffer_size(self) -> int:
+        tr = getattr(self.writer, "transport", None)
+        if tr is not None and hasattr(tr, "get_write_buffer_size"):
+            return int(tr.get_write_buffer_size())
+        return 0
 
     @classmethod
     async def connect(cls, url: str, token: str, timeout: float = 10.0) -> CallsSocket:
@@ -1206,27 +1218,43 @@ class CallsSocket:
     async def send_bytes(self, data: bytes) -> None:
         await self._send_frame(0x2, data)
 
-    async def _recv_frame(self, read_timeout: float = 90.0) -> tuple[int, bytes] | None:
+    async def _recv_frame(self, read_timeout: float = 90.0, *, keepalive: bool = False) -> tuple[int, bytes] | None:
         chunks: list[bytes] = []
         data_opcode: int | None = None
+        awaiting_pong = False
         while True:
+            hdr_timeout = (
+                (self.pong_timeout_seconds if awaiting_pong else self.idle_ping_seconds)
+                if keepalive else read_timeout
+            )
             try:
-                hdr = await asyncio.wait_for(self.reader.readexactly(2), timeout=read_timeout)
+                hdr = await asyncio.wait_for(self.reader.readexactly(2), timeout=hdr_timeout)
+            except asyncio.TimeoutError:
+                if not keepalive or awaiting_pong or self.closed:
+                    raise
+                try:
+                    await self._send_frame(0x9, b"hb")
+                except Exception:
+                    return None
+                awaiting_pong = True
+                continue
             except (asyncio.IncompleteReadError, ConnectionError, EOFError):
                 return None
+            body_timeout = self.pong_timeout_seconds if keepalive else read_timeout
             b0, b1 = hdr[0], hdr[1]
             fin = (b0 & 0x80) != 0
             opcode = b0 & 0x0F
             masked = (b1 & 0x80) != 0
             length = b1 & 0x7F
             if length == 126:
-                length = struct.unpack("!H", await asyncio.wait_for(self.reader.readexactly(2), timeout=read_timeout))[0]
+                length = struct.unpack("!H", await asyncio.wait_for(self.reader.readexactly(2), timeout=body_timeout))[0]
             elif length == 127:
-                length = struct.unpack("!Q", await asyncio.wait_for(self.reader.readexactly(8), timeout=read_timeout))[0]
+                length = struct.unpack("!Q", await asyncio.wait_for(self.reader.readexactly(8), timeout=body_timeout))[0]
             if length > _MAX_WS_FRAME:
                 raise WeChatError(502, "frame_too_large", True)
-            mask = await asyncio.wait_for(self.reader.readexactly(4), timeout=read_timeout) if masked else b""
-            payload = await asyncio.wait_for(self.reader.readexactly(length), timeout=read_timeout) if length else b""
+            mask = await asyncio.wait_for(self.reader.readexactly(4), timeout=body_timeout) if masked else b""
+            payload = await asyncio.wait_for(self.reader.readexactly(length), timeout=body_timeout) if length else b""
+            awaiting_pong = False
             if masked and payload:
                 payload = _ws_mask(payload, mask)
 
@@ -1318,7 +1346,7 @@ class CallsSocket:
     async def _read_loop(self) -> None:
         try:
             while True:
-                frame = await self._recv_frame()
+                frame = await self._recv_frame(keepalive=True)
                 if frame is None:
                     break
                 opcode, body = frame
