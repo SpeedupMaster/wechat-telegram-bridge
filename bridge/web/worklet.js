@@ -4,6 +4,7 @@ class BridgeIO extends AudioWorkletProcessor {
     super();
     const p = (o && o.processorOptions) || {};
     this.tx = true;
+    this.speaker = false;
     this.rxEnv = 0;
     this.micGain = 1;
     this.tracks = new Map();
@@ -14,6 +15,7 @@ class BridgeIO extends AudioWorkletProcessor {
       else if (d.t === 'drop') this.tracks.delete(d.id);
       else if (d.t === 'rate') this.setRate(d.net, d.frame);
       else if (d.t === 'tx') this.tx = !!d.on;
+      else if (d.t === 'speaker') this.speaker = !!d.on;
     };
   }
   setRate(net, frame) {
@@ -104,7 +106,8 @@ class BridgeIO extends AudioWorkletProcessor {
       }
       for (let c = 1; c < out.length; c++) out[c].set(ch);
       const rxRms = ch.length ? Math.sqrt(rxEnergy / ch.length) : 0;
-      const holdDecay = Math.exp(-ch.length / (sampleRate * 0.14));
+      const decaySec = this.speaker ? 0.18 : 0.14;
+      const holdDecay = Math.exp(-ch.length / (sampleRate * decaySec));
       this.rxEnv = rxRms > this.rxEnv ? (this.rxEnv + (rxRms - this.rxEnv) * 0.65) : (this.rxEnv * holdDecay);
     }
 
@@ -112,14 +115,16 @@ class BridgeIO extends AudioWorkletProcessor {
     const inp = inputs[0] && inputs[0][0];
     if (inp && this.tx) {
       let targetGain = 1;
-      if (this.rxEnv > 0.015 && inp.length) {
+      const refEnv = this.speaker ? this.rxEnv * 1.35 : this.rxEnv;
+      if (refEnv > 0.015 && inp.length) {
         let txEnergy = 0;
         for (let i = 0; i < inp.length; i++) txEnergy += inp[i] * inp[i];
         const txRms = Math.sqrt(txEnergy / inp.length);
         // Suppress speakerphone bleed when far-end dominates; open immediately on near-end double-talk
-        const dtThresh = Math.max(0.045, this.rxEnv * 0.55);
+        const dtThresh = Math.max(this.speaker ? 0.055 : 0.045, refEnv * (this.speaker ? 0.65 : 0.55));
         if (txRms < dtThresh) {
-          targetGain = 0.15 + 0.85 * Math.pow(txRms / dtThresh, 2);
+          const floor = this.speaker ? 0.10 : 0.15;
+          targetGain = floor + (1 - floor) * Math.pow(txRms / dtThresh, 2);
         }
       }
       const gAlpha = targetGain > this.micGain ? 0.25 : 0.08;

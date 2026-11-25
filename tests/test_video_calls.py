@@ -639,6 +639,7 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
     async def test_video_page_serves_stage_pip_and_wxv1_media_engine(self):
         async with self.http.get(self.base + "/call/sometoken") as r:
             self.assertEqual(r.status, 200)
+            self.assertIn("speaker-selection=(self)", r.headers.get("Permissions-Policy", ""))
             body = await r.text()
         for marker in (
             'id="stage"',
@@ -650,6 +651,8 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
             '摄像头已开',
             '摄像头已关',
             '麦克风已开',
+            '扬声器已开',
+            '扬声器已关',
             '翻转镜头',
             '对方已关闭摄像头',
             "$('pip').onclick = flipCamera",
@@ -935,6 +938,16 @@ for (let k = 0; k < 20; k++) pAec.process([[doubleTalk]], [[new Float32Array(128
 const dtPeak = Math.max(...Array.from(pAec.emitted[pAec.emitted.length - 1], (x) => Math.abs(x)));
 if (!(dtPeak > 15000)) throw new Error('Expected double-talk speech preserved (>15000), got ' + dtPeak);
 
+// Hands-free speaker=true mode applies even stronger bleed attenuation while preserving double-talk
+const pSpk = new Proc48k({{processorOptions: {{net: 16000, frame: 320}}}});
+pSpk.port.onmessage({{data: {{t: 'speaker', on: true}}}});
+pSpk.port.onmessage({{data: {{t: 'pcm', id: 9, pcm: farSpeech}}}});
+for (let k = 0; k < 20; k++) pSpk.process([[echoBleed]], [[new Float32Array(128)]]);
+const spkSuppressedPeak = Math.max(...Array.from(pSpk.emitted[pSpk.emitted.length - 1], (x) => Math.abs(x)));
+if (!(spkSuppressedPeak < suppressedPeak)) {{
+  throw new Error('Expected speaker=true stronger suppression (' + spkSuppressedPeak + ' vs ' + suppressedPeak + ')');
+}}
+
 console.log('WORKLET_OK');
 """
         res = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=15)
@@ -1079,13 +1092,28 @@ class FakeAudioContext {{
     return {{type: 'sine', frequency: {{value: 0}}, connect() {{}}, start() {{}}, stop() {{}}, disconnect() {{}}}};
   }}
   createGain() {{
+    const g = {{
+      gain: {{
+        value: 1,
+        setValueAtTime(v) {{ this.value = v; }},
+        linearRampToValueAtTime(v) {{ this.value = v; }},
+        setTargetAtTime(v) {{ this.value = v; }},
+      }},
+      connect() {{}},
+      disconnect(target) {{ if (target && target.isDest) aecDisconnectedDest++; }},
+    }};
+    FakeAudioContext.gains.push(g);
+    return g;
+  }}
+  createDynamicsCompressor() {{
     return {{
-      gain: {{value: 1, setValueAtTime() {{}}, linearRampToValueAtTime() {{}}}},
+      threshold: {{value: 0}}, knee: {{value: 0}}, ratio: {{value: 1}}, attack: {{value: 0}}, release: {{value: 0}},
       connect() {{}},
       disconnect(target) {{ if (target && target.isDest) aecDisconnectedDest++; }},
     }};
   }}
 }}
+FakeAudioContext.gains = [];
 class FakeWorkletNode {{
   constructor() {{
     this.port = {{ onmessage: null, postMessage: (m) => workletMsgs.push(m) }};
@@ -1221,39 +1249,76 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
     throw new Error('Expected automatic attach with cameraEnabled=true on reconnect, got ' + JSON.stringify(attachMsg));
   }}
 
-  // Outgoing calling state shows PiP self-preview and triggers 450Hz ringback oscillator
+  // Outgoing calling state shows PiP self-preview, triggers 450Hz ringback oscillator, and does NOT show speaker toggle before connected
   ws2.onmessage({{data: JSON.stringify({{
     type: 'state', phase: 'calling', title: '微信视频通话', name: 'Alice', status: '🔔 对方响铃中…',
     mine: true, muted: false, camera: true, videoCall: true, videoEnabled: true, rate: 16000, frame: 320,
   }})}});
   if (els.pip.hidden) throw new Error('Expected self-preview PiP to be visible during outgoing video calling');
   if (oscCount < 1) throw new Error('Expected ringback tone oscillator during outgoing calling');
+  const callingLabels = els.actions.children.map((b) => b.children.map((c) => c.textContent || '').join(''));
+  if (callingLabels.some((l) => l.includes('扬声器'))) {{
+    throw new Error('Outgoing ringing state should not show speaker toggle before connected: ' + JSON.stringify(callingLabels));
+  }}
 
-  // 1-on-1 pure voice call on v3 daemon hides camera button and displays remoteMuted status
+  // 1-on-1 pure voice call on v3 daemon hides camera button, shows speakerphone toggle, and displays remoteMuted status
   ws2.onmessage({{data: JSON.stringify({{
     type: 'state', phase: 'active', title: '微信语音通话', name: 'Alice', status: '🟢 通话中',
     mine: true, muted: false, camera: false, elapsed: 5, group: false,
     videoCall: false, videoEnabled: true, videoSend: null, remoteMuted: true, videoTracks: [], participants: [],
   }})}});
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
   const btnLabels = els.actions.children.map((b) => b.children.map((c) => c.textContent || '').join(''));
   if (btnLabels.some((l) => l.includes('摄像头'))) {{
     throw new Error('Pure 1:1 voice call should not show camera button, got ' + JSON.stringify(btnLabels));
+  }}
+  if (JSON.stringify(btnLabels) !== JSON.stringify(['麦克风已开', '扬声器已关', '挂断'])) {{
+    throw new Error('Expected voice call buttons [麦克风已开, 扬声器已关, 挂断], got ' + JSON.stringify(btnLabels));
   }}
   const statusText = els.status.children.map((c) => c.textContent || '').join('');
   if (statusText !== '对方已静音') throw new Error('Expected 对方已静音, got ' + statusText);
   if (camStops <= stopsBefore) throw new Error('Expected camera hardware stream to be stopped when camera=false');
 
-  // Verify Chromium RTCPeerConnection loopback AEC activated, tuned Opus SDP, detached direct ctx.destination, and cleans up on end
+  // Verify Chromium RTCPeerConnection loopback AEC activated & tuned Opus SDP
   if (aecAudioPlayed < 1 || aecDisconnectedDest < 1) {{
     throw new Error('Expected Chromium RTCPeerConnection loopback AEC to route through <audio>, got played=' + aecAudioPlayed + ', disc=' + aecDisconnectedDest);
   }}
   if (!lastAnswerSdp.includes('maxaveragebitrate=64000') || !lastAnswerSdp.includes('ptime=10') || !lastAnswerSdp.includes('usedtx=0')) {{
     throw new Error('Expected Opus low-latency SDP tuning, got ' + lastAnswerSdp);
   }}
+
+  // Toggle speakerphone ON in Android voice call -> button becomes 扬声器已开, voiceGain boosts to 1.8, worklet speaker=true, and Android routes directly to loudspeaker
+  const voiceGainNode = FakeAudioContext.gains[0];
+  const closedBeforeSpk = aecClosedCount;
+  els.actions.children[1].onclick();
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+  const onLabels = els.actions.children.map((b) => b.children.map((c) => c.textContent || '').join(''));
+  if (onLabels[1] !== '扬声器已开' || !els.actions.children[1].className.includes(' on')) {{
+    throw new Error('Expected highlighted 扬声器已开 button, got ' + onLabels[1] + ' / ' + els.actions.children[1].className);
+  }}
+  if (voiceGainNode.gain.value !== 1.8) {{
+    throw new Error('Expected hands-free voiceGain=1.8, got ' + voiceGainNode.gain.value);
+  }}
+  if (!workletMsgs.some((m) => m && m.t === 'speaker' && m.on === true)) {{
+    throw new Error('Expected worklet speaker=true message');
+  }}
+  if (aecClosedCount < closedBeforeSpk + 2) {{
+    throw new Error('Expected Android speakerphone ON to exit telephony loopback to media loudspeaker');
+  }}
+
+  // Toggle speakerphone OFF -> button returns to 扬声器已关, voiceGain restores to 1, and AEC loopback re-engages
+  const playedBeforeOff = aecAudioPlayed;
+  els.actions.children[1].onclick();
+  for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  const offLabels = els.actions.children.map((b) => b.children.map((c) => c.textContent || '').join(''));
+  if (offLabels[1] !== '扬声器已关' || voiceGainNode.gain.value !== 1 || aecAudioPlayed <= playedBeforeOff) {{
+    throw new Error('Expected speakerphone OFF to restore 扬声器已关, gain=1, and AEC loopback');
+  }}
+
   ws2.onmessage({{data: JSON.stringify({{
     type: 'state', phase: 'ended', title: '微信语音通话', name: 'Alice', status: '⚪ 通话已结束', mine: false,
   }})}});
-  if (aecClosedCount < 2) throw new Error('Expected loopback RTCPeerConnections to close on call end, got ' + aecClosedCount);
+  if (aecClosedCount < closedBeforeSpk + 4) throw new Error('Expected loopback RTCPeerConnections to close on call end, got ' + aecClosedCount);
 
   console.log('CALL_HTML_OK');
 }})().catch((e) => {{ console.error(e); process.exit(1); }});
@@ -1261,5 +1326,151 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
         res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         self.assertIn("CALL_HTML_OK", res.stdout)
+
+    def test_desktop_voice_call_speakerphone_setsinkid_and_picker_in_node(self):
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+
+        web_dir = Path(__file__).resolve().parent.parent / "bridge" / "web"
+        html = (web_dir / "call.html").read_text(encoding="utf-8")
+        worklet = (web_dir / "worklet.js").read_text(encoding="utf-8")
+        rendered = (
+            html.replace("__NONCE__", "testnonce")
+            .replace("__CFG__", json.dumps({"base": "/wxcall"}))
+            .replace("__WORKLET__", json.dumps(worklet))
+        )
+        main_js = re.findall(r'<script nonce="testnonce">([\s\S]*?)</script>', rendered)[1]
+
+        harness = f"""
+const vm = require('vm');
+function makeEl(id) {{
+  return {{
+    id: id || '', className: '', textContent: '', _html: '', hidden: false, disabled: false,
+    get innerHTML() {{ return this._html; }},
+    set innerHTML(v) {{ this._html = v; if (!v) this.children = []; }},
+    style: {{}}, children: [], listeners: {{}},
+    classList: {{ _set: new Set(), add(c) {{ this._set.add(c); }}, remove(c) {{ this._set.delete(c); }}, toggle() {{}}, contains(c) {{ return this._set.has(c); }} }},
+    appendChild(ch) {{ ch.parentNode = this; this.children.push(ch); return ch; }},
+    removeChild(ch) {{ this.children = this.children.filter((x) => x !== ch); }},
+    addEventListener() {{}},
+    play() {{ return Promise.resolve(); }},
+    pause() {{}},
+    getBoundingClientRect() {{ return {{left: 0, top: 0, width: 100, height: 100}}; }},
+    getContext() {{ return {{}}; }},
+  }};
+}}
+const els = {{}};
+['stage', 'pip', 'selfVideo', 'main', 'avatar', 'title', 'name', 'status', 'timer', 'peers', 'hint', 'actions'].forEach((id) => {{ els[id] = makeEl(id); }});
+const sockets = [];
+class FakeWS {{
+  constructor() {{ this.readyState = 0; this.bufferedAmount = 0; this.sent = []; sockets.push(this); }}
+  send(d) {{ this.sent.push(d); }}
+  close() {{ this.readyState = 3; }}
+}}
+const ctxSinks = [], elSinks = [];
+let outputs = [
+  {{kind: 'audiooutput', deviceId: 'default', label: 'Default - Headphones (USB)'}},
+  {{kind: 'audiooutput', deviceId: 'hp-usb', label: 'USB Headset'}},
+  {{kind: 'audiooutput', deviceId: 'spk-builtin', label: 'MacBook Pro Speakers'}},
+];
+let pickerCalls = 0;
+class FakeAudioContext {{
+  constructor() {{
+    this.state = 'running'; this.currentTime = 0; this.destination = {{}};
+    this.audioWorklet = {{ addModule: () => Promise.resolve() }};
+  }}
+  resume() {{ return Promise.resolve(); }}
+  close() {{ this.state = 'closed'; }}
+  setSinkId(id) {{ ctxSinks.push(id); return Promise.resolve(); }}
+  createMediaStreamSource() {{ return {{connect() {{}}}}; }}
+  createGain() {{ return {{gain: {{value: 1, setTargetAtTime(v) {{ this.value = v; }}}}, connect() {{}}, disconnect() {{}}}}; }}
+}}
+class FakeWorkletNode {{
+  constructor() {{ this.port = {{ onmessage: null, postMessage() {{}} }}; }}
+  connect() {{}}
+}}
+const sandbox = {{
+  window: null, document: null, navigator: null,
+  location: {{ protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com', pathname: '/wxcall/call/tok123456', search: '', hash: '' }},
+  URL: {{ createObjectURL: () => 'blob:w', revokeObjectURL: () => {{}} }},
+  Blob: class {{}}, WebSocket: FakeWS, DataView, Uint8Array, Int16Array, ArrayBuffer, Math, JSON, Date, Number, String,
+  Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
+  performance: {{now: () => 0}}, AudioWorkletNode: FakeWorkletNode,
+  setTimeout: () => 1, clearTimeout: () => {{}}, setInterval: () => 1, clearInterval: () => {{}},
+}};
+sandbox.window = Object.assign(sandbox, {{ isSecureContext: true, innerWidth: 1024, innerHeight: 768, AudioContext: FakeAudioContext }});
+sandbox.window.parent = sandbox.window;
+sandbox.document = {{
+  body: makeEl('body'), getElementById: (id) => els[id] || makeEl(id),
+  createElement: (tag) => {{
+    const el = makeEl(tag);
+    if (tag === 'audio') el.setSinkId = (id) => {{ elSinks.push(id); return Promise.resolve(); }};
+    return el;
+  }},
+  createTextNode: (t) => ({{textContent: t}}), addEventListener: () => {{}}, hidden: false,
+}};
+sandbox.navigator = {{
+  userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+  mediaDevices: {{
+    getUserMedia: () => Promise.resolve({{ getTracks: () => [{{stop() {{}}}}] }}),
+    enumerateDevices: () => Promise.resolve(outputs),
+    selectAudioOutput: () => {{ pickerCalls++; return Promise.resolve({{deviceId: 'picked-ext-spk', label: 'External Speaker'}}); }},
+  }},
+}};
+vm.runInNewContext({json.dumps(main_js)}, sandbox);
+
+(async () => {{
+  const ws = sockets[0]; ws.readyState = 1; await ws.onopen();
+  await new Promise((r) => setImmediate(r));
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'ringing', title: '微信语音来电', name: 'Bob', status: '🔔 响铃中…',
+    mine: false, muted: false, camera: false, answerable: true, videoCall: false, rate: 16000, frame: 320,
+  }})}});
+  // Ringing state must NOT show speaker button
+  const ringLabels = els.actions.children.map((b) => b.children.map((c) => c.textContent || '').join(''));
+  if (ringLabels.some((l) => l.includes('扬声器'))) throw new Error('Ringing should not show speaker toggle');
+
+  // Answer voice call
+  els.actions.children[1].onclick();
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'active', title: '微信语音通话', name: 'Bob', status: '🟢 通话中',
+    mine: true, muted: false, camera: false, elapsed: 1, videoCall: false, rate: 16000, frame: 320,
+  }})}});
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+  // 1) Auto-switches to enumerated built-in speaker ('spk-builtin') without prompting picker
+  els.actions.children[1].onclick();
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+  if (ctxSinks[ctxSinks.length - 1] !== 'spk-builtin' || pickerCalls !== 0) {{
+    throw new Error('Expected setSinkId(spk-builtin) without picker, got sinks=' + JSON.stringify(ctxSinks) + ', picker=' + pickerCalls);
+  }}
+
+  // 2) Toggling off switches right back to non-default headset ('hp-usb')
+  els.actions.children[1].onclick();
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+  if (ctxSinks[ctxSinks.length - 1] !== 'hp-usb') {{
+    throw new Error('Expected setSinkId(hp-usb) on speaker OFF, got ' + JSON.stringify(ctxSinks));
+  }}
+
+  // 3) When enumerateDevices hides outputs (e.g. Firefox), tapping speaker ON invokes selectAudioOutput()
+  outputs = [];
+  els.actions.children[1].onclick();
+  for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+  if (pickerCalls !== 1 || ctxSinks[ctxSinks.length - 1] !== 'picked-ext-spk') {{
+    throw new Error('Expected selectAudioOutput fallback to picked-ext-spk, got picker=' + pickerCalls + ', sinks=' + JSON.stringify(ctxSinks));
+  }}
+
+  console.log('DESKTOP_SPEAKER_OK');
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+        res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("DESKTOP_SPEAKER_OK", res.stdout)
 
 

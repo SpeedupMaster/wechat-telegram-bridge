@@ -217,6 +217,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     cam: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="13.5" height="12" rx="2.5"/><path d="M16 10.5l5.5-3.2v9.4L16 13.5"/></svg>',
     camOff: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 6H13.5a2.5 2.5 0 0 1 2.5 2.5v2M16 16v-.5a2.5 2.5 0 0 1-2.5 2.5H5a2.5 2.5 0 0 1-2.5-2.5v-7A2.5 2.5 0 0 1 5 6h1.2M16 10.5l5.5-3.2v9.4L18 14.6M3 3l18 18"/></svg>',
     flip: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-3.2l-1.5-2H8.7L7.2 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/><path d="M9.5 13a2.8 2.8 0 0 1 4.7-1.6l.8.8M14.5 14a2.8 2.8 0 0 1-4.7 1.6l-.8-.8"/></svg>',
+    speaker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2.5v6H6l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.8 5.5a9.5 9.5 0 0 1 0 13"/></svg>',
+    speakerLow: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H3v6h3l5 4V5z"/><path d="M15.5 9.5a3.5 3.5 0 0 1 0 5"/></svg>',
     headset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 18v-5.5a8.5 8.5 0 0 1 17 0V18"/><path d="M20.5 18.5a2 2 0 0 1-2 2H17v-6.5h3.5zM3.5 18.5a2 2 0 0 0 2 2H7v-6.5H3.5z"/></svg>',
     close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     group: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.6a3.5 3.5 0 0 1 0 6.8M18 14.2a6.5 6.5 0 0 1 3.5 5.8"/></svg>',
@@ -249,7 +251,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   let ws = null, wsOpen = false, st = null, audio = null, audioStarting = null, ended = false, fatal = false, retry = 0, reattach = false;
   let browserHandoff = findHandoff();
   let timerBase = null, timerId = null, wakeLock = null, pending = null, lastPhase = null, micGranted = false;
-  let closingConfirm = null;
+  let closingConfirm = null, speakerOn = false, speakerSinkId = '', lastWorkletSpeaker = null;
 
   // Video state (WebCodecs H.264 Annex-B preferred when supported, Canvas JPEG universal fallback)
   let h264EncCodec = 'avc1.42001e', h264DecCodec = 'avc1.42001e';
@@ -644,6 +646,17 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     if (/Macintosh/.test(ua) && navigator && navigator.maxTouchPoints > 1) return true;
     return /Safari/.test(ua) && !/Chrome|Chromium|CriOS|Edg|OPR|Android/.test(ua);
   })();
+  const IS_ANDROID = /Android/i.test((navigator && navigator.userAgent) || '');
+  const EARPIECE_RE = /earpiece|receiver|handset|听筒/i;
+  const HEADSET_RE = /headphone|headset|earbud|airpods|buds|hands-free|bluetooth|耳机|头戴|蓝牙/i;
+  const SPEAKER_RE = /speaker|loudspeaker|扬声器|外放|免提|built-in output|internal speaker|喇叭/i;
+
+  function isVideoMode() {
+    return !!(st && (st.videoCall || isCameraOn() || remoteTiles.size > 0));
+  }
+  function isHandsFree() {
+    return isVideoMode() || speakerOn;
+  }
 
   function tuneOpusSdp(sdp) {
     if (!sdp) return sdp;
@@ -765,12 +778,24 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         await mod;
         const node = new AudioWorkletNode(ctx, 'bridge-io', {numberOfInputs: 1, numberOfOutputs: 1,
           outputChannelCount: [1], processorOptions: {net: rate, frame: frame}});
-        let outBus = node;
+        let voiceGain = null, outBus = node;
         if (typeof ctx.createGain === 'function') {
-          const g = ctx.createGain();
-          if (g && g.gain) g.gain.value = 1;
-          node.connect(g);
-          outBus = g;
+          voiceGain = ctx.createGain();
+          if (voiceGain && voiceGain.gain) voiceGain.gain.value = 1;
+          node.connect(voiceGain);
+          outBus = voiceGain;
+        }
+        if (typeof ctx.createDynamicsCompressor === 'function') {
+          try {
+            const lim = ctx.createDynamicsCompressor();
+            if (lim.threshold) lim.threshold.value = -2;
+            if (lim.knee) lim.knee.value = 6;
+            if (lim.ratio) lim.ratio.value = 12;
+            if (lim.attack) lim.attack.value = 0.002;
+            if (lim.release) lim.release.value = 0.08;
+            outBus.connect(lim);
+            outBus = lim;
+          } catch (e) {}
         }
         ctx.createMediaStreamSource(stream).connect(node);
         outBus.connect(ctx.destination);
@@ -781,15 +806,13 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         };
         // Never wait for resume(): on iOS the microphone starting can leave the context "interrupted" and the
         // promise pending indefinitely, which used to leave the call connected with no sound either way.
-        const curAudio = {ctx: ctx, stream: stream, node: node, out: outBus, aec: null, rate: rate};
+        const curAudio = {ctx: ctx, stream: stream, node: node, voiceGain: voiceGain, out: outBus,
+                          aec: null, aecPending: false, bypassAec: false, sinkId: '', routeKey: '', rate: rate};
         audio = curAudio;
-        setupAecLoopback(ctx, outBus).then((aec) => {
-          if (!aec) return;
-          if (audio === curAudio) curAudio.aec = aec;
-          else aec.close();
-        });
         lastWorkletTx = null;
+        lastWorkletSpeaker = null;
         syncWorkletTx();
+        syncAudioRoute(false);
         micGranted = true;
         ctx.onstatechange = checkAudio;
         checkAudio();
@@ -821,6 +844,155 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       audio.node.port.postMessage({t: 'tx', on: on});
     }
   }
+
+  function syncWorkletSpeaker() {
+    if (!audio || !audio.node) { lastWorkletSpeaker = null; return; }
+    const on = isHandsFree();
+    if (on !== lastWorkletSpeaker) {
+      lastWorkletSpeaker = on;
+      audio.node.port.postMessage({t: 'speaker', on: on});
+    }
+  }
+
+  function ensureAecLoopback(curAudio) {
+    if (!curAudio || curAudio.aec || curAudio.aecPending || curAudio.bypassAec || curAudio.ctx.state === 'closed') return;
+    curAudio.aecPending = true;
+    setupAecLoopback(curAudio.ctx, curAudio.out).then((aec) => {
+      curAudio.aecPending = false;
+      if (!aec) return;
+      if (audio !== curAudio || curAudio.bypassAec) { aec.close(); return; }
+      curAudio.aec = aec;
+      if (curAudio.sinkId && aec.el && typeof aec.el.setSinkId === 'function') {
+        aec.el.setSinkId(curAudio.sinkId).catch(() => {});
+      }
+    });
+  }
+
+  function canSwitchSink(curAudio) {
+    if (!curAudio) return false;
+    if (typeof curAudio.ctx.setSinkId === 'function') return true;
+    if (curAudio.aec && curAudio.aec.el && typeof curAudio.aec.el.setSinkId === 'function') return true;
+    return typeof HTMLMediaElement !== 'undefined' && HTMLMediaElement.prototype && typeof HTMLMediaElement.prototype.setSinkId === 'function';
+  }
+
+  async function applySinkId(curAudio, sinkId) {
+    if (!curAudio || curAudio.ctx.state === 'closed') return false;
+    const id = sinkId || '';
+    let ok = false;
+    if (typeof curAudio.ctx.setSinkId === 'function') {
+      try { await curAudio.ctx.setSinkId(id); ok = true; } catch (e) {}
+    }
+    if (curAudio.aec && curAudio.aec.el && typeof curAudio.aec.el.setSinkId === 'function') {
+      try { await curAudio.aec.el.setSinkId(id); ok = true; } catch (e) {}
+    }
+    if (ok) curAudio.sinkId = id;
+    return ok;
+  }
+
+  async function resolveAudioOutputs() {
+    const res = {all: [], speaker: null, earpiece: null, headset: null};
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== 'function') return res;
+    try {
+      const list = await navigator.mediaDevices.enumerateDevices();
+      const pick = (cur, cand) => {
+        if (!cur) return cand;
+        const curGeneric = cur.deviceId === 'default' || cur.deviceId === 'communications';
+        const candGeneric = cand.deviceId === 'default' || cand.deviceId === 'communications';
+        return curGeneric && !candGeneric ? cand : cur;
+      };
+      for (let i = 0; i < list.length; i++) {
+        const d = list[i];
+        if (!d || d.kind !== 'audiooutput' || !d.deviceId) continue;
+        res.all.push(d);
+        const lbl = d.label || '';
+        if (EARPIECE_RE.test(lbl)) res.earpiece = pick(res.earpiece, d);
+        else if (HEADSET_RE.test(lbl)) res.headset = pick(res.headset, d);
+        else if (SPEAKER_RE.test(lbl)) res.speaker = pick(res.speaker, d);
+      }
+    } catch (e) {}
+    return res;
+  }
+
+  function applySpeakerGain(curAudio) {
+    if (!curAudio || !curAudio.voiceGain || !curAudio.voiceGain.gain) return;
+    const target = (speakerOn && !isVideoMode()) ? 1.8 : 1;
+    const g = curAudio.voiceGain.gain;
+    try {
+      if (typeof g.setTargetAtTime === 'function') g.setTargetAtTime(target, curAudio.ctx.currentTime || 0, 0.015);
+      else g.value = target;
+    } catch (e) { g.value = target; }
+  }
+
+  async function syncAudioRoute(fromTap) {
+    const curAudio = audio;
+    syncWorkletSpeaker();
+    if (!curAudio || curAudio.ctx.state === 'closed') return;
+    curAudio.routeKey = (isVideoMode() ? 'v' : 'a') + ':' + (speakerOn ? '1' : '0');
+    applySpeakerGain(curAudio);
+    if (IS_IOS_OR_SAFARI) {
+      try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+      if (fromTap && curAudio.ctx.state !== 'running') curAudio.ctx.resume().catch(() => {});
+    }
+    const wantSpeaker = speakerOn && !isVideoMode();
+    const sinkCapable = canSwitchSink(curAudio);
+    const outs = await resolveAudioOutputs();
+    if (audio !== curAudio || curAudio.ctx.state === 'closed') return;
+
+    if (wantSpeaker) {
+      let targetSink = (outs.speaker && outs.speaker.deviceId) || '';
+      if (!targetSink && speakerSinkId && (!outs.all.length || outs.all.some((d) => d.deviceId === speakerSinkId))) {
+        targetSink = speakerSinkId;
+      }
+      if (!targetSink && fromTap && sinkCapable && navigator.mediaDevices && typeof navigator.mediaDevices.selectAudioOutput === 'function') {
+        try {
+          const picked = await navigator.mediaDevices.selectAudioOutput();
+          if (picked && picked.deviceId) {
+            speakerSinkId = picked.deviceId;
+            targetSink = picked.deviceId;
+          }
+        } catch (e) {}
+      }
+      if (audio !== curAudio || curAudio.ctx.state === 'closed') return;
+      if (targetSink && sinkCapable) {
+        curAudio.bypassAec = false;
+        ensureAecLoopback(curAudio);
+        const ok = await applySinkId(curAudio, targetSink);
+        if (ok) return;
+        if (targetSink === speakerSinkId) speakerSinkId = '';
+      }
+      if (IS_ANDROID) {
+        // Android WebView / Chrome without discrete speaker sinkId: routing directly to ctx.destination
+        // exits telephony earpiece routing and plays on the USAGE_MEDIA main loudspeaker.
+        curAudio.bypassAec = true;
+        if (curAudio.aec) { curAudio.aec.close(); curAudio.aec = null; }
+        return;
+      }
+      curAudio.bypassAec = false;
+      ensureAecLoopback(curAudio);
+    } else {
+      curAudio.bypassAec = false;
+      ensureAecLoopback(curAudio);
+      if (!isVideoMode() && sinkCapable) {
+        const backSink = (outs.earpiece && outs.earpiece.deviceId) || (outs.headset && outs.headset.deviceId) || '';
+        if (curAudio.sinkId !== backSink) await applySinkId(curAudio, backSink);
+      } else if (isVideoMode() && curAudio.sinkId && sinkCapable) {
+        await applySinkId(curAudio, '');
+      }
+    }
+  }
+
+  function toggleSpeaker() {
+    if (!st || !st.mine) return;
+    speakerOn = !speakerOn;
+    haptic('light');
+    render();
+    syncAudioRoute(true);
+  }
+  try {
+    if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
+      navigator.mediaDevices.addEventListener('devicechange', () => { if (audio) syncAudioRoute(false); });
+    }
+  } catch (e) {}
 
   let ringTimer = null, ringNode = null;
   function stopRingback() {
@@ -890,6 +1062,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   function stopAudio() {
     stopRingback();
     lastWorkletTx = null;
+    lastWorkletSpeaker = null;
     clearTimeout(soundTimer);
     if (soundHint) { soundHint = false; hint(''); }
     if (!audio) return;
@@ -897,6 +1070,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     try { audio.ctx.onstatechange = null; } catch (e) {}
     try { audio.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
     try { audio.ctx.close(); } catch (e) {}
+    try { if (IS_IOS_OR_SAFARI && navigator.audioSession) navigator.audioSession.type = 'auto'; } catch (e) {}
     audio = null;
     try { wakeLock && wakeLock.release(); } catch (e) {}
     wakeLock = null;
@@ -1033,7 +1207,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const b = document.createElement('button');
     const busy = pending && pending.action === action;
     b.className = 'btn ' + cls + (busy ? ' busy' : '');
-    b.disabled = !!pending || (!wsOpen && action !== 'close');
+    b.disabled = (!!pending && action !== 'speaker') || (!wsOpen && action !== 'close' && action !== 'speaker');
     b.innerHTML = '<span class="c">' + icon + '</span>';
     b.appendChild(document.createTextNode(label));
     b.onclick = onClick;
@@ -1147,6 +1321,11 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     if (showPip && p === 'active' && st.videoSend && st.videoSend.active) scheduleCapture();
     renderPeers(!!(st.group && (p === 'active' || p === 'connecting' || p === 'calling') && !showStage));
     syncWorkletTx();
+    syncWorkletSpeaker();
+    if (audio) {
+      const rk = (isVideoMode() ? 'v' : 'a') + ':' + (speakerOn ? '1' : '0');
+      if (audio.routeKey !== rk) syncAudioRoute(false);
+    }
     syncRingback();
 
     const mainCls = [];
@@ -1227,6 +1406,10 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         const muted = isMuted();
         addBtn(button('glass' + (muted ? ' on' : ''), muted ? ICON.micOff : ICON.mic,
           muted ? '已静音' : '麦克风已开', () => act('mute', {muted: !muted}), 'mute'));
+        if (!isVideoMode()) {
+          addBtn(button('glass' + (speakerOn ? ' on' : ''), speakerOn ? ICON.speaker : ICON.speakerLow,
+            speakerOn ? '扬声器已开' : '扬声器已关', toggleSpeaker, 'speaker'));
+        }
         if (st.videoCall || st.videoSend || (st.group && st.videoEnabled)) {
           const camOn = isCameraOn();
           addBtn(button('glass' + (camOn ? ' on' : ''), camOn ? ICON.cam : ICON.camOff,
@@ -1247,6 +1430,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     setClosingConfirmation(!!LIVE[p] && !!st.mine);
     if (p === 'ended' || p === 'elsewhere') {
       if (p === 'ended') ended = true;
+      speakerOn = false;
+      speakerSinkId = '';
       stopCamera();
       clearRemoteVideo();
       stopAudio();

@@ -1446,6 +1446,7 @@ class CallWeb:
                 "Cache-Control": "no-store",
                 "Referrer-Policy": "no-referrer",
                 "X-Content-Type-Options": "nosniff",
+                "Permissions-Policy": "microphone=(self), camera=(self), speaker-selection=(self)",
                 "Content-Security-Policy": (
                     "default-src 'none'; "
                     f"script-src 'nonce-{nonce}' blob:; "
