@@ -1787,27 +1787,38 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
   for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
 
   // 1) Must NOT have sent 'answer' before getUserMedia + AudioContext initialization actually succeeded,
-  //    and must NOT have created an AudioContext before getUserMedia resolved on iOS!
+  //    and MUST have unlocked an early AudioContext synchronously inside the iOS tap gesture!
   if (ws.sent.some((s) => typeof s === 'string' && JSON.parse(s).type === 'answer')) {{
     throw new Error('Sent answer prematurely before startAudio finished!');
   }}
-  if (contexts.length !== 0) {{
-    throw new Error('Created AudioContext before getUserMedia resolved on iOS (' + contexts.length + ')!');
+  if (contexts.length !== 1) {{
+    throw new Error('Expected 1 gesture-unlocked AudioContext inside iOS tap, got ' + contexts.length + '!');
   }}
 
-  // Now iOS finishes starting VoiceProcessingIO and resolves getUserMedia
+  // Now iOS finishes starting VoiceProcessingIO and resolves getUserMedia; when the pre-capture context stays
+  // wedged in 'interrupted' past the 250ms resume window, startAudio closes it and falls back to a post-gUM context.
   releaseGum();
+  for (let round = 0; round < 4; round++) {{
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    const due = timers.filter((t) => !t.interval && t.ms <= 300);
+    for (const t of due) {{
+      const idx = timers.indexOf(t);
+      if (idx >= 0) timers.splice(idx, 1);
+      t.fn();
+    }}
+  }}
   for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r));
 
-  if (contexts.length !== 1 || contexts[0].state !== 'running') {{
-    throw new Error('Expected 1 running post-getUserMedia AudioContext, got ' + JSON.stringify(contexts.map((c) => c.state)));
+  const activeCtx = contexts[contexts.length - 1];
+  if (contexts.length !== 2 || contexts[0].state !== 'closed' || activeCtx.state !== 'running') {{
+    throw new Error('Expected wedged earlyCtx closed and post-gUM AudioContext running, got ' + JSON.stringify(contexts.map((c) => c.state)));
   }}
   if (typeof global.gc === 'function') global.gc();
   if (!weakSources.length || !weakSources[weakSources.length - 1].deref()) {{
     throw new Error('MediaStreamAudioSourceNode was garbage-collected instead of held strongly!');
   }}
-  if (contexts[0].workletLoadedUrl !== '/wxcall/worklet.js') {{
-    throw new Error('Expected same-origin /wxcall/worklet.js first, got ' + contexts[0].workletLoadedUrl);
+  if (activeCtx.workletLoadedUrl !== '/wxcall/worklet.js') {{
+    throw new Error('Expected same-origin /wxcall/worklet.js first, got ' + activeCtx.workletLoadedUrl);
   }}
   if (!ws.sent.some((s) => typeof s === 'string' && JSON.parse(s).type === 'answer')) {{
     throw new Error('Expected answer to be sent once startAudio succeeded');
@@ -1831,7 +1842,7 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
   }}
 
   // 2) Advance AudioContext hardware clock, but StalledWorkletNode has 0 ticks -> watchdog hot-swaps to ScriptProcessorNode!
-  contexts[0].currentTime = 1.2;
+  activeCtx.currentTime = 1.2;
   const watchTimers = timers.filter((t) => t.ms >= 500 && t.ms <= 1500);
   for (const wt of watchTimers) {{
     const idx = timers.indexOf(wt);
@@ -1876,8 +1887,8 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
 
   // 3) Simulate WebKit Bug #263627: AudioContext reports state='running' while currentTime freezes!
   //    Watchdog detects stalled currentTime -> shows SOUND_HINT -> user tap rebuilds a fresh running AudioContext!
-  const frozenTime = contexts[0].currentTime;
-  contexts[0].frozen = true;
+  const frozenTime = activeCtx.currentTime;
+  activeCtx.frozen = true;
   for (let round = 0; round < 3; round++) {{
     const activeTimers = timers.filter((t) => t.ms >= 500 && t.ms <= 2500);
     for (const t of activeTimers) {{
@@ -1889,7 +1900,7 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
     }}
     await new Promise((r) => setImmediate(r));
   }}
-  if (contexts[0].currentTime !== frozenTime) throw new Error('Test setup bug: time moved');
+  if (activeCtx.currentTime !== frozenTime) throw new Error('Test setup bug: time moved');
   if (!els.hint.textContent.includes('轻点屏幕')) {{
     throw new Error('Expected SOUND_HINT when ctx.currentTime is frozen while state=running, got: ' + els.hint.textContent);
   }}
@@ -2184,6 +2195,271 @@ const vm = require('vm');
         res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         self.assertIn("SILENT_MIC_RECOVERY_OK", res.stdout)
+
+    def test_ios_telegram_wkwebview_synchronous_gesture_unlocks_audio_without_sound_hint(self):
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+
+        web_dir = Path(__file__).resolve().parent.parent / "bridge" / "web"
+        html = (web_dir / "call.html").read_text(encoding="utf-8")
+        worklet = (web_dir / "worklet.js").read_text(encoding="utf-8")
+        rendered = (
+            html.replace("__NONCE__", "testnonce")
+            .replace("__CFG__", json.dumps({"base": "/wxcall"}))
+            .replace("__WORKLET__", json.dumps(worklet))
+        )
+        main_js = re.findall(r'<script nonce="testnonce">([\s\S]*?)</script>', rendered)[1]
+
+        harness = f"""
+const vm = require('vm');
+const timers = [];
+let nextTimerId = 1;
+const docListeners = {{}};
+function makeEl(id) {{
+  return {{
+    id: id || '', className: '', textContent: '', _html: '', hidden: false, disabled: false,
+    get innerHTML() {{ return this._html; }},
+    set innerHTML(v) {{ this._html = v; if (!v) this.children = []; }},
+    style: {{}}, children: [], listeners: {{}},
+    classList: {{
+      _set: new Set(),
+      add(c) {{ this._set.add(c); }},
+      remove(c) {{ this._set.delete(c); }},
+      toggle(c, on) {{ if (on === undefined ? !this._set.has(c) : on) this._set.add(c); else this._set.delete(c); }},
+      contains(c) {{ return this._set.has(c); }},
+    }},
+    appendChild(ch) {{ ch.parentNode = this; this.children.push(ch); return ch; }},
+    removeChild(ch) {{ this.children = this.children.filter((x) => x !== ch); }},
+    addEventListener(ev, fn) {{ (this.listeners[ev] = this.listeners[ev] || []).push(fn); }},
+    setAttribute() {{}},
+    play() {{ return Promise.resolve(); }},
+    pause() {{}},
+    getBoundingClientRect() {{ return {{left: 0, top: 0, width: 100, height: 100}}; }},
+    getContext() {{ return {{}}; }},
+  }};
+}}
+const els = {{}};
+['stage', 'pip', 'selfVideo', 'main', 'avatar', 'title', 'name', 'status', 'timer', 'peers', 'hint', 'actions'].forEach((id) => {{
+  els[id] = makeEl(id);
+}});
+els.stage.hidden = true; els.pip.hidden = true; els.peers.hidden = true;
+
+const sockets = [];
+class FakeWS {{
+  constructor(url) {{
+    this.url = url; this.readyState = 0; this.bufferedAmount = 0; this.sent = [];
+    sockets.push(this);
+  }}
+  send(d) {{ this.sent.push(d); }}
+  close() {{ this.readyState = 3; if (this.onclose) this.onclose(); }}
+}}
+
+// Mirrors real iOS Telegram Mini App WKWebView (WKAudiovisualMediaTypes requiring user gesture):
+// - UserGestureIndicator (`inUserGesture`) is true ONLY synchronously inside a user tap handler.
+// - Creating or resuming an AudioContext AFTER `await getUserMedia()` (when `inUserGesture` is false)
+//   does NOT lift `RequireUserGestureForAudioRateChange`, even when `capturingAudio` is true!
+// - An AudioContext created & resumed synchronously inside the tap lifts the gesture restriction;
+//   even if VoiceProcessingIO setup transiently interrupts it during getUserMedia + 150ms settle,
+//   resuming it once the hardware route settles succeeds without requiring a second screen tap.
+let inUserGesture = false;
+let routeSettled = false;
+let releaseGum = null;
+const contexts = [];
+
+class StrictWKWebViewAudioContext {{
+  constructor() {{
+    this.sampleRate = 48000;
+    this.gestureUnlocked = inUserGesture;
+    this.silentBufferStarted = false;
+    this.state = inUserGesture ? 'running' : 'suspended';
+    this.currentTime = 0;
+    this.destination = {{isDest: true}};
+    this.onstatechange = null;
+    this.audioWorklet = {{ addModule: () => Promise.resolve() }};
+    contexts.push(this);
+  }}
+  createBuffer(ch, len, sr) {{ return {{ch, len, sr}}; }}
+  createBufferSource() {{
+    const ctx = this;
+    return {{
+      buffer: null,
+      connect() {{}},
+      start() {{ if (inUserGesture) {{ ctx.gestureUnlocked = true; ctx.silentBufferStarted = true; }} }},
+    }};
+  }}
+  resume() {{
+    if (inUserGesture) {{
+      this.gestureUnlocked = true;
+    }}
+    if (!this.gestureUnlocked) {{
+      // Blocked by WKWebView RequireUserGestureForAudioRateChange!
+      return Promise.reject(new Error('NotAllowedError: AudioContext was not allowed to start'));
+    }}
+    if (!routeSettled) {{
+      // CoreAudio VoiceProcessingIO route transition still in progress
+      return Promise.reject(new Error('InvalidStateError: Cannot resume while audio session is switching'));
+    }}
+    const changed = this.state !== 'running';
+    this.state = 'running';
+    if (changed && typeof this.onstatechange === 'function') {{
+      Promise.resolve().then(() => this.onstatechange && this.onstatechange());
+    }}
+    return Promise.resolve();
+  }}
+  suspend() {{ this.state = 'suspended'; return Promise.resolve(); }}
+  close() {{ this.state = 'closed'; return Promise.resolve(); }}
+  createMediaStreamSource(stream) {{ return {{stream, connect() {{}}, disconnect() {{}}}}; }}
+  createGain() {{
+    return {{
+      gain: {{ value: 1, setValueAtTime(v) {{ this.value = v; }}, linearRampToValueAtTime(v) {{ this.value = v; }}, setTargetAtTime(v) {{ this.value = v; }} }},
+      connect(n) {{ return n; }},
+      disconnect() {{}},
+    }};
+  }}
+  createDynamicsCompressor() {{
+    return {{
+      threshold: {{value: 0}}, knee: {{value: 0}}, ratio: {{value: 1}}, attack: {{value: 0}}, release: {{value: 0}},
+      connect(n) {{ return n; }},
+      disconnect() {{}},
+    }};
+  }}
+  createScriptProcessor(bufSize) {{
+    return {{ bufferSize: bufSize, onaudioprocess: null, connect(n) {{ return n; }}, disconnect() {{}} }};
+  }}
+}}
+
+class FakeWorkletNode {{
+  constructor() {{ this.port = {{ onmessage: null, postMessage() {{}} }}; }}
+  connect(n) {{ return n; }}
+  disconnect() {{}}
+}}
+
+const sandbox = {{
+  window: null, document: null, navigator: null,
+  location: {{
+    protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com',
+    pathname: '/wxcall/call/tok123456', search: '',
+    hash: '#tgWebAppData=query_id%3D1%26user%3D%257B%2522id%2522%253A999%257D',
+  }},
+  sessionStorage: {{ getItem: () => '', setItem: () => {{}} }},
+  URL: {{ createObjectURL: () => 'blob:worklet', revokeObjectURL: () => {{}} }},
+  Blob: class {{}}, WebSocket: FakeWS, DataView, Uint8Array, Int16Array, Float32Array, ArrayBuffer, Math, JSON, Date, Number, String,
+  Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
+  performance: {{now: () => 100}},
+  AudioWorkletNode: FakeWorkletNode,
+  setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
+  clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+  setInterval: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms, interval: true}}); return id; }},
+  clearInterval: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+}};
+sandbox.window = Object.assign(sandbox, {{
+  isSecureContext: true, innerWidth: 390, innerHeight: 844, webkitAudioContext: StrictWKWebViewAudioContext,
+}});
+sandbox.window.parent = sandbox.window;
+sandbox.document = {{
+  body: makeEl('body'),
+  getElementById: (id) => els[id] || makeEl(id),
+  createElement: (tag) => makeEl(tag),
+  createTextNode: (t) => ({{textContent: t}}),
+  addEventListener: (ev, fn) => {{ (docListeners[ev] = docListeners[ev] || []).push(fn); }},
+  hidden: false,
+}};
+sandbox.navigator = {{
+  userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+  audioSession: {{ _type: 'auto', get type() {{ return this._type; }}, set type(v) {{ this._type = v; }} }},
+  permissions: {{ query: () => Promise.resolve({{state: 'granted', onchange: null}}) }},
+  mediaDevices: {{
+    getUserMedia: () => new Promise((resolve) => {{
+      // VoiceProcessingIO startup transiently interrupts any active AudioContext while initializing
+      routeSettled = false;
+      contexts.forEach((c) => {{ if (c.state !== 'closed') c.state = 'interrupted'; }});
+      releaseGum = () => {{
+        resolve({{
+          getTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{}}}}],
+          getAudioTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{}}}}],
+        }});
+      }};
+    }}),
+  }},
+}};
+
+vm.runInNewContext({json.dumps(main_js)}, sandbox);
+
+async function flushMicrotasks(n = 8) {{
+  for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+}}
+
+async function fireTimersUpTo(maxMs) {{
+  const due = timers.filter((t) => !t.interval && t.ms <= maxMs);
+  for (const t of due) {{
+    const idx = timers.indexOf(t);
+    if (idx >= 0) timers.splice(idx, 1);
+    t.fn();
+    await flushMicrotasks(4);
+  }}
+}}
+
+(async () => {{
+  const ws = sockets[0];
+  ws.readyState = 1;
+  await ws.onopen();
+  await flushMicrotasks();
+
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'ringing', title: '微信语音来电', name: '宝子', status: '🔔 响铃中…',
+    mine: false, muted: false, camera: false, answerable: true, videoCall: false, rate: 16000, frame: 320,
+  }})}});
+
+  // User taps "接听": transient user activation is ONLY active synchronously during this tap!
+  const ansBtn = els.actions.children[1];
+  inUserGesture = true;
+  try {{
+    for (const fn of (ansBtn.listeners.touchend || [])) fn();
+    ansBtn.onclick();
+  }} finally {{
+    inUserGesture = false;
+  }}
+  await flushMicrotasks();
+
+  // getUserMedia resolves first while CoreAudio route finishes settling shortly after (e.g. 200ms later)
+  releaseGum();
+  await flushMicrotasks();
+  await fireTimersUpTo(300);
+  routeSettled = true;
+  await fireTimersUpTo(500);
+
+  // Server enters connecting ("接通中…") just like the user's screenshot
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'connecting', title: '微信语音来电', name: '宝子', status: '🟡 接通中…',
+    mine: true, muted: false, camera: false, videoCall: false, rate: 16000, frame: 320,
+  }})}});
+  await flushMicrotasks();
+
+  // Fire checkAudio's soundTimer window (up to 1500ms) WITHOUT any extra user screen tap
+  await fireTimersUpTo(1500);
+
+  if (els.hint.textContent !== '') {{
+    throw new Error('Unexpected error hint on iOS Telegram answer: ' + els.hint.textContent);
+  }}
+  const liveCtx = contexts.find((c) => c.state === 'running');
+  if (!liveCtx || !liveCtx.silentBufferStarted) {{
+    throw new Error('Expected gesture-unlocked running AudioContext, got states=' + JSON.stringify(contexts.map((c) => c.state)));
+  }}
+  if (!ws.sent.some((s) => typeof s === 'string' && JSON.parse(s).type === 'answer')) {{
+    throw new Error('Expected answer command sent to backend');
+  }}
+
+  console.log('IOS_WKWEBVIEW_GESTURE_UNLOCK_OK');
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+        res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("IOS_WKWEBVIEW_GESTURE_UNLOCK_OK", res.stdout)
 
 
 

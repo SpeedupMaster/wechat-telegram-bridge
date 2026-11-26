@@ -840,7 +840,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     }
   }
 
-  let silentWavUrl = '';
+  let silentWavUrl = '', iosPrimedCtx = null, iosPrimeTimer = null, pendingIosCtx = null;
   function primeIosAudio() {
     if (!IS_IOS_OR_SAFARI || !document.createElement) return;
     try {
@@ -859,6 +859,81 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       const p = el.play();
       if (p && p.then) p.then(() => { try { el.pause(); el.removeAttribute && el.removeAttribute('src'); } catch (_) {} }, () => {});
     } catch (e) {}
+  }
+
+  // iOS WKWebView requires an AudioContext to be created, pulled by a buffer source, and resumed synchronously
+  // inside a user gesture stack frame (touchend / click) to lift RequireUserGestureForAudioRateChange.
+  function unlockIosAudioContext(ctx) {
+    if (!ctx || ctx.state === 'closed') return;
+    try {
+      if (typeof ctx.createBuffer === 'function' && typeof ctx.createBufferSource === 'function') {
+        const buf = ctx.createBuffer(1, 1, ctx.sampleRate || 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        if (typeof src.start === 'function') src.start(0);
+        else if (typeof src.noteOn === 'function') src.noteOn(0);
+      }
+    } catch (e) {}
+    try {
+      const p = ctx.resume();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
+
+  function primeIosGestureContext() {
+    if (!IS_IOS_OR_SAFARI || audio || audioStarting) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+    if (!(navigator && navigator.audioSession)) primeIosAudio();
+    if (!iosPrimedCtx || iosPrimedCtx.state === 'closed') {
+      try { iosPrimedCtx = new AC({latencyHint: 'interactive'}); } catch (e) { iosPrimedCtx = null; }
+    }
+    if (iosPrimedCtx) {
+      unlockIosAudioContext(iosPrimedCtx);
+      clearTimeout(iosPrimeTimer);
+      iosPrimeTimer = setTimeout(() => {
+        if (iosPrimedCtx && !audio && !audioStarting) {
+          try { iosPrimedCtx.close(); } catch (e) {}
+          iosPrimedCtx = null;
+          try { if (navigator.audioSession) navigator.audioSession.type = 'auto'; } catch (e) {}
+        }
+      }, 1200);
+    }
+  }
+
+  function waitCtxRunning(ctx, ms) {
+    if (!ctx || ctx.state === 'running' || ctx.state === 'closed') {
+      return Promise.resolve(!!(ctx && ctx.state === 'running'));
+    }
+    return new Promise((resolve) => {
+      let done = false;
+      const prev = ctx.onstatechange;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        clearTimeout(r);
+        try { if (ctx.onstatechange === onChange) ctx.onstatechange = prev || null; } catch (e) {}
+        resolve(ctx.state === 'running');
+      };
+      const onChange = () => { if (ctx.state === 'running' || ctx.state === 'closed') finish(); };
+      try { ctx.onstatechange = onChange; } catch (e) {}
+      const tryResume = () => {
+        if (done || ctx.state === 'running' || ctx.state === 'closed') { finish(); return; }
+        try {
+          const p = ctx.resume();
+          if (p && typeof p.then === 'function') {
+            p.then(() => { if (ctx.state === 'running') finish(); }, () => {});
+          }
+        } catch (e) {}
+      };
+      const r = setTimeout(tryResume, Math.max(40, Math.floor(ms / 2)));
+      const t = setTimeout(finish, ms);
+      tryResume();
+      if (ctx.state === 'running') finish();
+    });
   }
 
   function withTimeout(p, ms) {
@@ -1286,8 +1361,13 @@ border-top-color:#fff;animation:spin .8s linear infinite}
           } else if (curAudio.ticks === curAudio.lastTicks) {
             curAudio.frozenCount++;
             if (curAudio.frozenCount === 1) {
-              try { if (typeof ctx.suspend === 'function') ctx.suspend().then(() => ctx.resume()).catch(() => {}); } catch (e) {}
-              ctx.resume().catch(() => {});
+              if (curAudio.engine === 'worklet' && curAudio.ticks === 0 && typeof ctx.createScriptProcessor === 'function') {
+                swapToScriptProcessor(curAudio);
+              }
+              try {
+                if (typeof ctx.suspend === 'function') ctx.suspend().then(() => ctx.resume(), () => ctx.resume()).catch(() => {});
+                else ctx.resume().catch(() => {});
+              } catch (e) { ctx.resume().catch(() => {}); }
             } else if (curAudio.frozenCount >= 2) {
               curAudio.stalled = true;
               soundHint = true;
@@ -1379,7 +1459,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     try { curAudio.source && curAudio.source.disconnect(); } catch (e) {}
     try { curAudio.ctx.close(); } catch (e) {}
     const newCtx = new AC({latencyHint: 'interactive'});
-    newCtx.resume().catch(() => {});
+    if (IS_IOS_OR_SAFARI) unlockIosAudioContext(newCtx);
+    else newCtx.resume().catch(() => {});
     createProcessorNode(newCtx, rate, frame, preferScript).then((built) => {
       if (audio !== curAudio || ended) { try { newCtx.close(); } catch (_) {} return; }
       const next = wireContextGraph(newCtx, stream, built.node, built.engine, rate, frame, recentPcm);
@@ -1411,9 +1492,11 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     });
   }
 
-  // Starts microphone capture synchronously inside the user tap, and instantiates AudioContext AFTER getUserMedia
-  // resolves across all platforms so iOS VoiceProcessingIO, Android VOICE_COMMUNICATION HAL, and Bluetooth HFP
-  // profile switches finish before AudioContext binds to the hardware sample rate and capture stream.
+  // Starts microphone capture synchronously inside the user tap. On iOS/Safari, WKWebView requires unlocking an
+  // AudioContext synchronously inside the tap gesture (otherwise post-await contexts stay suspended); after
+  // getUserMedia activates VoiceProcessingIO, we resume that unlocked context and fall back to a post-capture
+  // context only if Safari wedged the pre-capture instance. Non-iOS platforms create AudioContext post-getUserMedia
+  // so Android VOICE_COMMUNICATION HAL and Bluetooth HFP profile switches settle first.
   function startAudio(rate, frame) {
     if (audio) {
       if (audio.rate !== rate || audio.frame !== frame) {
@@ -1429,6 +1512,22 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return Promise.reject(new Error('当前环境不支持 WebAudio'));
     try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+    let earlyCtx = null;
+    if (IS_IOS_OR_SAFARI) {
+      clearTimeout(iosPrimeTimer);
+      iosPrimeTimer = null;
+      if (!(navigator && navigator.audioSession)) primeIosAudio();
+      if (iosPrimedCtx && iosPrimedCtx.state !== 'closed') {
+        earlyCtx = iosPrimedCtx;
+        iosPrimedCtx = null;
+      } else {
+        try { earlyCtx = new AC({latencyHint: 'interactive'}); } catch (e) { earlyCtx = null; }
+      }
+      if (earlyCtx) {
+        unlockIosAudioContext(earlyCtx);
+        pendingIosCtx = earlyCtx;
+      }
+    }
     const gum = navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
       autoGainControl: true, channelCount: 1}, video: false}).catch((err) => {
       const en = err && err.name;
@@ -1438,7 +1537,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       throw err;
     });
     audioStarting = (async () => {
-      let ctx = null, stream = null;
+      let ctx = earlyCtx, stream = null;
       try {
         stream = await gum;
         if (ended) {
@@ -1447,10 +1546,34 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         }
         try { stream.getTracks().forEach((t) => { if ('enabled' in t) t.enabled = true; }); } catch (e) {}
         try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
-        ctx = new AC({latencyHint: 'interactive'});
-        ctx.resume().catch(() => {});
+        if (ctx && ctx.state !== 'closed') {
+          if (ctx.state !== 'running') await waitCtxRunning(ctx, 250);
+          if (ctx.state !== 'running') {
+            let postCtx = null;
+            try {
+              postCtx = new AC({latencyHint: 'interactive'});
+              postCtx.resume().catch(() => {});
+              await waitCtxRunning(postCtx, 150);
+            } catch (e) { postCtx = null; }
+            if (postCtx && postCtx.state === 'running') {
+              try { ctx.close(); } catch (e) {}
+              ctx = postCtx;
+            } else {
+              if (postCtx) try { postCtx.close(); } catch (e) {}
+              try { ctx.resume().catch(() => {}); } catch (e) {}
+            }
+          }
+        } else {
+          ctx = new AC({latencyHint: 'interactive'});
+          ctx.resume().catch(() => {});
+        }
+        pendingIosCtx = IS_IOS_OR_SAFARI ? ctx : null;
         let node = null, engine = 'worklet';
         const modOk = await loadWorkletModule(ctx);
+        if (ended) {
+          stream.getTracks().forEach((t) => t.stop());
+          throw new Error('通话已结束');
+        }
         if (modOk) {
           try {
             node = new AudioWorkletNode(ctx, 'bridge-io', {
@@ -1490,8 +1613,10 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         sendDiag(null, (e && (e.name ? e.name + ': ' + (e.message || '') : e.message)) || String(e));
         gum.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
         if (ctx) try { ctx.close(); } catch (_) {}
+        if (earlyCtx && earlyCtx !== ctx) try { earlyCtx.close(); } catch (_) {}
         throw e;
       } finally {
+        pendingIosCtx = null;
         audioStarting = null;
       }
     })();
@@ -1714,32 +1839,52 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   // Keeps the AudioContext running: the system can suspend or interrupt it (iOS when the mic starts, another
   // app takes audio, the page is backgrounded). Resume quietly, and ask for a tap if that is not allowed.
   const SOUND_HINT = '声音被系统暂停了，轻点屏幕任意位置恢复';
-  let soundHint = false, soundTimer = null;
+  let soundHint = false, soundTimer = null, soundRetryTimers = [];
+  function clearSoundTimers() {
+    clearTimeout(soundTimer);
+    soundTimer = null;
+    while (soundRetryTimers.length) clearTimeout(soundRetryTimers.pop());
+  }
   function checkAudio() {
     if (!audio) return;
     if (audio.aec && audio.aec.el && audio.aec.el.paused) audio.aec.el.play().catch(() => {});
     const s = audio.ctx.state;
     if (s === 'running') {
+      clearSoundTimers();
       if (!audio.stalled && soundHint) { soundHint = false; hint(''); }
       syncRingback();
       return;
     }
     if (s === 'closed') return;
     audio.ctx.resume().catch(() => {});
-    clearTimeout(soundTimer);
+    clearSoundTimers();
+    [250, 600].forEach((ms) => {
+      soundRetryTimers.push(setTimeout(() => {
+        if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') {
+          audio.ctx.resume().catch(() => {});
+        }
+      }, ms));
+    });
     soundTimer = setTimeout(() => {
       if (audio && audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') {
         soundHint = true;
         hint(SOUND_HINT, true);
       }
-    }, 800);
+    }, 1000);
   }
   ['touchend', 'click'].forEach((t) => document.addEventListener(t, () => {
-    if (!audio) return;
+    if (!audio) {
+      if (IS_IOS_OR_SAFARI && pendingIosCtx && pendingIosCtx.state !== 'closed') {
+        try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+        unlockIosAudioContext(pendingIosCtx);
+      }
+      return;
+    }
     if (IS_IOS_OR_SAFARI) {
       try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
-      if (audio.ctx.state !== 'running' && audio.ctx.state !== 'closed' && !(navigator && navigator.audioSession)) {
-        primeIosAudio();
+      if (audio.ctx.state !== 'running' && audio.ctx.state !== 'closed') {
+        if (!(navigator && navigator.audioSession)) primeIosAudio();
+        unlockIosAudioContext(audio.ctx);
       }
     }
     if (audio.aec && audio.aec.el && audio.aec.el.paused) audio.aec.el.play().catch(() => {});
@@ -1761,7 +1906,14 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     stopRingback();
     lastWorkletTx = null;
     lastWorkletSpeaker = null;
-    clearTimeout(soundTimer);
+    clearSoundTimers();
+    clearTimeout(iosPrimeTimer);
+    iosPrimeTimer = null;
+    if (iosPrimedCtx) {
+      try { iosPrimedCtx.close(); } catch (e) {}
+      iosPrimedCtx = null;
+    }
+    pendingIosCtx = null;
     clearTimeout(audioWatchTimer);
     audioWatchTimer = null;
     if (soundHint || micHint) { soundHint = false; micHint = false; hint(''); }
@@ -1906,6 +2058,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   }, true);
   $('pip').onclick = flipCamera;
 
+  const MEDIA_ACTIONS = {answer: true, dial: true, join: true, attach: true};
   function button(cls, icon, label, onClick, action) {
     const b = document.createElement('button');
     const busy = pending && pending.action === action;
@@ -1913,6 +2066,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     b.disabled = (!!pending && action !== 'speaker') || (!wsOpen && action !== 'close' && action !== 'speaker');
     b.innerHTML = '<span class="c">' + icon + '</span>';
     b.appendChild(document.createTextNode(label));
+    if (MEDIA_ACTIONS[action]) {
+      b.addEventListener('touchend', () => { if (!b.disabled) primeIosGestureContext(); });
+    }
     b.onclick = onClick;
     return b;
   }
