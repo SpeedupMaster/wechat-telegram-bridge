@@ -893,20 +893,28 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     let tx = true, speaker = false, rxEnv = 0, micGain = 1;
     let net = initNet || 16000, frame = initFrame || 320, step = net / sr;
     let acc = 0, sum = 0, cnt = 0, prevIn = 0, buf = new Int16Array(frame), n = 0;
-    let tracks = new Map(), ticks = 0, txFrames = 0, rxFrames = 0;
+    let tracks = new Map(), ticks = 0, txFrames = 0, txNonZero = 0, rxFrames = 0;
+    let inPeak = 0, txPeak = 0, framePeak = 0;
     const port = {onmessage: null, postMessage: null};
     function setRate(nextNet, nextFrame) {
       const changed = net !== nextNet;
       net = nextNet; frame = nextFrame; step = net / sr;
-      acc = 0; sum = 0; cnt = 0; prevIn = 0; buf = new Int16Array(frame); n = 0;
+      acc = 0; sum = 0; cnt = 0; prevIn = 0; buf = new Int16Array(frame); n = 0; framePeak = 0;
       if (changed) tracks = new Map();
     }
     function emit(v) {
       if (!tx) return;
+      if (!Number.isFinite(v)) v = 0;
       v = v < -1 ? -1 : v > 1 ? 1 : v;
-      buf[n++] = v < 0 ? v * 32768 : v * 32767;
+      const s16 = v < 0 ? Math.round(v * 32768) : Math.round(v * 32767);
+      buf[n++] = s16;
+      const a16 = s16 < 0 ? -s16 : s16;
+      if (a16 > framePeak) framePeak = a16;
       if (n === frame) {
         txFrames++;
+        if (framePeak > 0) txNonZero++;
+        if (framePeak > txPeak) txPeak = framePeak;
+        framePeak = 0;
         const out = buf; buf = new Int16Array(frame); n = 0;
         if (port.onmessage) port.onmessage({data: out.buffer});
       }
@@ -973,13 +981,48 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         const holdDecay = Math.exp(-ch.length / (sr * (speaker ? 0.18 : 0.14)));
         rxEnv = rxRms > rxEnv ? (rxEnv + (rxRms - rxEnv) * 0.65) : (rxEnv * holdDecay);
       }
-      const ib = ev.inputBuffer, inp = ib && ib.numberOfChannels > 0 ? ib.getChannelData(0) : null;
+      const ib = ev.inputBuffer, inChCount = ib ? ib.numberOfChannels : 0;
+      let inp = inChCount > 0 ? ib.getChannelData(0) : null;
+      if (inChCount > 1 && inp && inp.length) {
+        let activeChans = 0, soleChan = null;
+        for (let c = 0; c < inChCount; c++) {
+          const chArr = ib.getChannelData(c);
+          for (let i = 0; i < chArr.length; i++) {
+            if (chArr[i] !== 0 && Number.isFinite(chArr[i])) { activeChans++; soleChan = chArr; break; }
+          }
+        }
+        if (activeChans === 1 && soleChan) {
+          inp = soleChan;
+        } else if (activeChans > 1) {
+          const mixed = new Float32Array(inp.length), scale = 1 / activeChans;
+          for (let c = 0; c < inChCount; c++) {
+            const chArr = ib.getChannelData(c);
+            for (let i = 0; i < inp.length; i++) {
+              const v = chArr[i];
+              if (Number.isFinite(v)) mixed[i] += v * scale;
+            }
+          }
+          inp = mixed;
+        }
+      }
+      if (inp && inp.length) {
+        for (let i = 0; i < inp.length; i++) {
+          const v = inp[i];
+          if (Number.isFinite(v)) {
+            const av = v < 0 ? -v : v;
+            if (av > inPeak) inPeak = av;
+          }
+        }
+      }
       if (inp && tx) {
         let targetGain = 1;
         const refEnv = speaker ? rxEnv * 1.35 : rxEnv;
         if (refEnv > 0.015 && inp.length) {
           let txEnergy = 0;
-          for (let i = 0; i < inp.length; i++) txEnergy += inp[i] * inp[i];
+          for (let i = 0; i < inp.length; i++) {
+            const v = Number.isFinite(inp[i]) ? inp[i] : 0;
+            txEnergy += v * v;
+          }
           const txRms = Math.sqrt(txEnergy / inp.length);
           const dtThresh = Math.max(speaker ? 0.055 : 0.045, refEnv * (speaker ? 0.65 : 0.55));
           if (txRms < dtThresh) {
@@ -990,36 +1033,55 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         const gAlpha = targetGain > micGain ? 0.25 : 0.08;
         if (step <= 1) {
           for (let i = 0; i < inp.length; i++) {
+            const raw = Number.isFinite(inp[i]) ? inp[i] : 0;
             micGain += (targetGain - micGain) * gAlpha;
-            sum += inp[i] * micGain; cnt++; acc += step;
+            sum += raw * micGain; cnt++; acc += step;
             if (acc >= 1) { acc -= 1; emit(sum / cnt); sum = 0; cnt = 0; }
           }
         } else {
           const inv = 1 / step;
           for (let i = 0; i < inp.length; i++) {
+            const raw = Number.isFinite(inp[i]) ? inp[i] : 0;
             micGain += (targetGain - micGain) * gAlpha;
-            const s = inp[i] * micGain, p = prevIn;
+            const s = raw * micGain, p = prevIn;
             while (acc < 1) { emit(p + (s - p) * acc); acc += inv; }
             acc -= 1; prevIn = s;
           }
         }
       } else if (inp && inp.length) {
-        prevIn = 0; micGain = 1; acc = 0; sum = 0; cnt = 0; n = 0;
+        prevIn = 0; micGain = 1; acc = 0; sum = 0; cnt = 0; n = 0; framePeak = 0;
       }
       ticks++;
-      if (port.onmessage && (ticks === 1 || (ticks & 31) === 0)) {
-        port.onmessage({data: {t: 'stat', ticks: ticks, tx: txFrames, rx: rxFrames, hasIn: !!(inp && inp.length)}});
+      if (port.onmessage && (ticks === 1 || (ticks & 15) === 0)) {
+        const inPeak16 = Math.min(32767, Math.round(inPeak * 32767));
+        const txPeak16 = txPeak;
+        inPeak = 0; txPeak = 0;
+        port.onmessage({data: {
+          t: 'stat', ticks: ticks, tx: txFrames, txNz: txNonZero,
+          inPeak: inPeak16, txPeak: txPeak16, rx: rxFrames, hasIn: !!(inp && inp.length),
+        }});
       }
     };
     sp.port = port;
     return sp;
   }
 
+  let micHint = false;
+
   function primaryMicTrack(stream) {
     if (!stream) return null;
     const list = typeof stream.getAudioTracks === 'function' ? stream.getAudioTracks()
       : (typeof stream.getTracks === 'function' ? stream.getTracks() : []);
     return (list && list[0]) || null;
+  }
+
+  function bindMicTrackEvents(curAudio, stream) {
+    const tr = primaryMicTrack(stream);
+    if (tr && typeof tr.addEventListener === 'function') {
+      tr.addEventListener('mute', () => { if (audio === curAudio) sendDiag(curAudio); });
+      tr.addEventListener('unmute', () => { if (audio === curAudio) { checkAudio(); sendDiag(curAudio); } });
+      tr.addEventListener('ended', () => { if (audio === curAudio) sendDiag(curAudio, 'mic_track_ended'); });
+    }
   }
 
   function sendDiag(curAudio, errText) {
@@ -1033,7 +1095,12 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       payload.ticks = curAudio.ticks || 0;
       payload.hasIn = !!curAudio.hasIn;
       payload.txFrames = curAudio.txFrames || 0;
+      payload.txNonZero = curAudio.txNonZero || 0;
+      payload.inPeak = curAudio.maxInPeak || 0;
+      payload.txPeak = curAudio.maxTxPeak || 0;
       payload.rxFrames = curAudio.rxFrames || 0;
+      payload.aec = !!(curAudio.aec);
+      if (curAudio.recovery) payload.recovery = curAudio.recovery;
       if (curAudio.stalled) payload.stalled = true;
     }
     if (tr) {
@@ -1044,6 +1111,20 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     send(payload);
   }
 
+  function markMicSignal(curAudio, peak16) {
+    if (peak16 <= 0) return;
+    if (peak16 > curAudio.maxTxPeak) curAudio.maxTxPeak = peak16;
+    if (!curAudio.micAlive) {
+      curAudio.micAlive = true;
+      curAudio.silentTicks = 0;
+      if (micHint) {
+        micHint = false;
+        if (!soundHint) hint('');
+      }
+      if (curAudio.recovery) sendDiag(curAudio);
+    }
+  }
+
   function bindNodePort(curAudio, node) {
     node.port.onmessage = (e) => {
       if (audio !== curAudio) return;
@@ -1052,10 +1133,26 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         curAudio.ticks = d.ticks || (curAudio.ticks + 1);
         curAudio.hasIn = !!d.hasIn;
         curAudio.rxFrames = d.rx || curAudio.rxFrames;
+        if (typeof d.txNz === 'number' && d.txNz > curAudio.txNonZero) curAudio.txNonZero = d.txNz;
+        if (typeof d.inPeak === 'number' && d.inPeak > curAudio.maxInPeak) curAudio.maxInPeak = d.inPeak;
+        if (typeof d.txPeak === 'number' && d.txPeak > 0) markMicSignal(curAudio, d.txPeak);
+        else if (typeof d.inPeak === 'number' && d.inPeak > 0) markMicSignal(curAudio, d.inPeak);
         return;
       }
       curAudio.ticks++;
       curAudio.txFrames++;
+      if (d && d.byteLength >= 2) {
+        const s16 = new Int16Array(d);
+        let peak = 0;
+        for (let i = 0; i < s16.length; i++) {
+          const v = s16[i] < 0 ? -s16[i] : s16[i];
+          if (v > peak) peak = v;
+        }
+        if (peak > 0) {
+          curAudio.txNonZero++;
+          markMicSignal(curAudio, peak);
+        }
+      }
       if (st && st.mine && st.phase === 'active' && !isMuted() && ws && ws.readyState === 1 && ws.bufferedAmount < 128000) {
         ws.send(d);
       }
@@ -1072,6 +1169,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       const downstream = curAudio.voiceGain || curAudio.limiter || (curAudio.aec ? null : curAudio.ctx.destination);
       if (curAudio.source) curAudio.source.connect(sp);
       if (downstream) sp.connect(downstream);
+      if (curAudio.keepAlive) sp.connect(curAudio.keepAlive);
       curAudio.node = sp;
       curAudio.engine = 'scriptProcessor';
       lastWorkletTx = null;
@@ -1088,6 +1186,75 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     }
   }
 
+  function recoverSilentMic(curAudio) {
+    if (!curAudio || audio !== curAudio || ended || curAudio.micAlive || curAudio.recoveringMic) return;
+    const tr = primaryMicTrack(curAudio.stream);
+    if (curAudio.recoveryStage === 0) {
+      curAudio.recoveryStage = 1;
+      curAudio.recovery = 'rebind';
+      if (curAudio.aec) {
+        curAudio.bypassAec = true;
+        try { curAudio.aec.close(); } catch (e) {}
+        curAudio.aec = null;
+        curAudio.recovery = 'bypass_aec';
+      }
+      try { if (tr && 'enabled' in tr) tr.enabled = true; } catch (e) {}
+      try {
+        if (curAudio.stream && typeof curAudio.ctx.createMediaStreamSource === 'function') {
+          try { curAudio.source && curAudio.source.disconnect(); } catch (e) {}
+          const freshSrc = curAudio.ctx.createMediaStreamSource(curAudio.stream);
+          freshSrc.connect(curAudio.node);
+          curAudio.source = freshSrc;
+        }
+      } catch (e) {}
+      sendDiag(curAudio, 'silent_mic_' + curAudio.recovery);
+      return;
+    }
+    if (curAudio.recoveryStage === 1 && navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
+      curAudio.recoveryStage = 2;
+      curAudio.recoveringMic = true;
+      navigator.mediaDevices.getUserMedia({
+        audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false},
+        video: false,
+      }).then((rawStream) => {
+        curAudio.recoveringMic = false;
+        if (audio !== curAudio || ended || curAudio.micAlive) {
+          try { rawStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+          return;
+        }
+        const oldStream = curAudio.stream;
+        try { rawStream.getTracks().forEach((t) => { if ('enabled' in t) t.enabled = true; }); } catch (e) {}
+        try { curAudio.source && curAudio.source.disconnect(); } catch (e) {}
+        const freshSrc = curAudio.ctx.createMediaStreamSource(rawStream);
+        freshSrc.connect(curAudio.node);
+        curAudio.stream = rawStream;
+        curAudio.source = freshSrc;
+        curAudio.rawMic = true;
+        curAudio.recovery = 'raw_mic';
+        bindMicTrackEvents(curAudio, rawStream);
+        try { oldStream && oldStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+        lastWorkletSpeaker = null;
+        syncWorkletSpeaker();
+        sendDiag(curAudio, 'silent_mic_raw_fallback');
+      }, () => {
+        curAudio.recoveringMic = false;
+      });
+      return;
+    }
+    if (curAudio.recoveryStage === 2) {
+      curAudio.recoveryStage = 3;
+      if (!soundHint) {
+        micHint = true;
+        const msg = (tr && tr.muted)
+          ? '麦克风被系统静音或被占用，请检查麦克风权限'
+          : '未检测到麦克风输入，请检查 Telegram 麦克风权限或系统静音设置';
+        hint(msg, true);
+        browserFallback();
+      }
+      sendDiag(curAudio, (tr && tr.muted) ? 'silent_mic_track_muted' : 'silent_mic_persistent');
+    }
+  }
+
   let audioWatchTimer = null;
   function scheduleAudioWatch(curAudio, delayMs) {
     clearTimeout(audioWatchTimer);
@@ -1101,12 +1268,20 @@ border-top-color:#fff;animation:spin .8s linear infinite}
             curAudio.lastTime = curT;
             curAudio.frozenCount = 0;
             curAudio.stalled = false;
-            if (soundHint) { soundHint = false; hint(''); }
+            if (soundHint) { soundHint = false; if (!micHint) hint(''); }
             if (curAudio.engine === 'worklet' && curAudio.ticks === 0 && typeof ctx.createScriptProcessor === 'function') {
               swapToScriptProcessor(curAudio);
-            } else if (!curAudio.diagSent) {
-              curAudio.diagSent = true;
-              sendDiag(curAudio);
+            } else {
+              if (!curAudio.diagSent) {
+                curAudio.diagSent = true;
+                sendDiag(curAudio);
+              }
+              const tr = primaryMicTrack(curAudio.stream);
+              if (st && st.mine && st.phase === 'active' && !isMuted() && !curAudio.micAlive
+                  && (curAudio.txFrames >= 40 || (tr && (tr.muted || tr.readyState === 'ended')))) {
+                curAudio.silentTicks++;
+                recoverSilentMic(curAudio);
+              }
             }
           } else if (curAudio.ticks === curAudio.lastTicks) {
             curAudio.frozenCount++;
@@ -1134,12 +1309,18 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   }
 
   function wireContextGraph(ctx, stream, node, engine, rate, frame, recentPcm) {
-    let voiceGain = null, lim = null, outBus = node;
+    let voiceGain = null, keepAlive = null, lim = null, outBus = node;
     if (typeof ctx.createGain === 'function') {
       voiceGain = ctx.createGain();
       if (voiceGain && voiceGain.gain) voiceGain.gain.value = 1;
       node.connect(voiceGain);
       outBus = voiceGain;
+      // Silent pull path to ctx.destination so disconnecting outBus during WebRTC loopback AEC never starves
+      // Chromium's MediaStreamAudioSourceNode / ScriptProcessorNode render pull graph.
+      keepAlive = ctx.createGain();
+      if (keepAlive && keepAlive.gain) keepAlive.gain.value = 0;
+      node.connect(keepAlive);
+      keepAlive.connect(ctx.destination);
     }
     if (typeof ctx.createDynamicsCompressor === 'function') {
       try {
@@ -1159,9 +1340,11 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     outBus.connect(ctx.destination);
     const initT = typeof ctx.currentTime === 'number' ? ctx.currentTime : 0;
     return {
-      ctx: ctx, stream: stream, source: source, node: node, voiceGain: voiceGain, limiter: lim, out: outBus,
-      engine: engine, aec: null, aecPending: false, bypassAec: false, sinkId: '', routeKey: '',
-      rate: rate, frame: frame, ticks: 0, lastTicks: 0, txFrames: 0, rxFrames: 0, hasIn: false,
+      ctx: ctx, stream: stream, source: source, node: node, voiceGain: voiceGain, keepAlive: keepAlive,
+      limiter: lim, out: outBus, engine: engine, aec: null, aecPending: false, bypassAec: false,
+      rawMic: false, sinkId: '', routeKey: '', rate: rate, frame: frame, ticks: 0, lastTicks: 0,
+      txFrames: 0, txNonZero: 0, maxInPeak: 0, maxTxPeak: 0, micAlive: false, silentTicks: 0,
+      recoveryStage: 0, recoveringMic: false, recovery: '', rxFrames: 0, hasIn: false,
       lastTime: initT, frozenCount: 0, stalled: false, diagSent: false, recentPcm: recentPcm || new Map(),
     };
   }
@@ -1200,6 +1383,14 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     createProcessorNode(newCtx, rate, frame, preferScript).then((built) => {
       if (audio !== curAudio || ended) { try { newCtx.close(); } catch (_) {} return; }
       const next = wireContextGraph(newCtx, stream, built.node, built.engine, rate, frame, recentPcm);
+      next.bypassAec = curAudio.bypassAec;
+      next.rawMic = curAudio.rawMic;
+      next.recovery = curAudio.recovery;
+      next.recoveryStage = curAudio.recoveryStage;
+      next.micAlive = curAudio.micAlive;
+      next.txNonZero = curAudio.txNonZero;
+      next.maxInPeak = curAudio.maxInPeak;
+      next.maxTxPeak = curAudio.maxTxPeak;
       bindNodePort(next, built.node);
       audio = next;
       lastWorkletTx = null;
@@ -1207,7 +1398,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       syncWorkletTx();
       syncAudioRoute(true);
       newCtx.onstatechange = checkAudio;
-      if (soundHint && newCtx.state === 'running') { soundHint = false; hint(''); }
+      if (soundHint && newCtx.state === 'running') { soundHint = false; if (!micHint) hint(''); }
       checkAudio();
       for (const [tid, chunks] of recentPcm.entries()) {
         for (let i = 0; i < chunks.length; i++) built.node.port.postMessage({t: 'pcm', id: tid, pcm: chunks[i]});
@@ -1220,10 +1411,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     });
   }
 
-  // Starts microphone capture synchronously inside the user tap. On iOS/Safari, instantiating AudioContext
-  // BEFORE getUserMedia resolves causes VoiceProcessingIO startup / permission sheets to interrupt or freeze
-  // the context (0 mic chunks + silent output), whereas creating AudioContext right AFTER getUserMedia resolves
-  // inherits the active VoiceProcessingIO sample rate and starts unblocked under WebKit's capturing exemption.
+  // Starts microphone capture synchronously inside the user tap, and instantiates AudioContext AFTER getUserMedia
+  // resolves across all platforms so iOS VoiceProcessingIO, Android VOICE_COMMUNICATION HAL, and Bluetooth HFP
+  // profile switches finish before AudioContext binds to the hardware sample rate and capture stream.
   function startAudio(rate, frame) {
     if (audio) {
       if (audio.rate !== rate || audio.frame !== frame) {
@@ -1239,32 +1429,28 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return Promise.reject(new Error('当前环境不支持 WebAudio'));
     try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
-    primeIosAudio();
-    let earlyCtx = null, earlyMod = null;
-    if (!IS_IOS_OR_SAFARI) {
-      earlyCtx = new AC({latencyHint: 'interactive'});
-      earlyCtx.resume().catch(() => {});
-      earlyMod = loadWorkletModule(earlyCtx);
-    }
     const gum = navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true,
-      autoGainControl: true, channelCount: 1}, video: false});
+      autoGainControl: true, channelCount: 1}, video: false}).catch((err) => {
+      const en = err && err.name;
+      if (en === 'OverconstrainedError' || en === 'NotReadableError' || en === 'AbortError') {
+        return navigator.mediaDevices.getUserMedia({audio: true, video: false});
+      }
+      throw err;
+    });
     audioStarting = (async () => {
-      let ctx = earlyCtx, stream = null;
+      let ctx = null, stream = null;
       try {
         stream = await gum;
         if (ended) {
           stream.getTracks().forEach((t) => t.stop());
-          if (ctx) try { ctx.close(); } catch (_) {}
           throw new Error('通话已结束');
         }
         try { stream.getTracks().forEach((t) => { if ('enabled' in t) t.enabled = true; }); } catch (e) {}
-        if (!ctx) {
-          try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
-          ctx = new AC({latencyHint: 'interactive'});
-          ctx.resume().catch(() => {});
-        }
+        try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+        ctx = new AC({latencyHint: 'interactive'});
+        ctx.resume().catch(() => {});
         let node = null, engine = 'worklet';
-        const modOk = earlyMod ? await earlyMod : await loadWorkletModule(ctx);
+        const modOk = await loadWorkletModule(ctx);
         if (modOk) {
           try {
             node = new AudioWorkletNode(ctx, 'bridge-io', {
@@ -1282,12 +1468,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         }
         const curAudio = wireContextGraph(ctx, stream, node, engine, rate, frame);
         bindNodePort(curAudio, node);
-        const tr = primaryMicTrack(stream);
-        if (tr && typeof tr.addEventListener === 'function') {
-          tr.addEventListener('mute', () => { if (audio === curAudio) sendDiag(curAudio); });
-          tr.addEventListener('unmute', () => { if (audio === curAudio) { checkAudio(); sendDiag(curAudio); } });
-          tr.addEventListener('ended', () => { if (audio === curAudio) sendDiag(curAudio, 'mic_track_ended'); });
-        }
+        bindMicTrackEvents(curAudio, stream);
         audio = curAudio;
         lastWorkletTx = null;
         lastWorkletSpeaker = null;
@@ -1329,7 +1510,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
 
   function syncWorkletSpeaker() {
     if (!audio || !audio.node) { lastWorkletSpeaker = null; return; }
-    const on = isHandsFree();
+    const on = isHandsFree() || !!audio.rawMic;
     if (on !== lastWorkletSpeaker) {
       lastWorkletSpeaker = on;
       audio.node.port.postMessage({t: 'speaker', on: on});
@@ -1420,6 +1601,10 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const outs = await resolveAudioOutputs();
     if (audio !== curAudio || curAudio.ctx.state === 'closed') return;
 
+    // Telegram Android Mini App WebView already engages Android hardware AEC via getUserMedia; spinning up a local
+    // RTCPeerConnection loopback inside the embedded WebView conflicts with AudioRecord and zeros mic capture.
+    const tgAndroidWebView = IS_ANDROID && !!tg;
+
     if (wantSpeaker) {
       let targetSink = (outs.speaker && outs.speaker.deviceId) || '';
       if (!targetSink && speakerSinkId && (!outs.all.length || outs.all.some((d) => d.deviceId === speakerSinkId))) {
@@ -1436,8 +1621,13 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       }
       if (audio !== curAudio || curAudio.ctx.state === 'closed') return;
       if (targetSink && sinkCapable) {
-        curAudio.bypassAec = false;
-        ensureAecLoopback(curAudio);
+        if (!tgAndroidWebView && curAudio.recovery !== 'bypass_aec') {
+          curAudio.bypassAec = false;
+          ensureAecLoopback(curAudio);
+        } else {
+          curAudio.bypassAec = true;
+          if (curAudio.aec) { curAudio.aec.close(); curAudio.aec = null; }
+        }
         const ok = await applySinkId(curAudio, targetSink);
         if (ok) return;
         if (targetSink === speakerSinkId) speakerSinkId = '';
@@ -1449,11 +1639,21 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         if (curAudio.aec) { curAudio.aec.close(); curAudio.aec = null; }
         return;
       }
-      curAudio.bypassAec = false;
-      ensureAecLoopback(curAudio);
+      if (curAudio.recovery !== 'bypass_aec') {
+        curAudio.bypassAec = false;
+        ensureAecLoopback(curAudio);
+      }
+    } else if (tgAndroidWebView || (IS_ANDROID && isVideoMode() && !outs.headset)) {
+      curAudio.bypassAec = true;
+      if (curAudio.aec) { curAudio.aec.close(); curAudio.aec = null; }
+      if (isVideoMode() && curAudio.sinkId && sinkCapable) {
+        await applySinkId(curAudio, '');
+      }
     } else {
-      curAudio.bypassAec = false;
-      ensureAecLoopback(curAudio);
+      if (curAudio.recovery !== 'bypass_aec') {
+        curAudio.bypassAec = false;
+        ensureAecLoopback(curAudio);
+      }
       if (!isVideoMode() && sinkCapable) {
         const backSink = (outs.earpiece && outs.earpiece.deviceId) || (outs.headset && outs.headset.deviceId) || '';
         if (curAudio.sinkId !== backSink) await applySinkId(curAudio, backSink);
@@ -1538,7 +1738,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     if (!audio) return;
     if (IS_IOS_OR_SAFARI) {
       try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
-      primeIosAudio();
+      if (audio.ctx.state !== 'running' && audio.ctx.state !== 'closed' && !(navigator && navigator.audioSession)) {
+        primeIosAudio();
+      }
     }
     if (audio.aec && audio.aec.el && audio.aec.el.paused) audio.aec.el.play().catch(() => {});
     if (audio.stalled) {
@@ -1562,11 +1764,12 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     clearTimeout(soundTimer);
     clearTimeout(audioWatchTimer);
     audioWatchTimer = null;
-    if (soundHint) { soundHint = false; hint(''); }
+    if (soundHint || micHint) { soundHint = false; micHint = false; hint(''); }
     if (!audio) return;
     try { audio.aec && audio.aec.close(); } catch (e) {}
     try { audio.ctx.onstatechange = null; } catch (e) {}
     try { audio.source && audio.source.disconnect(); } catch (e) {}
+    try { audio.keepAlive && audio.keepAlive.disconnect(); } catch (e) {}
     try { audio.node && audio.node.disconnect && audio.node.disconnect(); } catch (e) {}
     try { audio.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
     try { audio.ctx.close(); } catch (e) {}
@@ -1937,6 +2140,13 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       stopAudio();
     }
     if (soundHint) hint(SOUND_HINT, true);  // a phase change clears the hint; this one still applies
+    else if (micHint && audio && !audio.micAlive) {
+      const tr = primaryMicTrack(audio.stream);
+      hint((tr && tr.muted)
+        ? '麦克风被系统静音或被占用，请检查麦克风权限'
+        : '未检测到麦克风输入，请检查 Telegram 麦克风权限或系统静音设置', true);
+      browserFallback();
+    }
   }
 
   function connect() {

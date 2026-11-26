@@ -506,6 +506,8 @@ class CallsMixin:
 
         entry["revision"] = call.get("revision", entry["revision"])
         if entry["terminal"]:
+            if state in ("ended", "uncertain"):
+                entry["stage"] = state
             await self._sync_call_msg(entry)
             return
         conf = entry["kind"] == "conference"

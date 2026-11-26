@@ -10,6 +10,7 @@ when the page runs as a Telegram Mini App its signed initData must additionally 
 """
 from __future__ import annotations
 
+import array
 import asyncio
 import hashlib
 import hmac
@@ -18,6 +19,7 @@ import logging
 import re
 import secrets
 import struct
+import sys
 import time
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, quote, urlsplit
@@ -74,6 +76,10 @@ _DEFAULT_VIDEO_CAPS = {
 AUDIO_CHECK_SECONDS = 8
 # Grace window when /media closes before /socket reports call.state(ending/ended) (e.g. remote conference teardown).
 MEDIA_CLOSE_GRACE_SECONDS = 5.0
+# Retain /media briefly while call.state is "ending" until "ended" arrives so agent-wechat does not drop /calls/socket.
+ENDING_MEDIA_GRACE_SECONDS = 5.0
+# Minimum PCM16 peak amplitude (~ -60 dBFS) expected from a live microphone stream.
+SILENT_MIC_PEAK_THRESHOLD = 32
 # Max queued socket bytes before dropping video frames so real-time audio never stalls behind video.
 VIDEO_WS_MAX_BUFFER = 64 * 1024
 KEYFRAME_REQ_COOLDOWN = 2.0
@@ -234,7 +240,8 @@ def _err_text(code: str | None, default: str) -> str:
 
 _DIAG_KEYS = (
     "engine", "ctxState", "sampleRate", "currentTime", "ticks", "hasIn",
-    "txFrames", "rxFrames", "stalled", "trackState", "trackMuted", "err",
+    "txFrames", "txNonZero", "inPeak", "txPeak", "rxFrames", "aec",
+    "recovery", "stalled", "trackState", "trackMuted", "err",
 )
 
 
@@ -320,10 +327,13 @@ class CallSession:
         self.rx_chunks = 0
         self.rx_to_page = 0
         self.tx_chunks = 0
+        self.tx_nonzero_chunks = 0
+        self.tx_peak = 0
         self.rx_video_frames = 0
         self.tx_video_frames = 0
         self.page_diag: dict[str, object] = {}
         self.watch_task: asyncio.Task | None = None
+        self.ending_task: asyncio.Task | None = None
 
     @property
     def attached(self) -> bool:
@@ -525,6 +535,12 @@ class CallSession:
             log.warning("Call %s: no microphone audio from the call page %ds after the media socket attached "
                         "(page attached: %s, muted: %s%s)", self.call_id, AUDIO_CHECK_SECONDS,
                         self.active_ws is not None, self.muted, extra)
+        elif not self.muted and (not self.tx_nonzero_chunks or self.tx_peak < SILENT_MIC_PEAK_THRESHOLD):
+            diag_str = _format_page_diag(self.page_diag)
+            extra = f", {diag_str}" if diag_str else ""
+            log.warning("Call %s: %d microphone chunks arrived in %ds but audio is silent "
+                        "(nonzero: %d, peak: %d, muted: %s%s)", self.call_id, self.tx_chunks,
+                        AUDIO_CHECK_SECONDS, self.tx_nonzero_chunks, self.tx_peak, self.muted, extra)
 
     async def _start_send(self) -> None:
         if self.media is not None and self.send_track is not None and self.send_gen is not None:
@@ -669,14 +685,24 @@ class CallSession:
                 pass
 
     async def from_page(self, ws: web.WebSocketResponse, data: bytes) -> None:
-        if (ws is not self.active_ws or self.muted or self.media is None
-                or self.send_track is None or self.send_gen is None):
+        if (ws is not self.active_ws or self.muted or self.closed or self.entry["terminal"]
+                or self.media is None or self.send_track is None or self.send_gen is None):
             return
         if len(data) & 1:
             data = data[:-1]
         if not data or len(data) > MAX_PCM_CHUNK:
             return
         self.tx_chunks += 1
+        if any(data):
+            self.tx_nonzero_chunks += 1
+            samples = array.array("h")
+            samples.frombytes(data)
+            if sys.byteorder != "little":
+                samples.byteswap()
+            lo, hi = min(samples), max(samples)
+            peak = -lo if -lo > hi else hi
+            if peak > self.tx_peak:
+                self.tx_peak = peak
         try:
             self._tx_seq += 1
             ts = self._tx_samples * 1_000_000 // max(1, self.rate)
@@ -694,6 +720,7 @@ class CallSession:
 
     async def from_page_video(self, ws: web.WebSocketResponse, data: bytes) -> None:
         if (ws is not self.active_ws or not self.camera_enabled or not self.video_send_active
+                or self.closed or self.entry["terminal"]
                 or self.media is None or self.video_send_track is None or self.video_send_gen is None):
             return
         parsed = decode_wxv1_frame(data)
@@ -755,6 +782,16 @@ class CallSession:
         if self.active_ws is None and not self.closed and not self.entry["terminal"]:
             await self.web.hangup(self.entry, quiet=True, status="📴 通话界面已关闭，已自动挂断")
 
+    def schedule_ending_close(self) -> None:
+        if self.closed or (self.ending_task is not None and not self.ending_task.done()):
+            return
+        self.ending_task = asyncio.create_task(self._ending_close())
+
+    async def _ending_close(self) -> None:
+        await asyncio.sleep(ENDING_MEDIA_GRACE_SECONDS)
+        if not self.closed:
+            await self.close()
+
     async def close(self) -> None:
         if self.closed:
             return
@@ -762,13 +799,17 @@ class CallSession:
         self.changed.set()
         if self.watch_task and not self.watch_task.done():
             self.watch_task.cancel()
+        if self.ending_task and not self.ending_task.done() and self.ending_task is not asyncio.current_task():
+            self.ending_task.cancel()
         if self.media is not None:
             diag_str = _format_page_diag(self.page_diag)
+            tx_silent = bool(self.tx_chunks and (not self.tx_nonzero_chunks or self.tx_peak < SILENT_MIC_PEAK_THRESHOLD))
+            tx_detail = f" (nonzero {self.tx_nonzero_chunks}, peak {self.tx_peak})" if self.tx_chunks else ""
             extra = (f" ({diag_str})"
-                     if diag_str and (not self.tx_chunks or not self.rx_to_page or self.page_diag.get("err"))
+                     if diag_str and (not self.tx_chunks or tx_silent or not self.rx_to_page or self.page_diag.get("err"))
                      else "")
-            log.info("Call %s audio: %d chunks from WeChat (%d relayed to the page), %d mic chunks from the page%s",
-                     self.call_id, self.rx_chunks, self.rx_to_page, self.tx_chunks, extra)
+            log.info("Call %s audio: %d chunks from WeChat (%d relayed to the page), %d mic chunks from the page%s%s",
+                     self.call_id, self.rx_chunks, self.rx_to_page, self.tx_chunks, tx_detail, extra)
         if self.grace_task and not self.grace_task.done() and self.grace_task is not asyncio.current_task():
             self.grace_task.cancel()
         if self.media is not None:
@@ -941,6 +982,10 @@ class CallWeb:
         if sess is not None:
             sess.changed.set()
             if entry["terminal"] and not sess.closed:
+                if entry.get("stage") == "ending":
+                    sess.schedule_ending_close()
+                    await self.push_state(entry)
+                    return
                 await sess.close()
                 return  # close() pushes the final state
             if not sess.closed and sess.video_rx_tracks:

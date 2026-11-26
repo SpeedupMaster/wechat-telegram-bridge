@@ -1910,5 +1910,281 @@ vm.runInNewContext({json.dumps(main_js)}, sandbox);
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         self.assertIn("IOS_TELEGRAM_AUDIO_OK", res.stdout)
 
+    def test_telegram_android_webview_silent_mic_self_healing_and_stereo_worklet_in_node(self):
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+
+        web_dir = Path(__file__).resolve().parent.parent / "bridge" / "web"
+        html = (web_dir / "call.html").read_text(encoding="utf-8")
+        worklet = (web_dir / "worklet.js").read_text(encoding="utf-8")
+        rendered = (
+            html.replace("__NONCE__", "testnonce")
+            .replace("__CFG__", json.dumps({"base": "/wxcall"}))
+            .replace("__WORKLET__", json.dumps(worklet))
+        )
+        main_js = re.findall(r'<script nonce="testnonce">([\s\S]*?)</script>', rendered)[1]
+
+        harness = f"""
+const vm = require('vm');
+
+// Part 1: Verify BridgeIO AudioWorkletProcessor rescues stereo mics with dead Ch0 + active Ch1 and NaN guard
+(() => {{
+  let ProcCls = null;
+  const wSandbox = {{
+    sampleRate: 48000,
+    AudioWorkletProcessor: class {{
+      constructor() {{ this.port = {{ onmessage: null, postMessage(msg) {{ wSandbox.msgs.push(msg); }} }}; }}
+    }},
+    registerProcessor: (_name, cls) => {{ ProcCls = cls; }},
+    Int16Array, Float32Array, Map, Math, Number,
+    msgs: [],
+  }};
+  vm.runInNewContext({json.dumps(worklet)}, wSandbox);
+  const proc = new ProcCls({{processorOptions: {{net: 16000, frame: 320, stat: true}}}});
+  // 8 quanta * 128 samples @ 48kHz = 1024 samples -> > 320 samples @ 16kHz (1 emitted PCM frame)
+  for (let q = 0; q < 8; q++) {{
+    const ch0 = new Float32Array(128); // completely silent Ch0!
+    const ch1 = new Float32Array(128).fill(0.5);
+    if (q === 0) ch1[3] = NaN; // corrupt sample must not poison state
+    const out = [new Float32Array(128)];
+    proc.process([[ch0, ch1]], [out]);
+  }}
+  const pcmBuf = wSandbox.msgs.find((m) => m instanceof ArrayBuffer);
+  if (!pcmBuf) throw new Error('Expected BridgeIO to emit 320-sample PCM buffer from Ch1');
+  const s16 = new Int16Array(pcmBuf);
+  let maxAbs = 0;
+  for (let i = 0; i < s16.length; i++) maxAbs = Math.max(maxAbs, Math.abs(s16[i]));
+  if (maxAbs < 15000) throw new Error('Expected unity-gain Ch1 signal > 15000, got ' + maxAbs);
+  // Trigger stat emission on tick 64
+  for (let q = 8; q < 64; q++) {{
+    proc.process([[new Float32Array(128), new Float32Array(128).fill(0.5)]], [[new Float32Array(128)]]);
+  }}
+  const statMsg = wSandbox.msgs.filter((m) => m && m.t === 'stat').pop();
+  if (!statMsg || statMsg.txNz < 1 || statMsg.inPeak < 15000 || statMsg.txPeak < 15000) {{
+    throw new Error('Expected stat telemetry with txNz/inPeak/txPeak, got ' + JSON.stringify(statMsg));
+  }}
+}})();
+
+// Part 2: Verify Telegram Android Mini App bypasses RTCPeerConnection loopback & post-gUM AudioContext ordering
+// Part 3: Verify silent-mic self-healing ladder (Stage 1 bypass_aec -> Stage 2 raw_mic -> Stage 3 hint -> auto-clear)
+(async () => {{
+  async function runScenario(isTgAndroid) {{
+    const timers = [];
+    let nextTimerId = 1;
+    function makeEl(id) {{
+      return {{
+        id: id || '', className: '', textContent: '', _html: '', hidden: false, disabled: false,
+        get innerHTML() {{ return this._html; }},
+        set innerHTML(v) {{ this._html = v; if (!v) this.children = []; }},
+        style: {{}}, children: [], listeners: {{}},
+        classList: {{ _set: new Set(), add(c) {{ this._set.add(c); }}, remove(c) {{ this._set.delete(c); }}, toggle() {{}}, contains(c) {{ return this._set.has(c); }} }},
+        appendChild(ch) {{ ch.parentNode = this; this.children.push(ch); return ch; }},
+        removeChild(ch) {{ this.children = this.children.filter((x) => x !== ch); }},
+        addEventListener() {{}}, setAttribute() {{}},
+        play() {{ return Promise.resolve(); }}, pause() {{}},
+        getBoundingClientRect() {{ return {{left: 0, top: 0, width: 100, height: 100}}; }},
+        getContext() {{ return {{}}; }},
+      }};
+    }}
+    const els = {{}};
+    ['stage', 'pip', 'selfVideo', 'main', 'avatar', 'title', 'name', 'status', 'timer', 'peers', 'hint', 'actions'].forEach((id) => {{ els[id] = makeEl(id); }});
+    const sockets = [], gumCalls = [], contexts = [], worklets = [];
+    let pcCreated = 0, oldTrackStopped = 0, releaseInitialGum = null;
+
+    class FakeWS {{
+      constructor() {{ this.readyState = 0; this.bufferedAmount = 0; this.sent = []; sockets.push(this); }}
+      send(d) {{ this.sent.push(d); }}
+      close() {{ this.readyState = 3; }}
+    }}
+    class FakeRTCPeerConnection {{
+      constructor() {{ pcCreated++; this.iceConnectionState = 'connected'; FakeRTCPeerConnection.peers.push(this); }}
+      addTrack(tr) {{ this._tr = tr; }}
+      addIceCandidate() {{ return Promise.resolve(); }}
+      createOffer() {{ return Promise.resolve({{type: 'offer', sdp: 'v=0\\r\\na=rtpmap:111 opus/48000/2\\r\\na=fmtp:111 useinbandfec=1\\r\\n'}}); }}
+      createAnswer() {{ return Promise.resolve({{type: 'answer', sdp: 'v=0\\r\\na=rtpmap:111 opus/48000/2\\r\\na=fmtp:111 useinbandfec=1\\r\\n'}}); }}
+      setLocalDescription(d) {{ this.localDescription = d; return Promise.resolve(); }}
+      setRemoteDescription(d) {{
+        if (d && d.type === 'offer' && this.ontrack) {{
+          Promise.resolve().then(() => this.ontrack && this.ontrack({{streams: [{{id: 'lb'}}]}}));
+        }}
+        return Promise.resolve();
+      }}
+      close() {{ this.iceConnectionState = 'closed'; }}
+    }}
+    FakeRTCPeerConnection.peers = [];
+
+    class FakeAudioContext {{
+      constructor() {{
+        this.state = 'running'; this.currentTime = 0; this.destination = {{isDest: true, connectedFrom: []}};
+        this.audioWorklet = {{ addModule: () => Promise.resolve() }};
+        contexts.push(this);
+      }}
+      resume() {{ return Promise.resolve(); }}
+      close() {{ this.state = 'closed'; }}
+      createMediaStreamSource(s) {{ return {{stream: s, connect() {{}}, disconnect() {{}}}}; }}
+      createMediaStreamDestination() {{ return {{stream: {{getAudioTracks: () => [{{kind: 'audio'}}]}}}}; }}
+      createGain() {{
+        return {{
+          gain: {{value: 1, setTargetAtTime(v) {{ this.value = v; }}}},
+          connect(t) {{ if (t && t.isDest) t.connectedFrom.push(this); return t; }},
+          disconnect() {{}},
+        }};
+      }}
+    }}
+    class FakeWorkletNode {{
+      constructor() {{
+        this.port = {{ onmessage: null, postMessage() {{}} }};
+        worklets.push(this);
+      }}
+      connect() {{}}
+      disconnect() {{}}
+    }}
+
+    const sandbox = {{
+      window: null, document: null, navigator: null,
+      location: {{
+        protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com',
+        pathname: '/wxcall/call/tok123456', search: '',
+        hash: isTgAndroid ? '#tgWebAppData=query_id%3D1%26user%3D%257B%2522id%2522%253A999%257D' : '',
+      }},
+      sessionStorage: {{ getItem: () => '', setItem: () => {{}} }},
+      URL: {{ createObjectURL: () => 'blob:w', revokeObjectURL: () => {{}} }},
+      Blob: class {{}}, WebSocket: FakeWS, DataView, Uint8Array, Int16Array, Float32Array, ArrayBuffer, Math, Number, JSON, Date, String,
+      Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
+      performance: {{now: () => 0}}, AudioWorkletNode: FakeWorkletNode, RTCPeerConnection: FakeRTCPeerConnection,
+      setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
+      clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+      setInterval: () => 1, clearInterval: () => {{}},
+    }};
+    sandbox.window = Object.assign(sandbox, {{ isSecureContext: true, innerWidth: 390, innerHeight: 844, AudioContext: FakeAudioContext }});
+    sandbox.window.parent = sandbox.window;
+    sandbox.document = {{
+      body: makeEl('body'), getElementById: (id) => els[id] || makeEl(id),
+      createElement: (tag) => makeEl(tag), createTextNode: (t) => ({{textContent: t}}),
+      addEventListener: () => {{}}, hidden: false,
+    }};
+    sandbox.navigator = {{
+      userAgent: isTgAndroid
+        ? 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/131.0.0.0 Mobile Safari/537.36 Telegram-Android/11.4'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+      mediaDevices: {{
+        enumerateDevices: () => Promise.resolve([]),
+        getUserMedia: (c) => {{
+          gumCalls.push(c);
+          if (gumCalls.length === 1) {{
+            return new Promise((resolve) => {{
+              releaseInitialGum = () => resolve({{
+                getAudioTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{ oldTrackStopped++; }}}}],
+                getTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{ oldTrackStopped++; }}}}],
+              }});
+            }});
+          }}
+          return Promise.resolve({{
+            getAudioTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{}}}}],
+            getTracks: () => [{{kind: 'audio', readyState: 'live', muted: false, enabled: true, stop() {{}}}}],
+          }});
+        }},
+      }},
+    }};
+
+    vm.runInNewContext({json.dumps(main_js)}, sandbox);
+    const ws = sockets[0]; ws.readyState = 1; await ws.onopen();
+    await new Promise((r) => setImmediate(r));
+    ws.onmessage({{data: JSON.stringify({{
+      type: 'state', phase: 'ringing', title: '微信语音来电', name: 'Peer', status: '🔔 响铃中…',
+      mine: false, muted: false, camera: false, answerable: true, videoCall: false, rate: 16000, frame: 320,
+    }})}});
+
+    // Tap answer -> must NOT create AudioContext before getUserMedia resolves on ANY platform!
+    els.actions.children[1].onclick();
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    if (contexts.length !== 0) {{
+      throw new Error('Created AudioContext before getUserMedia resolved! count=' + contexts.length);
+    }}
+    releaseInitialGum();
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+    if (contexts.length !== 1) throw new Error('Expected post-gUM AudioContext');
+    // Verify silent keepAlive (gain=0) connected to ctx.destination
+    if (!contexts[0].destination.connectedFrom.some((g) => g.gain.value === 0)) {{
+      throw new Error('Expected silent keepAlive GainNode(0) connected to ctx.destination');
+    }}
+
+    ws.onmessage({{data: JSON.stringify({{
+      type: 'state', phase: 'active', title: '微信语音通话', name: 'Peer', status: '🟢 通话中',
+      mine: true, muted: false, camera: false, elapsed: 1, videoCall: false, rate: 16000, frame: 320,
+    }})}});
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+
+    if (isTgAndroid) {{
+      if (pcCreated !== 0) {{
+        throw new Error('Telegram Android Mini App WebView must bypass RTCPeerConnection loopback, got pcCreated=' + pcCreated);
+      }}
+      return;
+    }}
+
+    // Desktop scenario: RTCPeerConnection loopback WAS created initially
+    if (pcCreated < 2) throw new Error('Expected Desktop voice call to set up loopback AEC initially');
+
+    // Emit 45 all-zero PCM frames from worklet (broken AEC capture)
+    const wn = worklets[0];
+    for (let f = 0; f < 45; f++) {{
+      wn.port.onmessage({{data: new Int16Array(320).buffer}});
+    }}
+    function fireWatchTick(nextTime) {{
+      contexts[0].currentTime = nextTime;
+      const wt = timers.find((t) => t.ms >= 500 && t.ms <= 2000);
+      if (!wt) throw new Error('Missing audioWatchTimer');
+      timers.splice(timers.indexOf(wt), 1);
+      wt.fn();
+    }}
+
+    // Watch tick 1 -> Stage 1 recovery: bypass_aec + rebind source
+    fireWatchTick(1.5);
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    let diags = ws.sent.filter((s) => typeof s === 'string').map((s) => JSON.parse(s)).filter((m) => m.type === 'diag');
+    if (!diags.some((d) => d.recovery === 'bypass_aec' && d.aec === false)) {{
+      throw new Error('Expected Stage 1 silent-mic recovery=bypass_aec, got ' + JSON.stringify(diags));
+    }}
+
+    // Still zero PCM -> Watch tick 2 -> Stage 2 recovery: raw_mic getUserMedia(echoCancellation: false)
+    fireWatchTick(3.0);
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    if (gumCalls.length < 2 || gumCalls[1].audio.echoCancellation !== false || oldTrackStopped < 1) {{
+      throw new Error('Expected Stage 2 raw_mic getUserMedia({{echoCancellation: false}}), got ' + JSON.stringify(gumCalls));
+    }}
+    diags = ws.sent.filter((s) => typeof s === 'string').map((s) => JSON.parse(s)).filter((m) => m.type === 'diag');
+    if (!diags.some((d) => d.recovery === 'raw_mic')) {{
+      throw new Error('Expected diag recovery=raw_mic, got ' + JSON.stringify(diags));
+    }}
+
+    // Still zero PCM -> Watch tick 3 -> Stage 3 user warning hint
+    fireWatchTick(4.5);
+    if (!els.hint.textContent.includes('未检测到麦克风')) {{
+      throw new Error('Expected user-facing silent-mic hint at Stage 3, got: ' + els.hint.textContent);
+    }}
+
+    // Now real non-zero speech arrives on the raw mic stream -> warning auto-clears!
+    const liveFrame = new Int16Array(320).fill(4200);
+    wn.port.onmessage({{data: liveFrame.buffer}});
+    if (els.hint.textContent !== '') {{
+      throw new Error('Expected silent-mic hint to clear automatically once speech arrives, got: ' + els.hint.textContent);
+    }}
+  }}
+
+  await runScenario(true);
+  await runScenario(false);
+  console.log('SILENT_MIC_RECOVERY_OK');
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+        res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("SILENT_MIC_RECOVERY_OK", res.stdout)
+
+
 
 

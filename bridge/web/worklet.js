@@ -8,7 +8,11 @@ class BridgeIO extends AudioWorkletProcessor {
     this.stat = !!p.stat;
     this.ticks = 0;
     this.txFrames = 0;
+    this.txNonZero = 0;
     this.rxFrames = 0;
+    this.inPeak = 0;
+    this.txPeak = 0;
+    this.framePeak = 0;
     this.rxEnv = 0;
     this.micGain = 1;
     this.tracks = new Map();
@@ -31,10 +35,17 @@ class BridgeIO extends AudioWorkletProcessor {
   }
   emitSample(v) {
     if (!this.tx) return;
+    if (!Number.isFinite(v)) v = 0;
     v = v < -1 ? -1 : v > 1 ? 1 : v;
-    this.buf[this.n++] = v < 0 ? v * 32768 : v * 32767;
+    const s16 = v < 0 ? Math.round(v * 32768) : Math.round(v * 32767);
+    this.buf[this.n++] = s16;
+    const a16 = s16 < 0 ? -s16 : s16;
+    if (a16 > this.framePeak) this.framePeak = a16;
     if (this.n === this.frame) {
       this.txFrames++;
+      if (this.framePeak > 0) this.txNonZero++;
+      if (this.framePeak > this.txPeak) this.txPeak = this.framePeak;
+      this.framePeak = 0;
       const out = this.buf; this.buf = new Int16Array(this.frame); this.n = 0;
       this.port.postMessage(out.buffer, [out.buffer]);
     }
@@ -117,14 +128,54 @@ class BridgeIO extends AudioWorkletProcessor {
       this.rxEnv = rxRms > this.rxEnv ? (this.rxEnv + (rxRms - this.rxEnv) * 0.65) : (this.rxEnv * holdDecay);
     }
 
-    // 2) Capture & resample near-end microphone with double-talk-aware residual echo suppression
-    const inp = inputs[0] && inputs[0][0];
+    // 2) Capture & resample near-end microphone with multi-channel downmix and residual echo suppression
+    const inChans = inputs[0];
+    const ch0 = inChans && inChans[0];
+    let inp = ch0;
+    if (inChans && inChans.length > 1 && ch0 && ch0.length) {
+      if (!this.monoBuf || this.monoBuf.length !== ch0.length) this.monoBuf = new Float32Array(ch0.length);
+      let activeChans = 0, soleChan = null;
+      for (let c = 0; c < inChans.length; c++) {
+        const chArr = inChans[c];
+        if (!chArr) continue;
+        for (let i = 0; i < chArr.length; i++) {
+          if (chArr[i] !== 0 && Number.isFinite(chArr[i])) { activeChans++; soleChan = chArr; break; }
+        }
+      }
+      if (activeChans === 1 && soleChan) {
+        inp = soleChan;
+      } else if (activeChans > 1) {
+        const scale = 1 / activeChans;
+        this.monoBuf.fill(0);
+        for (let c = 0; c < inChans.length; c++) {
+          const chArr = inChans[c];
+          if (!chArr) continue;
+          for (let i = 0; i < ch0.length; i++) {
+            const v = chArr[i];
+            if (Number.isFinite(v)) this.monoBuf[i] += v * scale;
+          }
+        }
+        inp = this.monoBuf;
+      }
+    }
+    if (inp && inp.length) {
+      for (let i = 0; i < inp.length; i++) {
+        const v = inp[i];
+        if (Number.isFinite(v)) {
+          const av = v < 0 ? -v : v;
+          if (av > this.inPeak) this.inPeak = av;
+        }
+      }
+    }
     if (inp && this.tx) {
       let targetGain = 1;
       const refEnv = this.speaker ? this.rxEnv * 1.35 : this.rxEnv;
       if (refEnv > 0.015 && inp.length) {
         let txEnergy = 0;
-        for (let i = 0; i < inp.length; i++) txEnergy += inp[i] * inp[i];
+        for (let i = 0; i < inp.length; i++) {
+          const v = Number.isFinite(inp[i]) ? inp[i] : 0;
+          txEnergy += v * v;
+        }
         const txRms = Math.sqrt(txEnergy / inp.length);
         // Suppress speakerphone bleed when far-end dominates; open immediately on near-end double-talk
         const dtThresh = Math.max(this.speaker ? 0.055 : 0.045, refEnv * (this.speaker ? 0.65 : 0.55));
@@ -136,8 +187,9 @@ class BridgeIO extends AudioWorkletProcessor {
       const gAlpha = targetGain > this.micGain ? 0.25 : 0.08;
       if (this.step <= 1) {
         for (let i = 0; i < inp.length; i++) {
+          const raw = Number.isFinite(inp[i]) ? inp[i] : 0;
           this.micGain += (targetGain - this.micGain) * gAlpha;
-          this.sum += inp[i] * this.micGain; this.cnt++; this.acc += this.step;
+          this.sum += raw * this.micGain; this.cnt++; this.acc += this.step;
           if (this.acc >= 1) {
             this.acc -= 1;
             this.emitSample(this.sum / this.cnt);
@@ -147,8 +199,9 @@ class BridgeIO extends AudioWorkletProcessor {
       } else {
         const inv = 1 / this.step;
         for (let i = 0; i < inp.length; i++) {
+          const raw = Number.isFinite(inp[i]) ? inp[i] : 0;
           this.micGain += (targetGain - this.micGain) * gAlpha;
-          const s = inp[i] * this.micGain, p = this.prevIn;
+          const s = raw * this.micGain, p = this.prevIn;
           while (this.acc < 1) {
             this.emitSample(p + (s - p) * this.acc);
             this.acc += inv;
@@ -160,11 +213,18 @@ class BridgeIO extends AudioWorkletProcessor {
     } else if (inp && inp.length) {
       this.prevIn = 0;
       this.micGain = 1;
-      this.acc = 0; this.sum = 0; this.cnt = 0; this.n = 0;
+      this.acc = 0; this.sum = 0; this.cnt = 0; this.n = 0; this.framePeak = 0;
     }
     this.ticks++;
-    if (this.stat && (this.ticks === 1 || (this.ticks & 255) === 0)) {
-      this.port.postMessage({t: 'stat', ticks: this.ticks, tx: this.txFrames, rx: this.rxFrames, hasIn: !!(inp && inp.length)});
+    if (this.stat && (this.ticks === 1 || (this.ticks & 63) === 0)) {
+      const inPeak16 = Math.min(32767, Math.round(this.inPeak * 32767));
+      const txPeak16 = this.txPeak;
+      this.inPeak = 0;
+      this.txPeak = 0;
+      this.port.postMessage({
+        t: 'stat', ticks: this.ticks, tx: this.txFrames, txNz: this.txNonZero,
+        inPeak: inPeak16, txPeak: txPeak16, rx: this.rxFrames, hasIn: !!(inp && inp.length),
+      });
     }
     return true;
   }

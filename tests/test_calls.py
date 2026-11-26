@@ -1556,3 +1556,101 @@ class CallConcurrencyAndCrashHardeningTests(unittest.IsolatedAsyncioTestCase):
             callweb.AUDIO_CHECK_SECONDS = saved_chk
             await ws.close()
 
+    async def test_silent_mic_chunks_warn_with_diag_and_ending_retains_media_until_ended(self):
+        import struct
+        import bridge.callweb as callweb
+        from tests.fakes import _FakeMediaSocket, _button_urls, _init_data
+
+        self.daemon.add_thread("wxid_alice", "Alice")
+        media = _FakeMediaSocket()
+
+        async def call_media(call_id, client_id, owner_token, timeout=10.0):
+            return media, {
+                "type": "media.ready",
+                "protocolVersion": 3,
+                "sendTracks": [{"media": "audio", "id": 1, "generation": 1, "direction": "send",
+                                "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
+                "receiveTracks": [{"media": "audio", "id": 2, "generation": 1, "direction": "receive",
+                                   "format": {"sampleRate": 16000, "channels": 1, "frameMs": 20}}],
+            }
+
+        self.b.wx.call_media = call_media
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.answer":
+                async def connected():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "silent-end-1", "revision": 3, "kind": "direct", "callType": "voice",
+                        "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+                asyncio.create_task(connected())
+                return {"type": "command.result", "status": "accepted", "callId": "silent-end-1", "ownerToken": "own-s"}
+            return {"type": "command.result", "status": "accepted"}
+
+        self.sock.on_command = on_cmd
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "silent-end-1", "revision": 2, "kind": "direct", "callType": "voice", "callerId": "wxid_alice"}})
+        token = _button_urls(self.b.bot.sent[-1])[0].rsplit("/", 1)[1]
+
+        ws = await self.http.ws_connect(self.base + "/ws")
+        callweb.AUDIO_CHECK_SECONDS, saved_chk = 0.06, callweb.AUDIO_CHECK_SECONDS
+        try:
+            await ws.send_json({"type": "auth", "token": token, "initData": _init_data("123:abc", 999)})
+            await asyncio.wait_for(ws.receive(), timeout=2.0)
+            with self.assertLogs("bridge.callweb", level="INFO") as cm:
+                await ws.send_json({"type": "answer"})
+                while True:
+                    m = json.loads((await asyncio.wait_for(ws.receive(), timeout=2.0)).data)
+                    if m.get("type") == "state" and m.get("phase") == "active":
+                        break
+                await ws.send_json({
+                    "type": "diag",
+                    "engine": "worklet",
+                    "ctxState": "running",
+                    "sampleRate": 48000,
+                    "txFrames": 50,
+                    "txNonZero": 0,
+                    "inPeak": 0,
+                    "txPeak": 0,
+                    "aec": False,
+                    "recovery": "raw_mic",
+                    "trackState": "live",
+                    "trackMuted": True,
+                })
+                media.queue.put_nowait({
+                    "type": "audio.chunk", "trackId": 2, "generation": 1, "sequence": 1,
+                    "timestampMicros": 0, "pcm": b"\x10\x00" * 320,
+                })
+                # Send 5 all-zero PCM chunks from the page before AUDIO_CHECK_SECONDS fires
+                for _ in range(5):
+                    await ws.send_bytes(b"\x00\x00" * 320)
+                await asyncio.sleep(0.10)
+
+                # Now call enters "ending": page sees ended state, late mic chunks stop forwarding,
+                # and /media stays open until "ended" so agent-wechat never drops /calls/socket!
+                await self.b.handle_call_event({"type": "call.state", "call": {
+                    "callId": "silent-end-1", "revision": 4, "kind": "direct", "callType": "voice",
+                    "direction": "incoming", "state": "ending", "ownedByThisClient": True}})
+                self.assertFalse(media.closed, "media socket must stay open during 'ending' until 'ended'")
+                sent_before_ending = len(media.sent_bytes)
+                await ws.send_bytes(struct.pack("<h", 12000) * 320)
+                await asyncio.sleep(0.02)
+                self.assertEqual(len(media.sent_bytes), sent_before_ending)
+
+                # Terminal "ended" arrives -> media socket closes cleanly and logs nonzero/peak + diag
+                await self.b.handle_call_event({"type": "call.state", "call": {
+                    "callId": "silent-end-1", "revision": 5, "kind": "direct", "callType": "voice",
+                    "direction": "incoming", "state": "ended", "ownedByThisClient": True}})
+                self.assertTrue(media.closed)
+
+            joined_logs = "\n".join(cm.output)
+            self.assertIn("microphone chunks arrived", joined_logs)
+            self.assertIn("audio is silent (nonzero: 0, peak: 0", joined_logs)
+            self.assertIn("recovery=raw_mic", joined_logs)
+            self.assertIn("trackMuted=True", joined_logs)
+            self.assertIn("5 mic chunks from the page (nonzero 0, peak 0)", joined_logs)
+        finally:
+            callweb.AUDIO_CHECK_SECONDS = saved_chk
+            await ws.close()
+
+
