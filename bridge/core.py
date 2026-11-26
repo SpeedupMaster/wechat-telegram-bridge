@@ -2007,17 +2007,23 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             if result is not None:
                 state = result.get("state")
                 if state not in SEND_OK:
-                    reason = result.get("errorCode") or result.get("reason") or state
+                    err_obj = result.get("error") if isinstance(result.get("error"), dict) else {}
+                    raw_reason = str(result.get("errorCode") or result.get("reason") or err_obj.get("code") or state)
+                    reason_text = MEDIA_REASONS.get(raw_reason, raw_reason)
+                    reason_display = f"{reason_text}（{raw_reason}）" if reason_text != raw_reason else raw_reason
                     hint = "（结果未知，请在手机上确认，不要重复发送）" if state == "needs_review" else ""
                     await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id),
-                                       f"{fail_prefix}{reason}{hint}")
+                                       f"{fail_prefix}{reason_display}{hint}")
                 elif self.cfg.bridge.mark_read_on_reply:
                     try:
                         await self.wx.mark_read(thread_id)
                     except Exception:
                         pass
         except WeChatError as e:
-            await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{e.code}")
+            log.warning("Telegram -> WeChat failed (%s, key=%s): %s", label, key, e)
+            reason_text = MEDIA_REASONS.get(e.code, e.code)
+            reason_display = f"{reason_text}（{e.code}）" if reason_text != e.code else e.code
+            await self._report(chat_id, await self._bot_reply_id(chat_id, msg.id), f"{fail_prefix}{reason_display}")
         except Exception as e:
             log.exception("Telegram -> WeChat failed")
             err_detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__

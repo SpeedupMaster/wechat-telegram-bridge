@@ -951,5 +951,74 @@ class VoiceAndMediaV31Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.b.bot.sent), sent_before_cancel)
         self.assertIn("对方已取消发送该语音", lc_placeholder.text)
 
+    async def test_send_media_failure_logs_full_job_diagnostics_and_reports_chinese_reason(self):
+        from bridge.wechat import Media
+        from tests.fakes import tg_event
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -501, "Bob")
+        orig_handler = self.daemon.handler
+
+        def fail_send(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path.endswith("/sends"):
+                return httpx.Response(202, json={"id": "job-apk-1", "state": "queued", "kind": "send"})
+            if request.method == "GET" and request.url.path.endswith("/jobs/job-apk-1"):
+                return httpx.Response(200, json={
+                    "id": "job-apk-1",
+                    "kind": "send",
+                    "state": "needs_review",
+                    "phase": "uploading",
+                    "reason": "media_processing_failed",
+                    "retryable": False,
+                    "attempts": 1,
+                    "completedBytes": 52_428_800,
+                    "totalBytes": 60_817_408,
+                    "result": {"serviceStage": "large_file_upload", "serviceCode": -1},
+                })
+            return orig_handler(request)
+
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(fail_send),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+        # Direct send_media logs full structured diagnostics even for small payloads
+        with self.assertLogs("wechat", level="WARNING") as logs:
+            res = await self.b.wx.send_media(
+                "wxid_bob", "file", Media(b"apk-bytes", "application/vnd.android.package-archive", "app.apk"), "k-apk",
+            )
+        self.assertEqual(res["state"], "needs_review")
+        joined = "\n".join(logs.output)
+        for snippet in (
+            "id=job-apk-1",
+            "key=k-apk",
+            "state=needs_review",
+            "phase=uploading",
+            "reason=media_processing_failed",
+            "retryable=False",
+            "attempts=1",
+            "bytes=52428800/60817408",
+            "large_file_upload",
+        ):
+            self.assertIn(snippet, joined)
+
+        # End-to-end Telegram -> WeChat failure reports Chinese reason + raw code + needs_review hint
+        ev = tg_event(-501, 42, "")
+        ev.message.media = SimpleNamespace()
+        ev.message.file = SimpleNamespace(
+            size=9, mime_type="application/vnd.android.package-archive", name="app.apk", ext=".apk",
+        )
+        ev.message.photo = ev.message.sticker = ev.message.voice = None
+        ev.message.gif = ev.message.video = ev.message.video_note = None
+        ev.message.download_media = mock.AsyncMock(return_value=b"apk-bytes")
+        with self.assertLogs("wechat", level="WARNING"):
+            await self.b.on_tg_message(ev)
+        alert = self.b.bot.sent[-1].text
+        self.assertIn("app.apk", alert)
+        self.assertIn("媒体解码或处理失败（media_processing_failed）", alert)
+        self.assertIn("结果未知", alert)
+
+
 
 

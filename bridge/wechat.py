@@ -726,7 +726,9 @@ class WeChatClient:
             body["mentions"] = mentions
         intent = await self._req("POST", self._a("sends"), json=body, headers={"Idempotency-Key": key},
                                  timeout=_SEND_TIMEOUT)
-        return await self._wait(intent, lambda i: f"sends/{_id(i['id'])}", SEND_DONE, 120)
+        res = await self._wait(intent, lambda i: f"sends/{_id(i['id'])}", SEND_DONE, 120)
+        _log_send_failure("text", thread_id, key, res)
+        return res
 
     async def _upload_media(self, media: Media) -> dict:
         if media.path is not None:
@@ -767,6 +769,7 @@ class WeChatClient:
         if not prep_id:
             prep = await self.prepare_sticker(media, f"{key}-prep", fit=True)
             if prep.get("state") != "available":
+                _log_send_failure("sticker-prep", media.filename, f"{key}-prep", prep)
                 return prep
             prep_id = prep["id"]
             self._put_cached_prep(cache_key, prep_id)
@@ -785,6 +788,7 @@ class WeChatClient:
                 if res.get("state") == "failed" and reason in _EXPIRED_PREP_CODES:
                     stale = True
                 else:
+                    _log_send_failure("sticker", media.filename, send_key, res)
                     return res
             except WeChatError as e:
                 if used_cached and attempt == 0 and e.code in _EXPIRED_PREP_CODES:
@@ -792,10 +796,12 @@ class WeChatClient:
                 else:
                     raise
             if not (stale and used_cached and attempt == 0):
+                _log_send_failure("sticker", media.filename, send_key, res)
                 return res
             self._sticker_preps.pop(cache_key, None)
             prep = await self.prepare_sticker(media, f"{key}-reprep", fit=True)
             if prep.get("state") != "available":
+                _log_send_failure("sticker-prep", media.filename, f"{key}-reprep", prep)
                 return prep
             prep_id = prep["id"]
             self._put_cached_prep(cache_key, prep_id)
@@ -825,6 +831,7 @@ class WeChatClient:
                 "WeChat media send %s (%s, %.1f MiB): local_upload=%.2fs, wx_send=%.2fs (%.2f MiB/s), state=%s",
                 media.filename, kind, media_size / 1048576, t_upload, t_send, rate, res.get("state"),
             )
+        _log_send_failure(kind, media.filename, key, res)
         return res
 
     async def recall_message(self, message_id: str, server_id: str, key: str) -> dict:
@@ -1056,6 +1063,37 @@ class WeChatClient:
         except (WeChatError, httpx.HTTPError):
             return None
         return r.content or None
+
+
+def _log_send_failure(kind: str, label: str, key: str, res: Any) -> None:
+    """Log structured non-secret job/send diagnostics whenever a WeChat send does not succeed."""
+    if not isinstance(res, dict) or res.get("state") in SEND_OK:
+        return
+    parts: list[str] = []
+    if job_id := res.get("id"):
+        parts.append(f"id={job_id}")
+    if key:
+        parts.append(f"key={key}")
+    parts.append(f"state={res.get('state')}")
+    if phase := res.get("phase"):
+        parts.append(f"phase={phase}")
+    err = res.get("error") if isinstance(res.get("error"), dict) else None
+    reason = res.get("reason") or res.get("errorCode") or (err.get("code") if err else None)
+    if reason:
+        parts.append(f"reason={reason}")
+    if (retryable := res.get("retryable")) is not None:
+        parts.append(f"retryable={retryable}")
+    if (attempts := res.get("attempts")) is not None:
+        parts.append(f"attempts={attempts}")
+    completed = res.get("completedBytes")
+    total = res.get("totalBytes")
+    if completed is not None or total is not None:
+        parts.append(f"bytes={completed}/{total}")
+    if err:
+        parts.append(f"error={json.dumps(err, ensure_ascii=False, separators=(',', ':'))}")
+    if result := res.get("result"):
+        parts.append(f"result={json.dumps(result, ensure_ascii=False, separators=(',', ':'))}")
+    log.warning("WeChat %s send failed (%s): %s", kind, label, ", ".join(parts))
 
 
 def _log_voice_download_failure(mid: str, job: dict) -> None:
