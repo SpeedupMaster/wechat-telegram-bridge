@@ -845,6 +845,24 @@ class WeChatClient:
         return item
 
     # --- receiving media ----------------------------------------------------
+    async def _start_media_transfer(self, mid: str, payload: dict) -> dict:
+        """Start a media transfer job, retrying transient 503 media_queue_full responses."""
+        delays = self._read_retry_delays
+        for attempt in range(len(delays) + 1):
+            try:
+                return await self._req("POST", self._a(f"messages/{_id(mid)}/media-transfers"), json=payload)
+            except WeChatError as e:
+                if attempt >= len(delays) or not (e.status == 503 and e.code == "media_queue_full"):
+                    raise
+                delay = delays[attempt]
+                log.warning(
+                    "WeChat media transfer for %s hit 503 media_queue_full; retrying in %.1fs (%d/%d)",
+                    mid, delay, attempt + 1, len(delays),
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
     async def download_channels_video(self, message: dict, max_bytes: int) -> Media | str | None:
         """Fetch a Channels card's playable video if present, returning None when none is offered."""
         return await self._download_media(message, max_bytes, channels=True)
@@ -900,15 +918,14 @@ class WeChatClient:
                     break
                 fetchable = [
                     a for a in cands
-                    if a.get("state") not in ("expired", "unsupported", "recalled", "available")
+                    if a.get("state") not in ("expired", "unsupported", "recalled", "cancelled", "available")
                     and (a.get("advertisedByteLength") or 0) <= max_bytes
                 ]
                 if not fetchable:
                     continue
                 cand = fetchable[0]
-                last_job = await self._req(
-                    "POST", self._a(f"messages/{_id(mid)}/media-transfers"),
-                    json={"messageId": mid, "assetId": cand.get("id"), "quality": variant},
+                last_job = await self._start_media_transfer(
+                    mid, {"messageId": mid, "assetId": cand.get("id"), "quality": variant},
                 )
                 last_job = await self._wait(last_job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 300)
                 items = await assets()
@@ -921,15 +938,21 @@ class WeChatClient:
                 if avail:
                     asset = avail[0]
                     break
+                if mtype == VOICE:
+                    _log_voice_download_failure(mid, last_job)
         if not asset:
             pool = [a for a in items if eligible(a)]
             asset = _pick(pool, mtype)
         if not asset:
             eligible_items = [a for a in items if eligible(a)]
             states = {a.get("state") for a in eligible_items}
-            if states & {"expired", "unsupported", "recalled"} and not states & {"pending", "not_cached"}:
+            if states & {"expired", "unsupported", "recalled", "cancelled"} and not states & {"pending", "not_cached"}:
                 reasons = [a["reason"] for a in eligible_items if a.get("reason")]
-                return reasons[0] if reasons else "已过期" if "expired" in states else "不支持"
+                if reasons:
+                    return reasons[0]
+                if "cancelled" in states:
+                    return "voice_cancelled" if mtype == VOICE else "media_cancelled"
+                return "已过期" if "expired" in states else "不支持"
             big = [
                 a for a in eligible_items
                 if (a.get("advertisedByteLength") or 0) > max_bytes or (a.get("byteLength") or 0) > max_bytes
@@ -939,12 +962,15 @@ class WeChatClient:
             if last_job:
                 reason = last_job.get("reason") or last_job.get("state")
                 return reason if reason and reason != "available" else "下载失败"
-            job = await self._req("POST", self._a(f"messages/{_id(mid)}/media-transfers"),
-                                  json={"messageId": mid, "assetId": None, "quality": quality})
+            job = await self._start_media_transfer(
+                mid, {"messageId": mid, "assetId": None, "quality": quality},
+            )
             job = await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 300)
             items = await assets()
             asset = _pick([a for a in items if eligible(a)], mtype)
             if not asset:
+                if mtype == VOICE:
+                    _log_voice_download_failure(mid, job)
                 reason = job.get("reason") or job.get("state")
                 return reason if reason and reason != "available" else "下载失败"
         if (asset.get("byteLength") or 0) > max_bytes:
@@ -995,16 +1021,15 @@ class WeChatClient:
         if not asset:
             fetchable = [
                 a for a in cands
-                if a.get("state") not in ("expired", "unsupported", "recalled", "available")
+                if a.get("state") not in ("expired", "unsupported", "recalled", "cancelled", "available")
                 and (a.get("advertisedByteLength") or 0) <= max_bytes
             ]
             if not fetchable:
                 return None
             cand = fetchable[0]
             try:
-                job = await self._req(
-                    "POST", self._a(f"messages/{_id(mid)}/media-transfers"),
-                    json={"messageId": mid, "assetId": cand.get("id"), "quality": cand.get("variant") or "thumbnail"},
+                job = await self._start_media_transfer(
+                    mid, {"messageId": mid, "assetId": cand.get("id"), "quality": cand.get("variant") or "thumbnail"},
                 )
                 await self._wait(job, lambda j: f"jobs/{_id(j['id'])}", JOB_DONE, 20)
                 items = (await self._req("GET", self._a(f"messages/{_id(mid)}/media"))).get("items", [])
@@ -1031,6 +1056,14 @@ class WeChatClient:
         except (WeChatError, httpx.HTTPError):
             return None
         return r.content or None
+
+
+def _log_voice_download_failure(mid: str, job: dict) -> None:
+    """Log non-secret voiceDownloadFailure diagnostics attached by agent-wechat >= 3.1.0."""
+    res = job.get("result")
+    diag = res.get("voiceDownloadFailure") if isinstance(res, dict) else None
+    if isinstance(diag, dict) and diag:
+        log.info("WeChat voice download failure diagnostics for %s: %s", mid, diag)
 
 
 def _range_start(content_range: str | None) -> int | None:

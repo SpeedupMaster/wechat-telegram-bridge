@@ -246,6 +246,13 @@ class Store:
         """Drop message mappings of a thread in a chat (its topic was deleted: those messages are gone)."""
         self.db.execute("DELETE FROM msgmap WHERE tg_chat=? AND wx_thread=?", (tg_chat, wx_thread))
 
+    def unmap_messages(self, tg_chat: int, tg_msgs: list[int]) -> None:
+        """Drop specific Telegram message mappings after their placeholder messages were deleted."""
+        if not tg_msgs:
+            return
+        marks = ",".join("?" for _ in tg_msgs)
+        self.db.execute(f"DELETE FROM msgmap WHERE tg_chat=? AND tg_msg IN ({marks})", (tg_chat, *tg_msgs))
+
     # --- messages ---------------------------------------------------------
     @staticmethod
     def _norm_id(value: str | int | None) -> str | None:

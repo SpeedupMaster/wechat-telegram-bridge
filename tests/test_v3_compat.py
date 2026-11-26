@@ -714,3 +714,242 @@ class BigXmlAndMessageUpdatedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.b.bot.edited, [])
 
 
+def _minimal_wav(frames: int = 320, sample_rate: int = 16000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack(f"<{frames}h", *([1000, -1000] * (frames // 2))))
+    return buf.getvalue()
+
+
+class VoiceAndMediaV31Tests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cfg = Config(
+            WeChatConfig(token="secret-token"),
+            TelegramConfig(api_id=1, api_hash="x", bot_token="123:abc"),
+            BridgeConfig(create_interval_seconds=0, sync_avatar=False),
+            Path(self.tmp.name) / "config.toml",
+        )
+        self.daemon = GroupDaemon()
+        self.b = Bridge(cfg, user_client=FakeUser(), bot_client=FakeBot())
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(self.daemon.handler),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        self.b.wx._read_retry_delays = (0.0, 0.0)
+        self.b.wx._poll_initial_delay = 0.0
+        self.b.wx._avatar_poll_interval = 0.0
+        self.b._bot_pair_wait = 0.0
+        self.b.bot_input = object()
+        self.b.bot_me = SimpleNamespace(username="mybot")
+        self.b.tg_ready.set()
+        self.b.wx_ready = True
+        self.b.owner_id = 999
+        await self.b.wx.resolve_account()
+
+    async def asyncTearDown(self):
+        await self.b.close()
+        self.b.store.db.close()
+        self.tmp.cleanup()
+
+    def test_v31_media_error_reasons_render_friendly_chinese(self):
+        from bridge.core import MEDIA_REASONS, _media_failure_text
+
+        for code in (
+            "media_processing_failed",
+            "voice_cancelled",
+            "media_cancelled",
+            "media_queue_full",
+            "media_job_not_retryable",
+        ):
+            self.assertIn(code, MEDIA_REASONS)
+            rendered = _media_failure_text({"type": 34, "threadId": "wxid_bob", "senderId": "wxid_bob"}, code)
+            self.assertNotIn(code, rendered)
+            self.assertIn("语音", rendered)
+
+    async def test_media_transfer_retries_on_503_media_queue_full_and_does_not_retry_410(self):
+        wav = _minimal_wav()
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("v_qfull", "wxid_bob", "", type_=34)
+        self.daemon.media["v_qfull"] = [{
+            "id": "va_qfull", "kind": "voice", "variant": "normal", "state": "not_cached",
+            "contentType": "audio/wav", "advertisedByteLength": len(wav), "filename": "v.wav",
+        }]
+        self.daemon.media_bytes["va_qfull"] = (wav, "audio/wav")
+
+        queue_full_left = [2]
+        orig_handler = self.daemon.handler
+
+        def wrapped(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path.endswith("/messages/v_qfull/media-transfers"):
+                if queue_full_left[0] > 0:
+                    queue_full_left[0] -= 1
+                    return httpx.Response(503, json={"error": {"code": "media_queue_full", "retryable": True}})
+            if request.method == "POST" and request.url.path.endswith("/messages/v_cancel410/media-transfers"):
+                return httpx.Response(410, json={"error": {"code": "voice_cancelled", "retryable": False}})
+            return orig_handler(request)
+
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(wrapped),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+        # 2 transient 503 media_queue_full responses -> 3rd attempt succeeds
+        res = await self.b.wx.download_media(self.daemon.messages["v_qfull"], 10 * 1024 * 1024)
+        self.assertNotIsInstance(res, str)
+        self.assertEqual(queue_full_left[0], 0)
+        self.assertEqual(len(self.daemon.media_transfers), 1)
+
+        # 410 voice_cancelled is terminal and never retried
+        self.daemon.add_message("v_cancel410", "wxid_bob", "", type_=34)
+        self.daemon.media["v_cancel410"] = []
+        cancel_attempts = [0]
+
+        def wrapped_410(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path.endswith("/messages/v_cancel410/media-transfers"):
+                cancel_attempts[0] += 1
+                return httpx.Response(410, json={"error": {"code": "voice_cancelled", "retryable": False}})
+            return orig_handler(request)
+
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(wrapped_410),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        with self.assertRaises(WeChatError) as ctx:
+            await self.b.wx.download_media(self.daemon.messages["v_cancel410"], 10 * 1024 * 1024)
+        self.assertEqual((ctx.exception.status, ctx.exception.code), (410, "voice_cancelled"))
+        self.assertEqual(cancel_attempts[0], 1)
+
+    async def test_cancelled_asset_skips_media_transfer_and_returns_cancel_code(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("v_cancelled", "wxid_bob", "", type_=34)
+        self.daemon.media["v_cancelled"] = [{
+            "id": "va_can", "kind": "voice", "variant": "normal", "state": "cancelled",
+            "contentType": "audio/wav",
+        }]
+        self.daemon.add_message("img_cancelled", "wxid_bob", "", type_=3)
+        self.daemon.media["img_cancelled"] = [{
+            "id": "ia_can", "kind": "image", "variant": "original", "state": "cancelled",
+            "contentType": "image/jpeg",
+        }]
+
+        res_v = await self.b.wx.download_media(self.daemon.messages["v_cancelled"], 10 * 1024 * 1024)
+        res_i = await self.b.wx.download_media(self.daemon.messages["img_cancelled"], 10 * 1024 * 1024)
+        self.assertEqual(res_v, "voice_cancelled")
+        self.assertEqual(res_i, "media_cancelled")
+        self.assertEqual(self.daemon.media_transfers, [])
+
+    async def test_voice_download_failure_logs_structured_diagnostics(self):
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.daemon.add_message("v_diag", "wxid_bob", "", type_=34)
+        self.daemon.media["v_diag"] = [{
+            "id": "va_diag", "kind": "voice", "variant": "normal", "state": "not_cached",
+            "contentType": "audio/wav", "advertisedByteLength": 2048,
+        }]
+        diag = {
+            "stage": "decode", "transport": "cgi128", "fallback": True,
+            "completedBytes": 1024, "chunkCount": 2, "xmlFormat": 4, "reason": "media_processing_failed",
+        }
+        orig_handler = self.daemon.handler
+
+        def wrapped(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path.endswith("/messages/v_diag/media-transfers"):
+                self.daemon.transfer_jobs["dljob-diag"] = {
+                    "id": "dljob-diag",
+                    "state": "failed",
+                    "reason": "media_processing_failed",
+                    "result": {"voiceDownloadFailure": diag},
+                }
+                return httpx.Response(202, json={"id": "dljob-diag", "state": "queued"})
+            return orig_handler(request)
+
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(wrapped),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        with self.assertLogs("wechat", level="INFO") as logs:
+            res = await self.b.wx.download_media(self.daemon.messages["v_diag"], 10 * 1024 * 1024)
+        self.assertEqual(res, "media_processing_failed")
+        self.assertTrue(any("voiceDownloadFailure" in ln or "cgi128" in ln for ln in logs.output), logs.output)
+
+    async def test_streaming_voice_message_updated_redelivers_failed_placeholder_and_ignores_succeeded(self):
+        wav = _minimal_wav()
+        self.daemon.add_thread("wxid_bob", "Bob")
+
+        # 1) Voice initially fails on message.committed (e.g. settled before endflag=1) -> placeholder text sent
+        self.daemon.add_message("v_stream", "wxid_bob", "", type_=34, server="9101")
+        self.daemon.media["v_stream"] = [{
+            "id": "va_stream", "kind": "voice", "variant": "normal", "state": "not_cached",
+            "contentType": "audio/wav", "advertisedByteLength": len(wav), "filename": "voice.wav",
+        }]
+        self.daemon.transfer_fail_reasons["normal"] = "media_processing_failed"
+
+        await self.b.handle_event({
+            "cursor": "1", "kind": "message.committed",
+            "data": {"messageId": "v_stream", "threadId": "wxid_bob", "origin": "live", "direction": "incoming"},
+        })
+        placeholder = self.b.bot.sent[-1]
+        self.assertIsNone(placeholder.file)
+        self.assertIn("媒体解码或处理失败", placeholder.text)
+
+        # Later endflag=1 arrives, daemon updates the message and emits message.updated -> voice now downloads
+        self.daemon.transfer_fail_reasons.clear()
+        self.daemon.media_bytes["va_stream"] = (wav, "audio/wav")
+        with mock.patch("bridge.core.wav_to_ogg", new=mock.AsyncMock(return_value=b"OggS-fake")):
+            await self.b.handle_event({
+                "cursor": "2", "kind": "message.updated",
+                "data": {"messageId": "v_stream", "threadId": "wxid_bob", "origin": "live", "direction": "incoming"},
+            })
+
+        # Real voice message was sent, stale placeholder was deleted and unmapped, msgmap points to new voice msg
+        voice_msg = self.b.bot.sent[-1]
+        self.assertIsNotNone(voice_msg.file)
+        self.assertTrue(voice_msg.kwargs.get("voice_note"))
+        self.assertIn(placeholder.id, self.b.bot.deleted)
+        chat_id = self.b.store.chat_for_thread("wxid_bob")
+        assert chat_id is not None
+        self.assertEqual(self.b.store.tg_for_wx("wxid_bob", "v_stream", "9101", tg_chat=chat_id), (chat_id, voice_msg.id))
+
+        # Replaying message.updated after voice succeeded must NOT send a duplicate voice message
+        sent_count = len(self.b.bot.sent)
+        await self.b.handle_event({
+            "cursor": "3", "kind": "message.updated",
+            "data": {"messageId": "v_stream", "threadId": "wxid_bob", "origin": "live", "direction": "incoming"},
+        })
+        self.assertEqual(len(self.b.bot.sent), sent_count)
+
+        # 2) Voice that initially failed then gets cancelflag=1 -> edits placeholder in place to cancelled notice
+        self.daemon.add_message("v_late_cancel", "wxid_bob", "", type_=34, server="9102")
+        self.daemon.media["v_late_cancel"] = [{
+            "id": "va_lc", "kind": "voice", "variant": "normal", "state": "not_cached",
+            "contentType": "audio/wav",
+        }]
+        self.daemon.transfer_fail_reasons["normal"] = "media_processing_failed"
+        await self.b.handle_event({
+            "cursor": "4", "kind": "message.committed",
+            "data": {"messageId": "v_late_cancel", "threadId": "wxid_bob", "origin": "live", "direction": "incoming"},
+        })
+        lc_placeholder = self.b.bot.sent[-1]
+        sent_before_cancel = len(self.b.bot.sent)
+
+        self.daemon.transfer_fail_reasons.clear()
+        self.daemon.media["v_late_cancel"][0]["state"] = "cancelled"
+        await self.b.handle_event({
+            "cursor": "5", "kind": "message.updated",
+            "data": {"messageId": "v_late_cancel", "threadId": "wxid_bob", "origin": "live", "direction": "incoming"},
+        })
+        self.assertEqual(len(self.b.bot.sent), sent_before_cancel)
+        self.assertIn("对方已取消发送该语音", lc_placeholder.text)
+
+
+

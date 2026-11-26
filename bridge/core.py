@@ -232,6 +232,7 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
         self._bg_tasks: set[asyncio.Task] = set()
         self._event_concurrency: int = EVENT_CONCURRENCY
         self._media_dl_sem = asyncio.Semaphore(WX_MEDIA_DOWNLOAD_CONCURRENCY)
+        self._failed_voice_msgs: dict[str, str] = {}  # wx_msg_id -> last failure reason (bounded)
         self._card_cache_handle: asyncio.TimerHandle | None = None
         self._card_cache_idle_seconds: float = CARD_CACHE_IDLE_SECONDS
         self.forum_chat: int | None = (
@@ -1155,6 +1156,25 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             return hit[1], ""
         return None, self._quote_prefix(msg, orig)
 
+    @staticmethod
+    async def _convert_voice_media(media: Media) -> tuple[Media, tuple[int, bytes] | None]:
+        if media.mime != "audio/wav":
+            return media, None
+        voice_meta = wav_voice_meta(media.data, path=media.path)
+        ogg = await (wav_to_ogg(path=media.path) if media.path is not None else wav_to_ogg(media.data))
+        if ogg:
+            media.close()
+            return Media(ogg, "audio/ogg", "voice.ogg"), voice_meta
+        return media, voice_meta
+
+    def _note_failed_voice(self, message_id: str, reason: str) -> None:
+        if reason in ("voice_cancelled", "media_cancelled"):
+            self._failed_voice_msgs.pop(message_id, None)
+            return
+        self._failed_voice_msgs[message_id] = reason
+        while len(self._failed_voice_msgs) > 500:
+            self._failed_voice_msgs.pop(next(iter(self._failed_voice_msgs)))
+
     # --- sending to Telegram ----------------------------------------------
     async def forward_to_tg(self, chat: int, thread: dict, msg: dict) -> None:
         outgoing = msg.get("direction") == "outgoing"
@@ -1163,6 +1183,7 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
 
         media: Media | str | None = None
         voice_meta: tuple[int, bytes] | None = None
+        voice_failed_reason = ""
         channels_video_err = ""
         wx_dl_s = 0.0
         t = msg.get("type")
@@ -1179,11 +1200,10 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             wx_dl_s = time.monotonic() - t_dl0
             if isinstance(media, str):
                 log.info("Could not download the attachment of WeChat message %s (type %s): %s", msg["id"], t, media)
-            if isinstance(media, Media) and t == VOICE and media.mime == "audio/wav":
-                voice_meta = wav_voice_meta(media.data, path=media.path)
-                if ogg := await (wav_to_ogg(path=media.path) if media.path is not None else wav_to_ogg(media.data)):
-                    media.close()
-                    media = Media(ogg, "audio/ogg", "voice.ogg")
+                if t == VOICE:
+                    voice_failed_reason = media
+            if isinstance(media, Media) and t == VOICE:
+                media, voice_meta = await self._convert_voice_media(media)
         elif is_channels:
             t_dl0 = time.monotonic()
             try:
@@ -1246,6 +1266,11 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
                 self.store.map_message(chat, "user", m.id, msg["threadId"], msg["id"], msg.get("serverId"))
             if not self.topics:
                 self._pair(chat, _fingerprint(m), bot=(msg["threadId"], msg["id"], msg.get("serverId")))
+        if t == VOICE:
+            if voice_failed_reason and sent:
+                self._note_failed_voice(msg["id"], voice_failed_reason)
+            else:
+                self._failed_voice_msgs.pop(msg["id"], None)
         self.forwarded += 1
 
     def _schedule_card_cache_clear(self) -> None:
@@ -1639,7 +1664,8 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             return await go(new_chat)
 
     async def on_wx_message_updated(self, data: dict) -> None:
-        """Refresh a previously forwarded message in place when agent-wechat fills in its body (e.g. 49:40 -> 49:19)."""
+        """Refresh a previously forwarded message in place when agent-wechat fills in its body (e.g. 49:40 -> 49:19),
+        or re-deliver a streaming voice note that initially timed out before endflag=1."""
         message_id = data.get("messageId")
         if not message_id:
             return
@@ -1649,9 +1675,13 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             log.debug("Could not fetch updated WeChat message %s: %s", message_id, e)
             return
         if msg.get("recall"):
+            self._failed_voice_msgs.pop(message_id, None)
             return
         t = msg.get("type")
-        if t in (IMAGE, VIDEO, VOICE, STICKER) or (t == APP and msg.get("appMessageType") == APP_FILE):
+        if t == VOICE:
+            await self._on_wx_voice_updated(msg, data)
+            return
+        if t in (IMAGE, VIDEO, STICKER) or (t == APP and msg.get("appMessageType") == APP_FILE):
             return
         thread_id = msg.get("threadId") or data.get("threadId") or ""
         if not thread_id:
@@ -1687,6 +1717,76 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
             self.store.map_message(chat_id, "bot", sent.id, thread_id, msg["id"], msg.get("serverId"))
             if chat_id < -1000000000000:
                 self.store.map_message(chat_id, "user", sent.id, thread_id, msg["id"], msg.get("serverId"))
+
+    async def _on_wx_voice_updated(self, msg: dict, data: dict) -> None:
+        """Retry a voice message that failed on message.committed when agent-wechat later finalizes it."""
+        message_id = msg["id"]
+        prev_reason = self._failed_voice_msgs.get(message_id)
+        if prev_reason is None:
+            return
+        thread_id = msg.get("threadId") or data.get("threadId") or ""
+        if not thread_id:
+            self._failed_voice_msgs.pop(message_id, None)
+            return
+        dest = self._dest_for_thread(thread_id)
+        hit = self.store.tg_msgs_for_wx(thread_id, message_id, msg.get("serverId"), tg_chat=dest[0] if dest else None)
+        if not hit:
+            self._failed_voice_msgs.pop(message_id, None)
+            return
+        chat_id, msg_ids = hit
+        try:
+            async with self._media_dl_sem:
+                media: Media | str = await self.wx.download_media(msg, self.max_media)
+        except WeChatError as e:
+            media = e.code
+        try:
+            thread = await self.wx.thread(thread_id)
+        except WeChatError:
+            thread = {"id": thread_id, "kind": "group" if is_group_id(thread_id) else "direct"}
+        header = await self._msg_header(thread, msg)
+        reply_to, prefix = await self._resolve_quote(chat_id, msg)
+        if isinstance(media, str):
+            log.info("Updated WeChat voice %s still could not be downloaded: %s", message_id, media)
+            if media in ("voice_cancelled", "media_cancelled"):
+                self._failed_voice_msgs.pop(message_id, None)
+                if media != prev_reason:
+                    text = header + prefix + _media_failure_text(msg, media)
+                    try:
+                        await self.bot.edit_message(chat_id, msg_ids[0], text, parse_mode="html", link_preview=False)
+                    except errors.MessageNotModifiedError:
+                        pass
+                    except Exception as e:
+                        log.info("Could not update cancelled voice placeholder %s/%s: %s", chat_id, msg_ids[0], e)
+            return
+        self._failed_voice_msgs.pop(message_id, None)
+        voice_meta: tuple[int, bytes] | None = None
+        should_trim = media.path is not None or media.size >= TRIM_MEDIA_BYTES
+        silent = msg.get("direction") == "outgoing" and self.cfg.bridge.outgoing_silent
+        sent: list = []
+        try:
+            media, voice_meta = await self._convert_voice_media(media)
+            sent = await self._send_tg(
+                chat_id, thread, header, prefix, msg, media, reply_to, silent,
+                voice_meta=voice_meta,
+            )
+        finally:
+            media.close()
+            if should_trim:
+                maybe_trim_memory()
+        if not sent:
+            return
+        try:
+            await self.bot.delete_messages(chat_id, msg_ids)
+        except Exception as e:
+            log.info("Could not delete stale voice placeholder %s/%s: %s", chat_id, msg_ids, e)
+        else:
+            self.store.unmap_messages(chat_id, msg_ids)
+        for m in sent:
+            self.store.map_message(chat_id, "bot", m.id, thread_id, msg["id"], msg.get("serverId"))
+            if chat_id < -1000000000000:
+                self.store.map_message(chat_id, "user", m.id, thread_id, msg["id"], msg.get("serverId"))
+            if not self.topics:
+                self._pair(chat_id, _fingerprint(m), bot=(thread_id, msg["id"], msg.get("serverId")))
 
     async def on_wx_recall(self, data: dict) -> None:
         tid = data.get("threadId") or ""
