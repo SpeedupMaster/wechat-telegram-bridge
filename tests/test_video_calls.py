@@ -867,6 +867,81 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await ws.close()
 
+    async def test_answer_video_offer_race_resends_ready_video_caps_and_requests_initial_h264_keyframe(self):
+        self.daemon.add_thread("wxid_alice", "Alice")
+        self.ready_payload["receiveTracks"][1]["format"]["codec"] = "h264"
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.ready" and cmd.get("scope", {}).get("kind") == "offer":
+                # Offer transitioned pending -> offered (and upgraded callType to video) right before call.ready arrived
+                await self.b.handle_call_event({"type": "call.offered", "offer": {
+                    "callId": "vid-race", "revision": 2, "kind": "direct", "callType": "video",
+                    "callerId": "wxid_alice"}})
+                return {"type": "command.result", "status": "error", "code": "offer_expired"}
+            if cmd["type"] == "call.answer":
+                async def connected():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "vid-race", "revision": 3, "kind": "direct", "callType": "video",
+                        "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+                asyncio.create_task(connected())
+                return {"type": "command.result", "status": "accepted", "callId": "vid-race", "ownerToken": "own-vr"}
+            return None
+
+        self.sock.on_command = on_cmd
+        # Initial pending offer omitted callType (defaults to voice), then call.offered upgrades to video
+        await self.b.handle_call_event({"type": "call.pending", "offer": {
+            "callId": "vid-race", "revision": 1, "kind": "direct", "callerId": "wxid_alice"}})
+        await self.b.handle_call_event({"type": "call.offered", "offer": {
+            "callId": "vid-race", "revision": 1, "kind": "direct", "callType": "video", "callerId": "wxid_alice"}})
+        # Force stage back to pending to simulate the in-flightpending->offered race inside answer()
+        self.b._active_calls["vid-race"]["stage"] = "pending"
+
+        token = _button_urls(self.b.bot.sent[-1])[0].rsplit("/", 1)[1]
+        ios_vcaps = {
+            "sendCodecs": ["h264", "jpeg"],
+            "receiveCodecs": ["jpeg"],
+            "maxWidth": 640, "maxHeight": 480, "maxFps": 15,
+        }
+        ws = await self._page(token, video_caps=ios_vcaps)
+        try:
+            st0 = await self._next_json(ws)
+            self.assertTrue(st0["videoCall"])
+            await ws.send_json({"type": "answer", "cameraEnabled": True, "videoCaps": ios_vcaps})
+            await self._next_json(ws, pred=lambda m: m.get("phase") == "active")
+
+            # After offer-scoped call.ready failed with offer_expired, answer() must still register videoCaps via kind='all'
+            all_ready = [
+                c for c in self.sock.commands
+                if c["type"] == "call.ready" and c.get("ready") and c.get("scope", {}).get("kind") == "all"
+            ]
+            self.assertEqual(len(all_ready), 1)
+            self.assertEqual(all_ready[0]["video"], ios_vcaps)
+
+            # If no initial keyframe arrives promptly on /media attach (or an orphan P-frame arrives first),
+            # CallSession automatically requests an IDR keyframe for the H.264 receive track
+            await self._until(lambda: {"type": "video.request_keyframe", "trackId": 65538} in self.media.sent_json)
+
+            # Dynamically added H.264 receive track that sends an orphan P-frame before IDR immediately requests keyframe
+            self.media.sent_json.clear()
+            self.media.queue.put_nowait({
+                "type": "track.added",
+                "callId": "vid-race",
+                "track": {
+                    "media": "video", "id": 65541, "generation": 1, "direction": "receive",
+                    "participantId": "wxid_alice", "active": True,
+                    "format": {"codec": "h264", "mode": "passthrough", "maxWidth": 640, "maxHeight": 480, "maxFps": 15},
+                },
+            })
+            self.media.queue.put_nowait({
+                "type": "video.frame", "kind": WXCM_KIND_H264, "flags": 0x04,  # orphan P-frame before any IDR
+                "trackId": 65541, "generation": 1, "sequence": 1, "timestampMicros": 20_000,
+                "payload": b"\x00\x00\x00\x01\x41orphan_p",
+            })
+            await self._until(lambda: {"type": "video.request_keyframe", "trackId": 65541} in self.media.sent_json)
+        finally:
+            await ws.close()
+
 
 class BrowserAudioAndVideoJsTests(unittest.TestCase):
     def test_worklet_upsampling_downsampling_tx_gate_and_smooth_jitter_buffer(self):
@@ -2460,6 +2535,235 @@ async function fireTimersUpTo(maxMs) {{
         res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         self.assertIn("IOS_WKWEBVIEW_GESTURE_UNLOCK_OK", res.stdout)
+
+    def test_ios_video_call_requests_jpeg_rx_and_async_h264_decoder_error_replays_keyframe(self):
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+
+        web_dir = Path(__file__).resolve().parent.parent / "bridge" / "web"
+        html = (web_dir / "call.html").read_text(encoding="utf-8")
+        worklet = (web_dir / "worklet.js").read_text(encoding="utf-8")
+        rendered = (
+            html.replace("__NONCE__", "testnonce")
+            .replace("__CFG__", json.dumps({"base": "/wxcall"}))
+            .replace("__WORKLET__", json.dumps(worklet))
+        )
+        main_js = re.findall(r'<script nonce="testnonce">([\s\S]*?)</script>', rendered)[1]
+
+        harness = f"""
+const vm = require('vm');
+
+async function runScenario(isIos) {{
+  const timers = [];
+  let nextTimerId = 1, drawnFrames = 0;
+  function makeEl(id) {{
+    return {{
+      id: id || '', className: '', textContent: '', _html: '', hidden: false, disabled: false,
+      width: 0, height: 0, videoWidth: 480, videoHeight: 640, readyState: 4, srcObject: null,
+      get innerHTML() {{ return this._html; }},
+      set innerHTML(v) {{ this._html = v; if (!v) this.children = []; }},
+      style: {{}}, children: [], listeners: {{}},
+      classList: {{
+        _set: new Set(),
+        add(c) {{ this._set.add(c); }},
+        remove(c) {{ this._set.delete(c); }},
+        toggle(c, on) {{ if (on === undefined ? !this._set.has(c) : on) this._set.add(c); else this._set.delete(c); }},
+        contains(c) {{ return this._set.has(c); }},
+      }},
+      appendChild(ch) {{ ch.parentNode = this; this.children.push(ch); return ch; }},
+      removeChild(ch) {{ this.children = this.children.filter((x) => x !== ch); }},
+      addEventListener(ev, fn) {{ (this.listeners[ev] = this.listeners[ev] || []).push(fn); }},
+      setAttribute() {{}},
+      play() {{ return Promise.resolve(); }},
+      pause() {{}},
+      getBoundingClientRect() {{ return {{left: 0, top: 0, width: 100, height: 133}}; }},
+      getContext() {{
+        return {{
+          save() {{}}, restore() {{}}, setTransform() {{}}, translate() {{}}, rotate() {{}},
+          drawImage() {{ drawnFrames++; }},
+        }};
+      }},
+    }};
+  }}
+  const els = {{}};
+  ['stage', 'pip', 'selfVideo', 'main', 'avatar', 'title', 'name', 'status', 'timer', 'peers', 'hint', 'actions'].forEach((id) => {{
+    els[id] = makeEl(id);
+  }});
+  els.stage.hidden = true; els.pip.hidden = true; els.peers.hidden = true;
+
+  const sockets = [];
+  class FakeWS {{
+    constructor() {{ this.readyState = 0; this.bufferedAmount = 0; this.sent = []; sockets.push(this); }}
+    send(d) {{ this.sent.push(d); }}
+    close() {{ this.readyState = 3; }}
+  }}
+  class FakeAudioContext {{
+    constructor() {{
+      this.state = 'running'; this.currentTime = 0; this.destination = {{isDest: true}};
+      this.audioWorklet = {{ addModule: () => Promise.resolve() }};
+    }}
+    createBuffer() {{ return {{}}; }}
+    createBufferSource() {{ return {{ buffer: null, connect() {{}}, start() {{}} }}; }}
+    resume() {{ this.state = 'running'; return Promise.resolve(); }}
+    close() {{ this.state = 'closed'; return Promise.resolve(); }}
+    createMediaStreamSource() {{ return {{connect() {{}}, disconnect() {{}}}}; }}
+    createGain() {{ return {{gain: {{value: 1, setTargetAtTime() {{}}}}, connect() {{}}, disconnect() {{}}}}; }}
+    createDynamicsCompressor() {{ return {{threshold: {{}}, knee: {{}}, ratio: {{}}, attack: {{}}, release: {{}}, connect() {{}}, disconnect() {{}}}}; }}
+  }}
+  class FakeWorkletNode {{
+    constructor() {{ this.port = {{ onmessage: null, postMessage() {{}} }}; }}
+    connect() {{}}
+    disconnect() {{}}
+  }}
+  class FakeVideoEncoder {{
+    static isConfigSupported() {{ return Promise.resolve({{supported: true}}); }}
+    constructor() {{ this.state = 'unconfigured'; this.encodeQueueSize = 0; }}
+    configure() {{ this.state = 'configured'; }}
+    encode() {{}}
+    close() {{ this.state = 'closed'; }}
+  }}
+
+  const attemptedCodecs = [], attemptedDescs = [];
+  class AsyncHardwareVideoDecoder {{
+    static isConfigSupported() {{ return Promise.resolve({{supported: true}}); }}
+    constructor(init) {{ this._out = init.output; this._err = init.error; this.state = 'unconfigured'; this._cfg = null; }}
+    configure(cfg) {{
+      // Real WebCodecs VideoDecoder NEVER throws synchronously for unsupported profile/level or Annex-B!
+      this._cfg = cfg;
+      attemptedCodecs.push(cfg.codec);
+      attemptedDescs.push(!!cfg.description);
+      this.state = 'configured';
+    }}
+    decode(chunk) {{
+      const cfg = this._cfg;
+      Promise.resolve().then(() => {{
+        if (this.state === 'closed') return;
+        // Reject Level 5.1 ('33') AND reject Annex-B without avcC `description` (simulating strict VideoToolbox / mobile hw)
+        if (cfg.codec.endsWith('33') || !cfg.description) {{
+          this.state = 'closed';
+          this._err(new Error('EncodingError: Hardware decoder rejected bitstream'));
+          return;
+        }}
+        this._out({{displayWidth: 480, displayHeight: 640, codedWidth: 480, codedHeight: 640, close() {{}}}});
+      }});
+    }}
+    close() {{ this.state = 'closed'; }}
+  }}
+  class FakeEncodedVideoChunk {{
+    constructor(init) {{ this.type = init.type; this.timestamp = init.timestamp; this.data = init.data; }}
+  }}
+  class FakeImage {{
+    constructor() {{ this.onload = null; this.onerror = null; this.naturalWidth = 480; this.naturalHeight = 640; }}
+    set src(_v) {{ Promise.resolve().then(() => this.onload && this.onload()); }}
+  }}
+
+  const sandbox = {{
+    window: null, document: null, navigator: null,
+    location: {{ protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com', pathname: '/wxcall/call/tok123456', search: '', hash: '' }},
+    URL: {{ createObjectURL: () => 'blob:img', revokeObjectURL: () => {{}} }},
+    Blob: class {{}}, Image: FakeImage,
+    // Simulate broken/rejected createImageBitmap so JPEG fallback to HTMLImageElement is exercised!
+    createImageBitmap: () => Promise.reject(new Error('ImageBitmap decode error')),
+    WebSocket: FakeWS, DataView, Uint8Array, Int16Array, Float32Array, ArrayBuffer, Math, JSON, Date, Number, String,
+    Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
+    performance: {{now: () => 100}},
+    VideoEncoder: FakeVideoEncoder, VideoDecoder: AsyncHardwareVideoDecoder, EncodedVideoChunk: FakeEncodedVideoChunk,
+    VideoFrame: class {{ close() {{}} }}, AudioWorkletNode: FakeWorkletNode,
+    setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
+    clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+    setInterval: () => 1, clearInterval: () => {{}},
+  }};
+  sandbox.window = Object.assign(sandbox, {{ isSecureContext: true, innerWidth: 390, innerHeight: 844, AudioContext: FakeAudioContext }});
+  sandbox.window.parent = sandbox.window;
+  sandbox.document = {{
+    body: makeEl('body'), getElementById: (id) => els[id] || makeEl(id),
+    createElement: (tag) => makeEl(tag), createTextNode: (t) => ({{textContent: t}}),
+    addEventListener: () => {{}}, hidden: false,
+  }};
+  sandbox.navigator = {{
+    userAgent: isIos
+      ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148'
+      : 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0.0.0 Mobile Safari/537.36',
+    mediaDevices: {{
+      getUserMedia: () => Promise.resolve({{ getTracks: () => [{{kind: 'audio', readyState: 'live', enabled: true, stop() {{}}}}], getAudioTracks: () => [{{kind: 'audio', readyState: 'live', enabled: true, stop() {{}}}}] }}),
+    }},
+  }};
+
+  vm.runInNewContext({json.dumps(main_js)}, sandbox);
+
+  const ws = sockets[0]; ws.readyState = 1; await ws.onopen();
+  for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+  const authMsg = JSON.parse(ws.sent[0]);
+  if (isIos) {{
+    if (JSON.stringify(authMsg.videoCaps.receiveCodecs) !== JSON.stringify(['jpeg'])) {{
+      throw new Error('iOS must negotiate receiveCodecs=[jpeg] so server transcodes Vcodec1/H.265/H.264, got ' + JSON.stringify(authMsg.videoCaps));
+    }}
+    if (JSON.stringify(authMsg.videoCaps.sendCodecs) !== JSON.stringify(['h264', 'jpeg'])) {{
+      throw new Error('iOS must preserve outgoing sendCodecs=[h264, jpeg], got ' + JSON.stringify(authMsg.videoCaps));
+    }}
+  }} else {{
+    if (JSON.stringify(authMsg.videoCaps.receiveCodecs) !== JSON.stringify(['h264', 'jpeg'])) {{
+      throw new Error('Non-iOS should advertise receiveCodecs=[h264, jpeg], got ' + JSON.stringify(authMsg.videoCaps));
+    }}
+  }}
+
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'active', title: '微信视频通话', name: 'Alice', status: '🟢 通话中',
+    mine: true, muted: false, camera: true, elapsed: 1, videoCall: true, videoEnabled: true,
+    rate: 16000, frame: 320,
+    videoTracks: [{{id: 65538, codec: isIos ? 'jpeg' : 'h264', participantId: 'wxid_alice', name: 'Alice', active: true}}],
+    participants: [],
+  }})}});
+
+  function wxv1Frame(trackId, kind, flags, ts, payloadBytes) {{
+    const out = new Uint8Array(20 + payloadBytes.length);
+    out.set([0x57, 0x58, 0x56, 0x31, kind, flags, 0, 0], 0);
+    const dv = new DataView(out.buffer);
+    dv.setUint32(8, trackId, false);
+    dv.setUint32(16, ts, false);
+    out.set(payloadBytes, 20);
+    return out.buffer;
+  }}
+
+  if (isIos) {{
+    // Incoming JPEG frame renders via HTMLImageElement fallback even when createImageBitmap rejects!
+    ws.onmessage({{data: wxv1Frame(65538, 4, 0x01, 20000, [0xff, 0xd8, 0xff, 0xd9])}});
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+    if (drawnFrames < 1 || els.stage.hidden || !els.stage.children[0].classList.contains('has-frame')) {{
+      throw new Error('Expected incoming JPEG frame drawn on iOS stage canvas, drawnFrames=' + drawnFrames);
+    }}
+  }} else {{
+    // Single incoming Vcodec1->H.264 Level 5.1 Annex-B keyframe (SPS + PPS + IDR):
+    // Async VideoDecoder error on avc1.4d4033 and Annex-B must replay cached keyframe with avcC description & render!
+    const annexBKeyframe = [
+      0, 0, 0, 1, 0x09, 0xf0,
+      0, 0, 0, 1, 0x67, 0x4d, 0x40, 0x33, 0x9a, 0x74,
+      0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80,
+      0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21,
+    ];
+    ws.onmessage({{data: wxv1Frame(65538, 3, 0x05, 40000, annexBKeyframe)}});
+    for (let i = 0; i < 25; i++) await new Promise((r) => setImmediate(r));
+    if (drawnFrames < 1 || !els.stage.children[0].classList.contains('has-frame') || !attemptedDescs.includes(true)) {{
+      throw new Error('Expected async H.264 error fallback + AVCC description retry to render single keyframe, drawn=' + drawnFrames + ', codecs=' + JSON.stringify(attemptedCodecs) + ', descs=' + JSON.stringify(attemptedDescs));
+    }}
+  }}
+}}
+
+(async () => {{
+  await runScenario(true);
+  await runScenario(false);
+  console.log('IOS_JPEG_AND_ASYNC_H264_OK');
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+        res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("IOS_JPEG_AND_ASYNC_H264_OK", res.stdout)
 
 
 

@@ -83,6 +83,7 @@ SILENT_MIC_PEAK_THRESHOLD = 32
 # Max queued socket bytes before dropping video frames so real-time audio never stalls behind video.
 VIDEO_WS_MAX_BUFFER = 64 * 1024
 KEYFRAME_REQ_COOLDOWN = 2.0
+INITIAL_KEYFRAME_WAIT_SECONDS = 0.35
 
 
 def encode_wxv1_frame(track_or_gen: int, kind: int, flags: int, timestamp_micros: int, payload: bytes) -> bytes:
@@ -314,8 +315,10 @@ class CallSession:
         self._video_started_key: tuple[int, int] | None = None
         self._vtx_seq = 0
         self.video_rx_tracks: dict[int, dict] = {}  # trackId -> track metadata for UI
+        self._rx_seen_kf: set[int] = set()
         self._rx_need_kf: set[int] = set()
         self._rx_last_kf_req: dict[int, float] = {}
+        self._initial_kf_tasks: dict[int, asyncio.Task] = {}
         self._tx_last_kf_req: float = 0.0
         self.active_ws: web.WebSocketResponse | None = None
         self.muted = False
@@ -466,6 +469,9 @@ class CallSession:
             await self._start_send()
             if self.video_send_active and self.camera_enabled:
                 await self._start_video_send()
+            for tid, meta in list(self.video_rx_tracks.items()):
+                if meta.get("active", True) and meta.get("codec") in ("h264", "h265"):
+                    self._schedule_initial_keyframe(tid)
             await self.web.push_state(self.entry)
             log.info("Call %s media attached: %d Hz, frame %d, send track %s, video send %s",
                      self.call_id, self.rate, self.frame, self.send_track, self.video_send_track)
@@ -563,11 +569,29 @@ class CallSession:
             "generation": self.video_send_gen,
         })
 
+    def _schedule_initial_keyframe(self, track_id: int) -> None:
+        if self.closed or track_id <= 0 or track_id in self._rx_seen_kf or track_id in self._initial_kf_tasks:
+            return
+
+        async def _wait_and_req() -> None:
+            try:
+                await asyncio.sleep(INITIAL_KEYFRAME_WAIT_SECONDS)
+                if (not self.closed and not self.entry["terminal"] and track_id not in self._rx_seen_kf
+                        and self.video_rx_tracks.get(track_id, {}).get("active", True)):
+                    await self._maybe_request_keyframe(track_id)
+            finally:
+                self._initial_kf_tasks.pop(track_id, None)
+
+        self._initial_kf_tasks[track_id] = asyncio.create_task(_wait_and_req())
+
     async def _on_track_removed(self, track_id) -> None:
         if isinstance(track_id, int) and track_id in self.video_rx_tracks:
             self.video_rx_tracks.pop(track_id, None)
+            self._rx_seen_kf.discard(track_id)
             self._rx_need_kf.discard(track_id)
             self._rx_last_kf_req.pop(track_id, None)
+            if kf_task := self._initial_kf_tasks.pop(track_id, None):
+                kf_task.cancel()
             await self._send_page_json({"type": "video_drop", "trackId": track_id})
             await self.web.push_state(self.entry)
             return
@@ -597,9 +621,17 @@ class CallSession:
                         log.info("Could not restart video send track for %s: %s", self.call_id, e)
                 await self.web.push_state(self.entry)
             elif direction == "receive":
+                tid = track.get("id")
+                was_active = bool(isinstance(tid, int) and self.video_rx_tracks.get(tid, {}).get("active"))
                 await self._register_video_rx_track(track)
                 if not track.get("active", True):
-                    await self._send_page_json({"type": "video_drop", "trackId": track.get("id")})
+                    if isinstance(tid, int):
+                        self._rx_seen_kf.discard(tid)
+                        if kf_task := self._initial_kf_tasks.pop(tid, None):
+                            kf_task.cancel()
+                    await self._send_page_json({"type": "video_drop", "trackId": tid})
+                elif not was_active and isinstance(tid, int) and self.video_rx_tracks.get(tid, {}).get("codec") in ("h264", "h265"):
+                    self._schedule_initial_keyframe(tid)
                 await self.web.push_state(self.entry)
             return
         await self.on_track_updated(track)
@@ -659,6 +691,13 @@ class CallSession:
                 self._rx_need_kf.add(track_id)
                 await self._maybe_request_keyframe(track_id)
             return
+        if inter_coded:
+            if is_keyframe:
+                self._rx_seen_kf.add(track_id)
+                if kf_task := self._initial_kf_tasks.pop(track_id, None):
+                    kf_task.cancel()
+            elif track_id not in self._rx_seen_kf:
+                self._rx_need_kf.add(track_id)
         if inter_coded and track_id in self._rx_need_kf:
             if not is_keyframe:
                 await self._maybe_request_keyframe(track_id)
@@ -799,6 +838,10 @@ class CallSession:
         self.changed.set()
         if self.watch_task and not self.watch_task.done():
             self.watch_task.cancel()
+        for kf_task in list(self._initial_kf_tasks.values()):
+            if not kf_task.done():
+                kf_task.cancel()
+        self._initial_kf_tasks.clear()
         if self.ending_task and not self.ending_task.done() and self.ending_task is not asyncio.current_task():
             self.ending_task.cancel()
         if self.media is not None:
@@ -810,6 +853,10 @@ class CallSession:
                      else "")
             log.info("Call %s audio: %d chunks from WeChat (%d relayed to the page), %d mic chunks from the page%s%s",
                      self.call_id, self.rx_chunks, self.rx_to_page, self.tx_chunks, tx_detail, extra)
+            if self.rx_video_frames or self.tx_video_frames or self.video_rx_tracks or self.video_send_track is not None:
+                log.info("Call %s video: %d frames from WeChat, %d frames from the page (rx tracks: %d, send track: %s)",
+                         self.call_id, self.rx_video_frames, self.tx_video_frames,
+                         len(self.video_rx_tracks), self.video_send_track)
         if self.grace_task and not self.grace_task.done() and self.grace_task is not asyncio.current_task():
             self.grace_task.cancel()
         if self.media is not None:
@@ -1071,8 +1118,9 @@ class CallWeb:
                     {"kind": "offer", "callId": call_id, "expectedRevision": entry["revision"]},
                     video=ready_video,
                 )
-                readied = True
-                if res.get("status") == "error":
+                if res.get("status") != "error":
+                    readied = True
+                else:
                     code = res.get("code")
                     if code == "offer_expired" and entry["stage"] == "pending" and not entry["terminal"]:
                         try:
@@ -1086,6 +1134,10 @@ class CallWeb:
                         await asyncio.wait_for(entry["offered_event"].wait(), timeout=10.0)
                     except asyncio.TimeoutError:
                         raise CallActionError("等待来电就绪超时") from None
+                if not readied and ready_video is not None and entry["stage"] == "offered" and not entry["terminal"]:
+                    res = await self._ready({"kind": "all"}, video=ready_video)
+                    if res.get("status") != "error":
+                        readied = True
             elif ready_video is not None:
                 res = await self._ready({"kind": "all"}, video=ready_video)
                 if res.get("status") != "error":
@@ -1761,9 +1813,11 @@ class CallWeb:
                 if prev is not None and prev is not ws:
                     await _safe_send(prev, self._state(token, prev))
                 if prev is not ws:
+                    now = time.monotonic()
                     for tid, meta in list(sess.video_rx_tracks.items()):
                         if meta.get("active", True) and meta.get("codec") in ("h264", "h265"):
-                            await sess._maybe_request_keyframe(tid)
+                            sess._rx_last_kf_req[tid] = now
+                            await sess.request_keyframe(tid)
                 if (cam_opt is not None and cam_opt != sess.camera_enabled
                         and (entry.get("call_type") == "video" or sess.video_send_track is not None)):
                     try:

@@ -37,7 +37,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);overflow:hid
 font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
 -webkit-user-select:none;user-select:none}
 body{background:radial-gradient(130% 70% at 50% -10%,#1f3a2b 0%,rgba(20,22,27,0) 60%),var(--bg)}
-.stage{position:fixed;inset:0;z-index:1;background:#0c0e12;display:grid;grid-template-columns:1fr;gap:4px;padding:0}
+.stage{position:fixed;inset:0;z-index:1;background:#0c0e12;display:grid;grid-template-columns:1fr;grid-template-rows:1fr;gap:4px;padding:0}
 .stage[hidden]{display:none}
 .stage.grid-2,.stage.grid-many{gap:8px;padding:calc(max(12px,env(safe-area-inset-top)) + 116px) 8px calc(128px + env(safe-area-inset-bottom))}
 .stage.grid-2{grid-template-columns:1fr;grid-template-rows:1fr 1fr}
@@ -253,7 +253,17 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   let timerBase = null, timerId = null, wakeLock = null, pending = null, lastPhase = null, micGranted = false;
   let closingConfirm = null, speakerOn = false, speakerSinkId = '', lastWorkletSpeaker = null;
 
-  // Video state (WebCodecs H.264 Annex-B preferred when supported, Canvas JPEG universal fallback)
+  const IS_IOS_OR_SAFARI = (function () {
+    const ua = (navigator && navigator.userAgent) || '';
+    if (/iPad|iPhone|iPod/.test(ua)) return true;
+    if (/Macintosh/.test(ua) && navigator && navigator.maxTouchPoints > 1) return true;
+    return /Safari/.test(ua) && !/Chrome|Chromium|CriOS|Edg|OPR|Android/.test(ua);
+  })();
+  const IS_ANDROID = /Android/i.test((navigator && navigator.userAgent) || '');
+
+  // Video state: WebCodecs H.264 Annex-B preferred when supported, Canvas JPEG universal fallback.
+  // On iOS/Safari (WKWebView), VideoDecoder lacks software fallback and Apple VideoToolbox rejects WeChat's
+  // Vcodec1->H.264 passthrough bitstreams, so iOS always requests server-transcoded JPEG on the receive path.
   let h264EncCodec = 'avc1.42001e', h264DecCodec = 'avc1.42001e';
   let videoCaps = {sendCodecs: ['jpeg'], receiveCodecs: ['jpeg'], maxWidth: 640, maxHeight: 480, maxFps: 15};
   const videoCapsReady = (async () => {
@@ -268,7 +278,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
         } catch (e) {}
       }
     }
-    if (typeof VideoDecoder === 'function' && VideoDecoder.isConfigSupported) {
+    if (!IS_IOS_OR_SAFARI && typeof VideoDecoder === 'function' && VideoDecoder.isConfigSupported) {
       for (const c of ['avc1.42001e', 'avc1.42e01e', 'avc1.4d401f', 'avc1.64001f']) {
         try {
           const s = await VideoDecoder.isConfigSupported({codec: c});
@@ -561,6 +571,81 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     return '';
   }
 
+  function splitAnnexBNalus(u) {
+    const out = [];
+    if (!u || u.byteLength < 4) return out;
+    const len = u.byteLength;
+    let start = -1, i = 0;
+    while (i <= len - 3) {
+      let sc = 0;
+      if (u[i] === 0 && u[i + 1] === 0) {
+        if (u[i + 2] === 1) sc = 3;
+        else if (i + 3 < len && u[i + 2] === 0 && u[i + 3] === 1) sc = 4;
+      }
+      if (sc > 0) {
+        if (start >= 0 && i > start) out.push(u.subarray(start, i));
+        start = i + sc;
+        i = start;
+      } else {
+        i++;
+      }
+    }
+    if (start >= 0 && start < len) out.push(u.subarray(start, len));
+    return out;
+  }
+
+  function buildAvcCDescription(nalus) {
+    let sps = null, pps = null;
+    for (let i = 0; i < nalus.length; i++) {
+      const n = nalus[i];
+      if (!n || !n.byteLength) continue;
+      const t = n[0] & 0x1f;
+      if (t === 7 && n.byteLength >= 4 && !sps) sps = n;
+      else if (t === 8 && !pps) pps = n;
+    }
+    if (!sps || !pps || sps.byteLength > 65535 || pps.byteLength > 65535) return null;
+    const desc = new Uint8Array(11 + sps.byteLength + pps.byteLength);
+    desc[0] = 1;
+    desc[1] = sps[1];
+    desc[2] = sps[2];
+    desc[3] = sps[3];
+    desc[4] = 0xff;
+    desc[5] = 0xe1;
+    desc[6] = (sps.byteLength >>> 8) & 0xff;
+    desc[7] = sps.byteLength & 0xff;
+    desc.set(sps, 8);
+    const pOff = 8 + sps.byteLength;
+    desc[pOff] = 1;
+    desc[pOff + 1] = (pps.byteLength >>> 8) & 0xff;
+    desc[pOff + 2] = pps.byteLength & 0xff;
+    desc.set(pps, pOff + 3);
+    return desc;
+  }
+
+  function annexBToAvccPayload(nalus) {
+    const keep = [];
+    let total = 0;
+    for (let i = 0; i < nalus.length; i++) {
+      const n = nalus[i];
+      if (!n || !n.byteLength) continue;
+      const t = n[0] & 0x1f;
+      if (t === 7 || t === 8 || t === 9) continue;
+      keep.push(n);
+      total += 4 + n.byteLength;
+    }
+    if (!total) return null;
+    const out = new Uint8Array(total);
+    const dv = new DataView(out.buffer);
+    let pos = 0;
+    for (let i = 0; i < keep.length; i++) {
+      const n = keep[i];
+      dv.setUint32(pos, n.byteLength >>> 0, false);
+      out.set(n, pos + 4);
+      pos += 4 + n.byteLength;
+    }
+    return out;
+  }
+
   function ensureRemoteTile(trackId, name) {
     let tile = remoteTiles.get(trackId);
     if (!tile) {
@@ -575,7 +660,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       $('stage').appendChild(el);
       tile = {id: trackId, el: el, canvas: canvas, ctx: canvas.getContext('2d'), av: av, wt: wt, tag: tag,
               hasFrame: false, lastFrameAt: 0, decodingJpeg: false, decoder: null, awaitingKf: true,
-              codec: '', spsCodec: '', decodedOk: false, badCodecs: new Set(), rot: 0, lastKfAt: 0};
+              codec: '', spsCodec: '', decodedOk: false, badCodecs: new Set(), useAvcc: false, triedAvcc: false,
+              avccDesc: null, lastKf: null, retryCount: 0, rot: 0, lastKfAt: 0};
       remoteTiles.set(trackId, tile);
     }
     const label = name || (st && st.name) || '对方';
@@ -588,6 +674,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const tile = remoteTiles.get(trackId);
     if (!tile) return;
     if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} tile.decoder = null; }
+    tile.lastKf = null;
     if (tile.el.parentNode) tile.el.parentNode.removeChild(tile.el);
     remoteTiles.delete(trackId);
     updateStageLayout();
@@ -627,6 +714,138 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     send({type: 'request_keyframe', trackId: tile.id});
   }
 
+  function decodeJpegViaImage(tile, trackId, blob) {
+    const url = URL.createObjectURL(blob);
+    const im = new Image();
+    im.onload = () => {
+      tile.decodingJpeg = false;
+      if (remoteTiles.get(trackId) === tile) drawRotated(tile, im, im.naturalWidth || im.width, im.naturalHeight || im.height, tile.rot);
+      URL.revokeObjectURL(url);
+    };
+    im.onerror = () => { tile.decodingJpeg = false; URL.revokeObjectURL(url); };
+    im.src = url;
+  }
+
+  function onH264DecodeError(tile) {
+    if (remoteTiles.get(tile.id) !== tile || ended) return;
+    if (!tile.decodedOk && tile.codec && tile.codec.indexOf('avc1.') === 0) tile.badCodecs.add(tile.codec);
+    if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} tile.decoder = null; }
+    tile.awaitingKf = true;
+    if (!tile.decodedOk && tile.lastKf && tile.retryCount < 14) {
+      tile.retryCount++;
+      const kf = tile.lastKf;
+      Promise.resolve().then(() => {
+        if (remoteTiles.get(tile.id) !== tile || ended || tile.decodedOk || !tile.awaitingKf) return;
+        tile.rot = kf.rot;
+        decodeCompressedVideo(tile, {kind: 3, keyframe: true, ts: kf.ts, payload: kf.payload}, true);
+      });
+      return;
+    }
+    requestKeyframe(tile);
+  }
+
+  function decodeCompressedVideo(tile, f, isReplay) {
+    if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return;
+    let nalus = null;
+    if (f.kind === 3 && f.keyframe && !isReplay) {
+      const sps = parseH264SpsCodec(f.payload);
+      nalus = splitAnnexBNalus(f.payload);
+      const desc = buildAvcCDescription(nalus);
+      if (desc) tile.avccDesc = desc;
+      tile.lastKf = {ts: f.ts, rot: tile.rot, payload: new Uint8Array(f.payload)};
+      tile.retryCount = 0;
+      if (sps && sps !== tile.spsCodec) {
+        tile.spsCodec = sps;
+        tile.badCodecs.clear();
+        tile.useAvcc = false;
+        tile.triedAvcc = false;
+      }
+    }
+    if (tile.awaitingKf && !f.keyframe) { requestKeyframe(tile); return; }
+    let wantCodec = f.kind === 3 ? pickH264Codec(tile.spsCodec, tile.badCodecs) : 'hvc1.1.6.L93.B0';
+    if (f.kind === 3 && !wantCodec) {
+      if (!tile.useAvcc && !tile.triedAvcc && tile.avccDesc) {
+        tile.useAvcc = true;
+        tile.triedAvcc = true;
+        tile.badCodecs.clear();
+        wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
+      } else {
+        tile.useAvcc = false;
+        tile.badCodecs.clear();
+        wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
+      }
+    }
+    const wantModeKey = (tile.useAvcc ? 'avcc:' : 'annexb:') + wantCodec;
+    if (!tile.decoder || tile.decoder.state === 'closed' || (f.keyframe && tile.modeKey !== wantModeKey)) {
+      let configured = false;
+      for (let attempt = 0; attempt < 8 && wantCodec; attempt++) {
+        if (!tile.decoder || tile.decoder.state === 'closed') {
+          const curTile = tile;
+          try {
+            tile.decoder = new VideoDecoder({
+              output: (vf) => {
+                curTile.decodedOk = true;
+                curTile.retryCount = 0;
+                if (remoteTiles.get(curTile.id) === curTile) {
+                  drawRotated(curTile, vf, vf.displayWidth || vf.codedWidth, vf.displayHeight || vf.codedHeight, curTile.rot);
+                }
+                vf.close();
+              },
+              error: () => { onH264DecodeError(curTile); },
+            });
+          } catch (e) { tile.decoder = null; break; }
+        }
+        const cfgBase = {codec: wantCodec};
+        if (f.kind === 3 && tile.useAvcc && tile.avccDesc) cfgBase.description = tile.avccDesc;
+        try {
+          try {
+            tile.decoder.configure(Object.assign({optimizeForLatency: true}, cfgBase));
+          } catch (e) {
+            tile.decoder.configure(cfgBase);
+          }
+          tile.codec = wantCodec;
+          tile.modeKey = (tile.useAvcc ? 'avcc:' : 'annexb:') + wantCodec;
+          tile.decodedOk = false;
+          tile.awaitingKf = true;
+          configured = true;
+          break;
+        } catch (e) {
+          if (f.kind !== 3) break;
+          tile.badCodecs.add(wantCodec);
+          wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
+          if (!wantCodec && !tile.useAvcc && !tile.triedAvcc && tile.avccDesc) {
+            tile.useAvcc = true;
+            tile.triedAvcc = true;
+            tile.badCodecs.clear();
+            wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
+          }
+        }
+      }
+      if (!configured) {
+        if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} tile.decoder = null; }
+        tile.codec = '';
+        tile.modeKey = '';
+        tile.badCodecs.clear();
+        tile.awaitingKf = true;
+        return;
+      }
+    }
+    if (tile.awaitingKf && !f.keyframe) { requestKeyframe(tile); return; }
+    let chunkData = f.payload;
+    if (f.kind === 3 && tile.useAvcc && tile.avccDesc) {
+      if (!nalus) nalus = splitAnnexBNalus(f.payload);
+      const avcc = annexBToAvccPayload(nalus);
+      if (!avcc) return;
+      chunkData = avcc;
+    }
+    if (f.keyframe) tile.awaitingKf = false;
+    try {
+      tile.decoder.decode(new EncodedVideoChunk({type: f.keyframe ? 'key' : 'delta', timestamp: f.ts, data: chunkData}));
+    } catch (e) {
+      onH264DecodeError(tile);
+    }
+  }
+
   function handleVideoFrame(buf) {
     const f = unpackWxv1(buf);
     const meta = (st && st.videoTracks || []).find((t) => t.id === f.trackId);
@@ -644,98 +863,18 @@ border-top-color:#fff;animation:spin .8s linear infinite}
           tile.decodingJpeg = false;
           if (remoteTiles.get(f.trackId) === tile) drawRotated(tile, bmp, bmp.width, bmp.height, tile.rot);
           bmp.close();
-        }, () => { tile.decodingJpeg = false; });
+        }, () => {
+          if (remoteTiles.get(f.trackId) === tile && typeof Image === 'function') decodeJpegViaImage(tile, f.trackId, blob);
+          else tile.decodingJpeg = false;
+        });
       } else {
-        const url = URL.createObjectURL(blob);
-        const im = new Image();
-        im.onload = () => {
-          tile.decodingJpeg = false;
-          if (remoteTiles.get(f.trackId) === tile) drawRotated(tile, im, im.naturalWidth, im.naturalHeight, tile.rot);
-          URL.revokeObjectURL(url);
-        };
-        im.onerror = () => { tile.decodingJpeg = false; URL.revokeObjectURL(url); };
-        im.src = url;
+        decodeJpegViaImage(tile, f.trackId, blob);
       }
       return;
     }
-    if (typeof VideoDecoder !== 'function' || typeof EncodedVideoChunk !== 'function') return;
-    if (f.kind === 3 && f.keyframe) {
-      const sps = parseH264SpsCodec(f.payload);
-      if (sps && sps !== tile.spsCodec) {
-        tile.spsCodec = sps;
-        tile.badCodecs.clear();
-      }
-    }
-    if (tile.awaitingKf && !f.keyframe) { requestKeyframe(tile); return; }
-    let wantCodec = f.kind === 3 ? pickH264Codec(tile.spsCodec, tile.badCodecs) : 'hvc1.1.6.L93.B0';
-    if (f.kind === 3 && !wantCodec) {
-      tile.badCodecs.clear();
-      wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
-    }
-    if (!tile.decoder || tile.decoder.state === 'closed' || (f.keyframe && tile.codec !== wantCodec)) {
-      let configured = false;
-      for (let attempt = 0; attempt < 6 && wantCodec; attempt++) {
-        if (!tile.decoder || tile.decoder.state === 'closed') {
-          try {
-            tile.decoder = new VideoDecoder({
-              output: (vf) => {
-                tile.decodedOk = true;
-                if (remoteTiles.get(f.trackId) === tile) {
-                  drawRotated(tile, vf, vf.displayWidth || vf.codedWidth, vf.displayHeight || vf.codedHeight, tile.rot);
-                }
-                vf.close();
-              },
-              error: () => {
-                if (!tile.decodedOk && tile.codec && tile.codec.indexOf('avc1.') === 0) tile.badCodecs.add(tile.codec);
-                tile.awaitingKf = true;
-                requestKeyframe(tile);
-              },
-            });
-          } catch (e) { tile.decoder = null; break; }
-        }
-        try {
-          try {
-            tile.decoder.configure({codec: wantCodec, optimizeForLatency: true});
-          } catch (e) {
-            tile.decoder.configure({codec: wantCodec});
-          }
-          tile.codec = wantCodec;
-          tile.decodedOk = false;
-          tile.awaitingKf = true;
-          configured = true;
-          break;
-        } catch (e) {
-          if (f.kind !== 3) break;
-          tile.badCodecs.add(wantCodec);
-          wantCodec = pickH264Codec(tile.spsCodec, tile.badCodecs);
-        }
-      }
-      if (!configured) {
-        if (tile.decoder) { try { tile.decoder.close(); } catch (e) {} tile.decoder = null; }
-        tile.codec = '';
-        tile.badCodecs.clear();
-        tile.awaitingKf = true;
-        return;
-      }
-    }
-    if (tile.awaitingKf && !f.keyframe) { requestKeyframe(tile); return; }
-    if (f.keyframe) tile.awaitingKf = false;
-    try {
-      tile.decoder.decode(new EncodedVideoChunk({type: f.keyframe ? 'key' : 'delta', timestamp: f.ts, data: f.payload}));
-    } catch (e) {
-      if (!tile.decodedOk && tile.codec && tile.codec.indexOf('avc1.') === 0) tile.badCodecs.add(tile.codec);
-      tile.awaitingKf = true;
-      requestKeyframe(tile);
-    }
+    decodeCompressedVideo(tile, f, false);
   }
 
-  const IS_IOS_OR_SAFARI = (function () {
-    const ua = (navigator && navigator.userAgent) || '';
-    if (/iPad|iPhone|iPod/.test(ua)) return true;
-    if (/Macintosh/.test(ua) && navigator && navigator.maxTouchPoints > 1) return true;
-    return /Safari/.test(ua) && !/Chrome|Chromium|CriOS|Edg|OPR|Android/.test(ua);
-  })();
-  const IS_ANDROID = /Android/i.test((navigator && navigator.userAgent) || '');
   const EARPIECE_RE = /earpiece|receiver|handset|听筒/i;
   const HEADSET_RE = /headphone|headset|earbud|airpods|buds|hands-free|bluetooth|耳机|头戴|蓝牙/i;
   const SPEAKER_RE = /speaker|loudspeaker|扬声器|外放|免提|built-in output|internal speaker|喇叭/i;

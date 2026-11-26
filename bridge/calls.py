@@ -435,6 +435,8 @@ class CallsMixin:
             if not existing["terminal"]:
                 if stage == "offered" or existing["stage"] == "pending":
                     existing["stage"] = stage
+                if offer.get("callType") in ("voice", "video"):
+                    existing["call_type"] = offer["callType"]
                 existing["revision"] = offer.get("revision", existing["revision"])
                 existing["phase"] = offer.get("phase")
                 if stage == "offered":
