@@ -2803,6 +2803,219 @@ async function runScenario(isIos) {{
         self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
         self.assertIn("IOS_JPEG_AND_ASYNC_H264_OK", res.stdout)
 
+    def test_ios_video_answer_single_gum_and_muted_mic_reacquires_before_boosted_raw_fallback(self):
+        import re
+        import shutil
+        import subprocess
 
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
 
+        web_dir = Path(__file__).resolve().parent.parent / "bridge" / "web"
+        html = (web_dir / "call.html").read_text(encoding="utf-8")
+        worklet = (web_dir / "worklet.js").read_text(encoding="utf-8")
+        rendered = (
+            html.replace("__NONCE__", "testnonce")
+            .replace("__CFG__", json.dumps({"base": "/wxcall"}))
+            .replace("__WORKLET__", json.dumps(worklet))
+        )
+        main_js = re.findall(r'<script nonce="testnonce">([\s\S]*?)</script>', rendered)[1]
 
+        harness = f"""
+const vm = require('vm');
+
+// Part 1: worklet makeup gain lifts a quiet raw mic and bends loud peaks instead of hard clipping
+(() => {{
+  let ProcCls = null;
+  const wSandbox = {{
+    sampleRate: 48000,
+    AudioWorkletProcessor: class {{
+      constructor() {{ this.port = {{ onmessage: null, postMessage(msg) {{ wSandbox.msgs.push(msg); }} }}; }}
+    }},
+    registerProcessor: (_name, cls) => {{ ProcCls = cls; }},
+    Int16Array, Float32Array, Map, Math, Number,
+    msgs: [],
+  }};
+  vm.runInNewContext({json.dumps(worklet)}, wSandbox);
+  function peakFor(level, gain) {{
+    wSandbox.msgs = [];
+    const proc = new ProcCls({{processorOptions: {{net: 16000, frame: 320, stat: false}}}});
+    if (gain) proc.port.onmessage({{data: {{t: 'gain', v: gain}}}});
+    for (let q = 0; q < 8; q++) proc.process([[new Float32Array(128).fill(level)]], [[new Float32Array(128)]]);
+    const buf = wSandbox.msgs.find((m) => m instanceof ArrayBuffer);
+    if (!buf) throw new Error('no PCM frame emitted');
+    const s16 = new Int16Array(buf);
+    return Math.max(...Array.from(s16, (v) => Math.abs(v)));
+  }}
+  const quiet = peakFor(0.02, 0), boosted = peakFor(0.02, 4), loud = peakFor(0.4, 4);
+  if (Math.abs(boosted - quiet * 4) > 8) throw new Error('Expected x4 makeup gain, got ' + quiet + ' -> ' + boosted);
+  if (loud >= 32767 || loud < 26000) throw new Error('Expected soft-clipped loud peak below full scale, got ' + loud);
+  if (peakFor(0.02, 99) !== quiet) throw new Error('Out-of-range gain must fall back to unity');
+}})();
+
+(async () => {{
+  const timers = [];
+  let nextTimerId = 1;
+  function makeEl(id) {{
+    return {{
+      id: id || '', className: '', textContent: '', _html: '', hidden: false, disabled: false,
+      get innerHTML() {{ return this._html; }},
+      set innerHTML(v) {{ this._html = v; if (!v) this.children = []; }},
+      style: {{}}, children: [], listeners: {{}},
+      classList: {{ _set: new Set(), add(c) {{ this._set.add(c); }}, remove(c) {{ this._set.delete(c); }}, toggle() {{}}, contains(c) {{ return this._set.has(c); }} }},
+      appendChild(ch) {{ ch.parentNode = this; this.children.push(ch); return ch; }},
+      removeChild(ch) {{ this.children = this.children.filter((x) => x !== ch); }},
+      addEventListener() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+      play() {{ return Promise.resolve(); }}, pause() {{}},
+      getBoundingClientRect() {{ return {{left: 0, top: 0, width: 100, height: 100}}; }},
+      getContext() {{ return null; }},
+    }};
+  }}
+  const els = {{}};
+  ['stage', 'pip', 'selfVideo', 'main', 'avatar', 'title', 'name', 'status', 'timer', 'peers', 'hint', 'actions'].forEach((id) => {{ els[id] = makeEl(id); }});
+  const sockets = [], gumCalls = [], contexts = [], worklets = [], tracks = [];
+
+  class FakeWS {{
+    constructor() {{ this.readyState = 0; this.bufferedAmount = 0; this.sent = []; sockets.push(this); }}
+    send(d) {{ this.sent.push(d); }}
+    close() {{ this.readyState = 3; }}
+  }}
+  class FakeAudioContext {{
+    constructor() {{
+      this.state = 'running'; this.currentTime = 0; this.sampleRate = 44100; this.destination = {{}};
+      this.audioWorklet = {{ addModule: () => Promise.resolve() }};
+      contexts.push(this);
+    }}
+    resume() {{ return Promise.resolve(); }}
+    close() {{ this.state = 'closed'; }}
+    createBuffer() {{ return {{}}; }}
+    createBufferSource() {{ return {{connect() {{}}, start() {{}}}}; }}
+    createMediaStreamSource(s) {{ return {{stream: s, connect() {{}}, disconnect() {{}}}}; }}
+    createGain() {{ return {{gain: {{value: 1, setTargetAtTime(v) {{ this.value = v; }}}}, connect() {{}}, disconnect() {{}}}}; }}
+  }}
+  class FakeWorkletNode {{
+    constructor() {{ this.msgs = []; const self = this; this.port = {{ onmessage: null, postMessage(m) {{ self.msgs.push(m); }} }}; worklets.push(this); }}
+    connect() {{}}
+    disconnect() {{}}
+  }}
+  function makeTrack(kind, muted) {{
+    const t = {{kind, readyState: 'live', muted, enabled: true, stopped: false, listeners: {{}},
+      stop() {{ this.stopped = true; }},
+      addEventListener(ev, fn) {{ (this.listeners[ev] = this.listeners[ev] || []).push(fn); }}}};
+    tracks.push(t);
+    return t;
+  }}
+  class FakeMediaStream {{
+    constructor(list) {{ this._t = list.slice(); }}
+    getTracks() {{ return this._t.slice(); }}
+    getAudioTracks() {{ return this._t.filter((t) => t.kind === 'audio'); }}
+    getVideoTracks() {{ return this._t.filter((t) => t.kind === 'video'); }}
+  }}
+
+  const sandbox = {{
+    window: null, document: null, navigator: null,
+    location: {{ protocol: 'https:', host: 'call.example.com', origin: 'https://call.example.com',
+      pathname: '/wxcall/call/tok123456', search: '', hash: '' }},
+    sessionStorage: {{ getItem: () => '', setItem: () => {{}} }},
+    URL: {{ createObjectURL: () => 'blob:w', revokeObjectURL: () => {{}} }},
+    Blob: class {{}}, WebSocket: FakeWS, DataView, Uint8Array, Int16Array, Float32Array, ArrayBuffer, Math, Number, JSON, Date, String,
+    Promise, Set, Map, Array, Object, Error, URLSearchParams, encodeURIComponent, decodeURIComponent,
+    performance: {{now: () => 0}}, AudioWorkletNode: FakeWorkletNode, MediaStream: FakeMediaStream,
+    setTimeout: (fn, ms) => {{ const id = nextTimerId++; timers.push({{id, fn, ms}}); return id; }},
+    clearTimeout: (id) => {{ const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); }},
+    setInterval: () => 1, clearInterval: () => {{}},
+  }};
+  sandbox.window = Object.assign(sandbox, {{ isSecureContext: true, innerWidth: 390, innerHeight: 844, AudioContext: FakeAudioContext }});
+  sandbox.window.parent = sandbox.window;
+  sandbox.document = {{
+    body: makeEl('body'), getElementById: (id) => els[id] || makeEl(id),
+    createElement: (tag) => makeEl(tag), createTextNode: (t) => ({{textContent: t}}),
+    addEventListener: () => {{}}, hidden: false,
+  }};
+  sandbox.navigator = {{
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    mediaDevices: {{
+      enumerateDevices: () => Promise.resolve([]),
+      // iOS mutes every processed (voice-processing) capture in this scenario; only the raw one delivers.
+      getUserMedia: (c) => {{
+        gumCalls.push(c);
+        const list = [];
+        if (c.audio) list.push(makeTrack('audio', c.audio.echoCancellation !== false));
+        if (c.video) list.push(makeTrack('video', false));
+        return Promise.resolve(new FakeMediaStream(list));
+      }},
+    }},
+  }};
+
+  vm.runInNewContext({json.dumps(main_js)}, sandbox);
+  const ws = sockets[0]; ws.readyState = 1; await ws.onopen();
+  await new Promise((r) => setImmediate(r));
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'ringing', title: '微信视频来电', name: 'Peer', status: '🔔 响铃中…',
+    mine: false, muted: false, camera: false, answerable: true, videoCall: true, videoEnabled: true, rate: 16000, frame: 320,
+  }})}});
+
+  els.actions.children[1].onclick();
+  for (let i = 0; i < 12; i++) await new Promise((r) => setImmediate(r));
+
+  // 1) One getUserMedia for mic + camera, split so the camera stream holds only the video track
+  if (gumCalls.length !== 1 || !gumCalls[0].audio || !gumCalls[0].video || gumCalls[0].audio.echoCancellation !== true) {{
+    throw new Error('Expected a single combined audio+video getUserMedia on iOS, got ' + JSON.stringify(gumCalls));
+  }}
+  const cam = els.selfVideo.srcObject;
+  if (!cam || cam.getVideoTracks().length !== 1 || cam.getAudioTracks().length !== 0) {{
+    throw new Error('Expected the self-view stream to hold only the camera track');
+  }}
+  const sent = () => ws.sent.filter((s) => typeof s === 'string').map((s) => JSON.parse(s));
+  const answer = sent().find((m) => m.type === 'answer');
+  if (!answer || answer.cameraEnabled !== true) throw new Error('Expected answer with cameraEnabled, got ' + JSON.stringify(sent()));
+
+  ws.onmessage({{data: JSON.stringify({{
+    type: 'state', phase: 'active', title: '微信视频通话', name: 'Peer', status: '🟢 通话中',
+    mine: true, muted: false, camera: true, elapsed: 1, videoCall: true, videoEnabled: true, rate: 16000, frame: 320,
+  }})}});
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+
+  // 2) The muted event is reported with the capture mode and camera state
+  const mic0 = tracks[0];
+  mic0.listeners.mute.forEach((fn) => fn());
+  const mutedDiag = sent().find((m) => m.type === 'diag' && m.err === 'mic_track_muted');
+  if (!mutedDiag || mutedDiag.gum !== 'combined' || mutedDiag.cam !== true || mutedDiag.trackMuted !== true) {{
+    throw new Error('Expected mic_track_muted diag with gum=combined cam=true, got ' + JSON.stringify(mutedDiag));
+  }}
+
+  const wn = worklets[0];
+  for (let f = 0; f < 45; f++) wn.port.onmessage({{data: new Int16Array(320).buffer}});
+  let t = 1;
+  async function fireWatchTick() {{
+    contexts[contexts.length - 1].currentTime = (t += 1.5);
+    const wt = timers.find((x) => x.ms === 900 || x.ms === 1500);
+    if (!wt) throw new Error('Missing audioWatchTimer');
+    timers.splice(timers.indexOf(wt), 1);
+    wt.fn();
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  }}
+
+  await fireWatchTick();  // stage 0: rebind
+  await fireWatchTick();  // stage 1: muted track -> processed re-acquire
+  if (gumCalls.length !== 2 || gumCalls[1].video || gumCalls[1].audio.echoCancellation !== true) {{
+    throw new Error('Expected a processed (echoCancellation) mic re-acquire first, got ' + JSON.stringify(gumCalls));
+  }}
+  if (!mic0.stopped || tracks[1].stopped) throw new Error('Expected the old mic stopped and the camera kept');
+  if (!sent().some((m) => m.type === 'diag' && m.recovery === 'reacquire')) throw new Error('Expected recovery=reacquire diag');
+  if (wn.msgs.some((m) => m && m.t === 'gain' && m.v !== 1)) throw new Error('No makeup gain on a processed mic');
+
+  await fireWatchTick();  // still muted -> raw fallback with makeup gain
+  if (gumCalls.length !== 3 || gumCalls[2].audio.echoCancellation !== false) {{
+    throw new Error('Expected raw getUserMedia after the re-acquired track stayed muted, got ' + JSON.stringify(gumCalls));
+  }}
+  const lastGain = wn.msgs.filter((m) => m && m.t === 'gain').pop();
+  if (!lastGain || lastGain.v !== 4) throw new Error('Expected x4 makeup gain on the raw iOS mic, got ' + JSON.stringify(lastGain));
+  if (tracks[1].stopped) throw new Error('Mic recovery must never stop the camera track');
+  console.log('IOS_COMBINED_GUM_MIC_RECOVERY_OK');
+}})().catch((e) => {{ console.error(e); process.exit(1); }});
+"""
+        res = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr or res.stdout)
+        self.assertIn("IOS_COMBINED_GUM_MIC_RECOVERY_OK", res.stdout)

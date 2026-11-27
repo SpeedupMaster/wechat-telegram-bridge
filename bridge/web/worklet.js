@@ -1,4 +1,12 @@
 
+// Makeup gain (raw iOS mic) can push speech past full scale; bend peaks above 0.5 instead of hard clipping.
+function softClip(v) {
+  const a = v < 0 ? -v : v;
+  if (a <= 0.5) return v;
+  const o = 0.5 + 0.5 * Math.tanh((a - 0.5) / 0.5);
+  return v < 0 ? -o : o;
+}
+
 class BridgeIO extends AudioWorkletProcessor {
   constructor(o) {
     super();
@@ -15,6 +23,7 @@ class BridgeIO extends AudioWorkletProcessor {
     this.framePeak = 0;
     this.rxEnv = 0;
     this.micGain = 1;
+    this.inGain = 1;
     this.tracks = new Map();
     this.setRate(p.net || 16000, p.frame || 320);
     this.port.onmessage = (e) => {
@@ -24,6 +33,7 @@ class BridgeIO extends AudioWorkletProcessor {
       else if (d.t === 'rate') this.setRate(d.net, d.frame);
       else if (d.t === 'tx') this.tx = !!d.on;
       else if (d.t === 'speaker') this.speaker = !!d.on;
+      else if (d.t === 'gain') this.inGain = d.v > 0 && d.v <= 8 ? d.v : 1;
     };
   }
   setRate(net, frame) {
@@ -36,6 +46,7 @@ class BridgeIO extends AudioWorkletProcessor {
   emitSample(v) {
     if (!this.tx) return;
     if (!Number.isFinite(v)) v = 0;
+    if (this.inGain > 1) v = softClip(v);
     v = v < -1 ? -1 : v > 1 ? 1 : v;
     const s16 = v < 0 ? Math.round(v * 32768) : Math.round(v * 32767);
     this.buf[this.n++] = s16;
@@ -173,7 +184,7 @@ class BridgeIO extends AudioWorkletProcessor {
       if (refEnv > 0.015 && inp.length) {
         let txEnergy = 0;
         for (let i = 0; i < inp.length; i++) {
-          const v = Number.isFinite(inp[i]) ? inp[i] : 0;
+          const v = Number.isFinite(inp[i]) ? inp[i] * this.inGain : 0;
           txEnergy += v * v;
         }
         const txRms = Math.sqrt(txEnergy / inp.length);
@@ -187,7 +198,7 @@ class BridgeIO extends AudioWorkletProcessor {
       const gAlpha = targetGain > this.micGain ? 0.25 : 0.08;
       if (this.step <= 1) {
         for (let i = 0; i < inp.length; i++) {
-          const raw = Number.isFinite(inp[i]) ? inp[i] : 0;
+          const raw = Number.isFinite(inp[i]) ? inp[i] * this.inGain : 0;
           this.micGain += (targetGain - this.micGain) * gAlpha;
           this.sum += raw * this.micGain; this.cnt++; this.acc += this.step;
           if (this.acc >= 1) {
@@ -199,7 +210,7 @@ class BridgeIO extends AudioWorkletProcessor {
       } else {
         const inv = 1 / this.step;
         for (let i = 0; i < inp.length; i++) {
-          const raw = Number.isFinite(inp[i]) ? inp[i] : 0;
+          const raw = Number.isFinite(inp[i]) ? inp[i] * this.inGain : 0;
           this.micGain += (targetGain - this.micGain) * gAlpha;
           const s = raw * this.micGain, p = this.prevIn;
           while (this.acc < 1) {
