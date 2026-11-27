@@ -56,6 +56,8 @@ class GroupDaemon(FakeDaemon):
             self.ops_by_key[key] = op
             if op["state"] == "succeeded" and rest[0] == "threads" and rest[1] in self.groups:
                 self.groups[rest[1]]["muted"] = body["muted"]
+            if op["state"] == "succeeded" and rest[:3:2] == ["groups", "my-name"] and rest[1] in self.groups:
+                self.groups[rest[1]]["myDisplayName"] = body["displayName"] or None
             return httpx.Response(202, json={"id": "gmop", "state": "queued"})
         if rest[:2] == ["operations", "gmop"]:
             return httpx.Response(200, json={"id": "gmop", **self.op})
@@ -200,6 +202,15 @@ class GroupTests(unittest.IsolatedAsyncioTestCase):
         done = await self.send("/myname 小王")
         self.assertEqual(self.daemon.mutations[-1][:3], ("PUT", f"groups/{ROOM}/my-name", {"displayName": "小王"}))
         self.assertIn("我在本群的昵称改为「小王」", done.text)
+
+        my_usage = await self.send("/myname")
+        self.assertIn("当前：小王", my_usage.text)
+        self.assertIn("/myname -", my_usage.text)
+
+        cleared = await self.send("/myname -")
+        self.assertEqual(self.daemon.mutations[-1][:3], ("PUT", f"groups/{ROOM}/my-name", {"displayName": ""}))
+        self.assertIn("已清除我在本群的昵称", cleared.text)
+        self.assertIsNone(self.daemon.groups[ROOM]["myDisplayName"])
 
         self.daemon.op = {"state": "failed", "result": {"code": "rejected"}}
         failed = await self.send("/groupname X")
@@ -347,6 +358,42 @@ class GroupTests(unittest.IsolatedAsyncioTestCase):
         card = await self.send("/group")
         self.assertIn("欢迎新朋友🫡🌹", card.text)
         self.assertNotIn("[社会社会]", card.text)
+
+    async def test_group_updated_and_manual_refresh_invalidate_cached_sender_names(self):
+        # 1) New profile before agent-wechat's background roster batch refresh (#737):
+        #    member is not in contacts or roster yet, so the first message falls back to raw wxid.
+        self.daemon.contacts["wxid_stranger"] = {"id": "wxid_stranger", "remark": None, "nickname": None}
+        self.daemon.add_message("g_pre", ROOM, "大家好", sender="wxid_stranger")
+        await self.b.handle_event({"cursor": "10", "kind": "message.committed",
+                                   "data": {"messageId": "g_pre", "threadId": ROOM, "origin": "live"}})
+        self.assertIn("<b>wxid_stranger</b>：", self.b.bot.sent[-1].text)
+        self.assertEqual(self.b.names.get((ROOM, "wxid_stranger")), "wxid_stranger")
+
+        # Background roster refresh finishes and emits group.updated -> cached sender name is dropped.
+        self.daemon.group_members[ROOM].append(
+            {"id": "wxid_stranger", "displayName": "新群友阿哲", "roomDisplayName": "新群友阿哲", "nickname": "阿哲"}
+        )
+        await self.b.handle_event({"cursor": "11", "kind": "group.updated", "data": {"groupId": ROOM}})
+        self.assertNotIn((ROOM, "wxid_stranger"), self.b.names)
+
+        self.daemon.add_message("g_post", ROOM, "名片刷新好了", sender="wxid_stranger")
+        await self.b.handle_event({"cursor": "12", "kind": "message.committed",
+                                   "data": {"messageId": "g_post", "threadId": ROOM, "origin": "live"}})
+        self.assertIn("<b>新群友阿哲</b>：", self.b.bot.sent[-1].text)
+
+        # 2) Member clears their roomDisplayName in WeChat (#732): roster refresh clears roomDisplayName
+        #    and falls back to nickname; manual "从微信刷新" also evicts the room's sender-name cache.
+        self.daemon.group_members[ROOM][-1] = {
+            "id": "wxid_stranger", "displayName": "wxid_stranger", "roomDisplayName": None, "nickname": "阿哲本名",
+        }
+        card = await self.send("/group")
+        await self.click(card.kwargs["buttons"], "从微信刷新")
+        self.assertNotIn((ROOM, "wxid_stranger"), self.b.names)
+
+        self.daemon.add_message("g_cleared", ROOM, "群昵称已清空", sender="wxid_stranger")
+        await self.b.handle_event({"cursor": "13", "kind": "message.committed",
+                                   "data": {"messageId": "g_cleared", "threadId": ROOM, "origin": "live"}})
+        self.assertIn("<b>阿哲本名</b>：", self.b.bot.sent[-1].text)
 
 
 if __name__ == "__main__":

@@ -1019,6 +1019,75 @@ class VoiceAndMediaV31Tests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("媒体解码或处理失败（media_processing_failed）", alert)
         self.assertIn("结果未知", alert)
 
+    async def test_large_file_cdn_rejection_logs_service_stage_code_and_upload_failure(self):
+        from bridge.wechat import Media
+        from tests.fakes import tg_event
+
+        self.daemon.add_thread("wxid_bob", "Bob")
+        self.b.store.link("wxid_bob", -502, "Bob")
+        orig_handler = self.daemon.handler
+
+        def reject_large_upload(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path.endswith("/sends"):
+                return httpx.Response(202, json={"id": "job-large-1", "state": "queued", "kind": "send"})
+            if request.method == "GET" and request.url.path.endswith("/jobs/job-large-1"):
+                return httpx.Response(200, json={
+                    "id": "job-large-1",
+                    "kind": "send",
+                    "state": "failed",
+                    "phase": "uploading",
+                    "reason": "media_service_rejected",
+                    "serviceStage": "large_file_upload",
+                    "serviceCode": -5103059,
+                    "retryable": False,
+                    "attempts": 2,
+                    "completedBytes": 26_214_400,
+                    "totalBytes": 52_428_800,
+                    "result": {
+                        "cdnUploadFailure": {
+                            "phase": "uploadblock",
+                            "block": 2,
+                            "attempts": 1,
+                            "retriedServerErrors": 0,
+                            "cause": "rejected",
+                        },
+                    },
+                })
+            return orig_handler(request)
+
+        await self.b.wx.http.aclose()
+        self.b.wx.http = httpx.AsyncClient(
+            transport=httpx.MockTransport(reject_large_upload),
+            headers={"Authorization": "Bearer secret-token"},
+        )
+
+        with self.assertLogs("wechat", level="WARNING") as logs:
+            res = await self.b.wx.send_media(
+                "wxid_bob", "video", Media(b"video-bytes", "video/mp4", "clip.mp4"), "k-large",
+            )
+        self.assertEqual(res["state"], "failed")
+        joined = "\n".join(logs.output)
+        for snippet in (
+            "id=job-large-1",
+            "key=k-large",
+            "reason=media_service_rejected",
+            "serviceStage=large_file_upload",
+            "serviceCode=-5103059",
+            '"cdnUploadFailure":{"phase":"uploadblock","block":2',
+        ):
+            self.assertIn(snippet, joined)
+
+        ev = tg_event(-502, 43, "")
+        ev.message.media = SimpleNamespace()
+        ev.message.file = SimpleNamespace(size=11, mime_type="video/mp4", name="clip.mp4", ext=".mp4")
+        ev.message.photo = ev.message.sticker = ev.message.voice = ev.message.gif = ev.message.video_note = None
+        ev.message.video = True
+        ev.message.download_media = mock.AsyncMock(return_value=b"video-bytes")
+        with self.assertLogs("wechat", level="WARNING"):
+            await self.b.on_tg_message(ev)
+        alert = self.b.bot.sent[-1].text
+        self.assertIn("微信媒体服务拒绝请求（media_service_rejected）", alert)
+
 
 
 

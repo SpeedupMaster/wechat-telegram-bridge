@@ -291,19 +291,23 @@ class GroupsMixin:
                 current = (await self.wx.group(room)).get("myDisplayName") or ""
             except WeChatError:
                 current = ""
-            await say("🏷 <b>修改我在本群的昵称</b>\n\n用法：<code>/myname 新昵称</code>\n"
+            await say("🏷 <b>修改我在本群的昵称</b>\n\n"
+                      "用法：<code>/myname 新昵称</code>（发送 <code>/myname -</code> 清除）\n"
                       f"当前：{_esc(current) or '（未设置）'}")
             return
-        if len(name.encode()) > NAME_MAX_BYTES:
+        target = "" if name in ("-", "－") else name
+        if len(target.encode()) > NAME_MAX_BYTES:
             await say("昵称太长了（最多 512 字节）")
             return
+        what = "修改群昵称" if target else "清除群昵称"
         key = f"grp-myname-{secrets.token_hex(8)}"
-        op = await self.wx.set_my_group_name(room, name, key)
+        op = await self.wx.set_my_group_name(room, target, key)
         status, detail = op_outcome(op)
         if status == "ok":
-            await say(f"✅ 已把我在本群的昵称改为「{_esc(name)}」")
+            self._forget_names(room)
+            await say(f"✅ 已把我在本群的昵称改为「{_esc(target)}」" if target else "✅ 已清除我在本群的昵称")
         else:
-            await self._say_outcome(say, status, detail, key, "修改群昵称")
+            await self._say_outcome(say, status, detail, key, what)
 
     async def _say_outcome(self, say, status: str, detail: str, key: str, what: str) -> None:
         buttons = None
@@ -520,6 +524,7 @@ class GroupsMixin:
                 status, detail = "failed", _api_error(e)
             if status != "ok":
                 notes.append(f"⚠️ 刷新{what}：{_esc(detail)}")
+        self._forget_names(p["room"])
         text, buttons = await self.group_card(p["room"], note="\n".join(notes) or "✅ 已从微信刷新", fresh_names=True)
         await self._edit_ui_msg(event, text, buttons)
 

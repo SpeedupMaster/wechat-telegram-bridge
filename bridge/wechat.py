@@ -1078,9 +1078,18 @@ def _log_send_failure(kind: str, label: str, key: str, res: Any) -> None:
     if phase := res.get("phase"):
         parts.append(f"phase={phase}")
     err = res.get("error") if isinstance(res.get("error"), dict) else None
+    res_obj = res.get("result") if isinstance(res.get("result"), dict) else None
     reason = res.get("reason") or res.get("errorCode") or (err.get("code") if err else None)
     if reason:
         parts.append(f"reason={reason}")
+    service_stage = res.get("serviceStage") or (res_obj.get("serviceStage") if res_obj else None)
+    if service_stage:
+        parts.append(f"serviceStage={service_stage}")
+    service_code = res.get("serviceCode")
+    if service_code is None and res_obj is not None:
+        service_code = res_obj.get("serviceCode")
+    if service_code is not None:
+        parts.append(f"serviceCode={service_code}")
     if (retryable := res.get("retryable")) is not None:
         parts.append(f"retryable={retryable}")
     if (attempts := res.get("attempts")) is not None:

@@ -1035,9 +1035,9 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
         return hit[0] if hit else ""
 
     def _forget_names(self, wx_id: str) -> None:
-        """A contact's names changed: drop what is cached about them."""
+        """A contact's or group's names changed: drop what is cached about them."""
         self._contact_name_cache.pop(wx_id, None)
-        for key in [k for k in self.names if k[1] == wx_id]:
+        for key in [k for k in self.names if k[0] == wx_id or k[1] == wx_id]:
             self.names.pop(key, None)
 
     async def _named_thread(self, thread: dict, *, fresh: bool = False) -> dict:
@@ -1077,8 +1077,12 @@ class Bridge(ContactsMixin, GroupsMixin, CallsMixin, CommandsMixin, LoginMixin):
                 name = remark
             elif is_group_id(msg["threadId"]):
                 member = await self.wx.group_member(msg["threadId"], sid)
-                if member and (m_name := member.get("displayName") or member.get("nickname")):
-                    name = m_name
+                if member:
+                    for field in ("displayName", "roomDisplayName", "nickname"):
+                        val = str(member.get(field) or "").strip()
+                        if val and val != sid:
+                            name = val
+                            break
         except WeChatError:
             pass
         if name == sid:
