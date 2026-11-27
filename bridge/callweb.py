@@ -397,6 +397,7 @@ class CallSession:
         self.video_rx_tracks[tid] = {
             "id": tid,
             "codec": fmt.get("codec") or "jpeg",
+            "mode": fmt.get("mode") or "",
             "participantId": str(pid) if pid else "",
             "name": name,
             "active": bool(track.get("active", True)),
@@ -473,8 +474,9 @@ class CallSession:
                 if meta.get("active", True) and meta.get("codec") in ("h264", "h265"):
                     self._schedule_initial_keyframe(tid)
             await self.web.push_state(self.entry)
-            log.info("Call %s media attached: %d Hz, frame %d, send track %s, video send %s",
-                     self.call_id, self.rate, self.frame, self.send_track, self.video_send_track)
+            log.info("Call %s media attached: %d Hz, frame %d, send track %s, video send %s%s",
+                     self.call_id, self.rate, self.frame, self.send_track, self.video_send_track,
+                     f", video receive {self._rx_tracks_desc()}" if self.video_rx_tracks else "")
             self.watch_task = asyncio.create_task(self._watch_audio())
             async for ev in sock.events():
                 etype = ev.get("type")
@@ -530,6 +532,7 @@ class CallSession:
         await asyncio.sleep(AUDIO_CHECK_SECONDS)
         if self.closed or self.entry["terminal"]:
             return
+        await self._watch_video()
         if not self.rx_chunks:
             log.warning("Call %s: no audio from WeChat %ds after the media socket attached", self.call_id,
                         AUDIO_CHECK_SECONDS)
@@ -547,6 +550,26 @@ class CallSession:
             log.warning("Call %s: %d microphone chunks arrived in %ds but audio is silent "
                         "(nonzero: %d, peak: %d, muted: %s%s)", self.call_id, self.tx_chunks,
                         AUDIO_CHECK_SECONDS, self.tx_nonzero_chunks, self.tx_peak, self.muted, extra)
+
+    def _rx_tracks_desc(self) -> str:
+        """Compact "id codec/mode" list of the video receive tracks, for logs."""
+        return ", ".join(
+            f"{tid} {meta.get('codec') or '?'}/{meta.get('mode') or '?'}"
+            + ("" if meta.get("active", True) else " inactive")
+            for tid, meta in self.video_rx_tracks.items()
+        )
+
+    async def _watch_video(self) -> None:
+        """Warn (and nudge a keyframe) if an active video receive track has delivered no frames yet."""
+        active = [tid for tid, meta in self.video_rx_tracks.items() if meta.get("active", True)]
+        if self.rx_video_frames or not active:
+            return
+        log.warning("Call %s: no video from WeChat %ds after the media socket attached (receive tracks: %s); "
+                    "agent-wechat produced no frames -- set WX_CALL_VIDEO_TRACE=1 on agent-wechat to see why "
+                    "(a jpeg/transcoded track needs FFmpeg with the hevc/h264 decoders and the mjpeg encoder)",
+                    self.call_id, AUDIO_CHECK_SECONDS, self._rx_tracks_desc())
+        for tid in active:
+            await self._maybe_request_keyframe(tid)
 
     async def _start_send(self) -> None:
         if self.media is not None and self.send_track is not None and self.send_gen is not None:
@@ -854,9 +877,10 @@ class CallSession:
             log.info("Call %s audio: %d chunks from WeChat (%d relayed to the page), %d mic chunks from the page%s%s",
                      self.call_id, self.rx_chunks, self.rx_to_page, self.tx_chunks, tx_detail, extra)
             if self.rx_video_frames or self.tx_video_frames or self.video_rx_tracks or self.video_send_track is not None:
-                log.info("Call %s video: %d frames from WeChat, %d frames from the page (rx tracks: %d, send track: %s)",
+                log.info("Call %s video: %d frames from WeChat, %d frames from the page (rx tracks: %d%s, send track: %s)",
                          self.call_id, self.rx_video_frames, self.tx_video_frames,
-                         len(self.video_rx_tracks), self.video_send_track)
+                         len(self.video_rx_tracks),
+                         f" [{self._rx_tracks_desc()}]" if self.video_rx_tracks else "", self.video_send_track)
         if self.grace_task and not self.grace_task.done() and self.grace_task is not asyncio.current_task():
             self.grace_task.cancel()
         if self.media is not None:

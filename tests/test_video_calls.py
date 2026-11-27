@@ -773,6 +773,44 @@ class CallWebVideoTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await ws.close()
 
+    async def test_no_video_from_wechat_logs_receive_codec_and_nudges_keyframe(self):
+        from unittest import mock
+
+        self.daemon.add_thread("wxid_alice", "Alice")
+
+        async def on_cmd(cmd):
+            if cmd["type"] == "call.answer":
+                async def connected():
+                    await asyncio.sleep(0.01)
+                    await self.b.handle_call_event({"type": "call.state", "call": {
+                        "callId": "vid-nov", "revision": 3, "kind": "direct", "callType": "video",
+                        "direction": "incoming", "state": "connected", "ownedByThisClient": True}})
+                asyncio.create_task(connected())
+                return {"type": "command.result", "status": "accepted", "callId": "vid-nov", "ownerToken": "own-nov"}
+            return None
+
+        self.sock.on_command = on_cmd
+        self.ready_payload["receiveTracks"][1]["format"].update(codec="jpeg", mode="transcoded")
+        with mock.patch("bridge.callweb.AUDIO_CHECK_SECONDS", 0.05), \
+                self.assertLogs("bridge.callweb", level="INFO") as logs:
+            await self.b.handle_call_event({"type": "call.offered", "offer": {
+                "callId": "vid-nov", "revision": 2, "kind": "direct", "callType": "video", "callerId": "wxid_alice"}})
+            token = _button_urls(self.b.bot.sent[-1])[0].rsplit("/", 1)[1]
+            ws = await self._page(token)
+            try:
+                await self._next_json(ws)
+                await ws.send_json({"type": "answer", "cameraEnabled": True,
+                                    "videoCaps": {"sendCodecs": ["jpeg"], "receiveCodecs": ["jpeg"]}})
+                await self._next_json(ws, pred=lambda m: m.get("phase") == "active")
+                await self._until(lambda: any(m.get("type") == "video.request_keyframe" and m.get("trackId") == 65538
+                                              for m in self.media.sent_json))
+            finally:
+                await ws.close()
+        out = "\n".join(logs.output)
+        self.assertIn("video receive 65538 jpeg/transcoded", out)
+        self.assertIn("no video from WeChat", out)
+        self.assertIn("WX_CALL_VIDEO_TRACE=1", out)
+
     async def test_remote_muted_late_participant_name_refresh_and_video_invite_titles(self):
         room = "joinroom@chatroom"
         self.daemon.add_group(room, "JoinTeam")
