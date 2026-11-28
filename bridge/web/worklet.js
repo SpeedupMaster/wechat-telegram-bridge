@@ -34,6 +34,7 @@ class BridgeIO extends AudioWorkletProcessor {
       else if (d.t === 'tx') this.tx = !!d.on;
       else if (d.t === 'speaker') this.speaker = !!d.on;
       else if (d.t === 'gain') this.inGain = d.v > 0 && d.v <= 8 ? d.v : 1;
+      else if (d.t === 'stop') this.stopped = true;
     };
   }
   setRate(net, frame) {
@@ -78,6 +79,8 @@ class BridgeIO extends AudioWorkletProcessor {
     }
   }
   process(inputs, outputs) {
+    // Retired by the page (replaced with the ScriptProcessor fallback): let the audio thread drop this node.
+    if (this.stopped) return false;
     // 1) Render far-end receive tracks first and update acoustic echo tail envelope (rxEnv)
     const out = outputs[0], ch = out && out[0];
     if (ch) {

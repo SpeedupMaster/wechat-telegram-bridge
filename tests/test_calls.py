@@ -1616,6 +1616,8 @@ class CallConcurrencyAndCrashHardeningTests(unittest.IsolatedAsyncioTestCase):
                     "recovery": "raw_mic",
                     "trackState": "live",
                     "trackMuted": True,
+                    "ageMs": 3412,
+                    "gumMs": 640,
                 })
                 media.queue.put_nowait({
                     "type": "audio.chunk", "trackId": 2, "generation": 1, "sequence": 1,
@@ -1648,6 +1650,7 @@ class CallConcurrencyAndCrashHardeningTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("audio is silent (nonzero: 0, peak: 0", joined_logs)
             self.assertIn("recovery=raw_mic", joined_logs)
             self.assertIn("trackMuted=True", joined_logs)
+            self.assertIn("ageMs=3412, gumMs=640", joined_logs)
             self.assertIn("5 mic chunks from the page (nonzero 0, peak 0)", joined_logs)
         finally:
             callweb.AUDIO_CHECK_SECONDS = saved_chk

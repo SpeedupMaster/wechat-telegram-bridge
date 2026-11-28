@@ -242,7 +242,7 @@ def _err_text(code: str | None, default: str) -> str:
 _DIAG_KEYS = (
     "engine", "ctxState", "sampleRate", "currentTime", "ticks", "hasIn",
     "txFrames", "txNonZero", "inPeak", "txPeak", "rxFrames", "aec",
-    "recovery", "stalled", "trackState", "trackMuted", "gum", "cam", "err",
+    "recovery", "stalled", "trackState", "trackMuted", "gum", "cam", "ageMs", "gumMs", "err",
 )
 
 

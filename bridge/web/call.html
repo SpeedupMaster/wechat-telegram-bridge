@@ -1297,6 +1297,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
   }
 
   let micHint = false;
+  // Start-up timing for the diag: ms from the tap that started the capture, and from it to getUserMedia resolving.
+  let audioT0 = 0, audioGumMs = -1;
+  function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
 
   function primaryMicTrack(stream) {
     if (!stream) return null;
@@ -1341,6 +1344,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       if (tr.readyState) payload.trackState = String(tr.readyState);
       if (typeof tr.muted === 'boolean') payload.trackMuted = tr.muted;
     }
+    if (audioT0) payload.ageMs = Math.round(nowMs() - audioT0);
+    if (audioGumMs >= 0) payload.gumMs = audioGumMs;
     if (errText) payload.err = String(errText);
     send(payload);
   }
@@ -1400,6 +1405,10 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       bindNodePort(curAudio, sp);
       try { curAudio.source && curAudio.source.disconnect(curAudio.node); } catch (e) {}
       try { curAudio.node && curAudio.node.disconnect && curAudio.node.disconnect(); } catch (e) {}
+      // A disconnected AudioWorkletNode keeps running and posting stats into this curAudio (ticks, hasIn, rxFrames
+      // from a node with no input) unless it is told to stop.
+      const oldNode = curAudio.node;
+      try { if (oldNode && oldNode.port) { oldNode.port.onmessage = null; oldNode.port.postMessage({t: 'stop'}); } } catch (e) {}
       const downstream = curAudio.voiceGain || curAudio.limiter || (curAudio.aec ? null : curAudio.ctx.destination);
       if (curAudio.source) curAudio.source.connect(sp);
       if (downstream) sp.connect(downstream);
@@ -1502,6 +1511,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     }
   }
 
+  // Render time a worklet may go without posting a single stat before it counts as stuck (its first stat is
+  // posted on its first 128-sample quantum).
+  const WORKLET_STALL_SECONDS = 0.5;
   let audioWatchTimer = null;
   function scheduleAudioWatch(curAudio, delayMs) {
     clearTimeout(audioWatchTimer);
@@ -1517,7 +1529,9 @@ border-top-color:#fff;animation:spin .8s linear infinite}
             curAudio.stalled = false;
             if (soundHint) { soundHint = false; if (!micHint) hint(''); }
             if (curAudio.engine === 'worklet' && curAudio.ticks === 0 && typeof ctx.createScriptProcessor === 'function') {
-              swapToScriptProcessor(curAudio);
+              // iOS holds a fresh context for about a second while the capture starts, so the first check can see
+              // it barely running and no worklet stats yet. Only a worklet silent over real render time is stuck.
+              if (curT - curAudio.startT >= WORKLET_STALL_SECONDS) swapToScriptProcessor(curAudio);
             } else {
               if (!curAudio.diagSent) {
                 curAudio.diagSent = true;
@@ -1532,10 +1546,13 @@ border-top-color:#fff;animation:spin .8s linear infinite}
             }
           } else if (curAudio.ticks === curAudio.lastTicks) {
             curAudio.frozenCount++;
+            // A context frozen on the first check is usually still in that start-up hold; nudge it first and only
+            // replace the worklet if it is still frozen on the next one.
+            if (curAudio.frozenCount === 2 && curAudio.engine === 'worklet' && curAudio.ticks === 0
+                && typeof ctx.createScriptProcessor === 'function') {
+              swapToScriptProcessor(curAudio);
+            }
             if (curAudio.frozenCount === 1) {
-              if (curAudio.engine === 'worklet' && curAudio.ticks === 0 && typeof ctx.createScriptProcessor === 'function') {
-                swapToScriptProcessor(curAudio);
-              }
               try {
                 if (typeof ctx.suspend === 'function') ctx.suspend().then(() => ctx.resume(), () => ctx.resume()).catch(() => {});
                 else ctx.resume().catch(() => {});
@@ -1598,7 +1615,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       rawMic: false, reacquired: false, gum: '', sinkId: '', routeKey: '', rate: rate, frame: frame, ticks: 0, lastTicks: 0,
       txFrames: 0, txNonZero: 0, maxInPeak: 0, maxTxPeak: 0, micAlive: false, silentTicks: 0,
       recoveryStage: 0, recoveringMic: false, recovery: '', rxFrames: 0, hasIn: false,
-      lastTime: initT, frozenCount: 0, stalled: false, diagSent: false, recentPcm: recentPcm || new Map(),
+      startT: initT, lastTime: initT, frozenCount: 0, stalled: false, diagSent: false, recentPcm: recentPcm || new Map(),
     };
   }
 
@@ -1725,6 +1742,8 @@ border-top-color:#fff;animation:spin .8s linear infinite}
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return Promise.reject(new Error('当前环境不支持 WebAudio'));
     try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+    audioT0 = nowMs();
+    audioGumMs = -1;
     let earlyCtx = null;
     if (IS_IOS_OR_SAFARI) {
       clearTimeout(iosPrimeTimer);
@@ -1746,6 +1765,7 @@ border-top-color:#fff;animation:spin .8s linear infinite}
       let ctx = earlyCtx, stream = null;
       try {
         stream = await gum;
+        audioGumMs = Math.round(nowMs() - audioT0);
         if (ended) {
           stream.getTracks().forEach((t) => t.stop());
           throw new Error('通话已结束');
